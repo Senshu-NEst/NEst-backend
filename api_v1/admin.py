@@ -6,6 +6,21 @@ from rest_framework_simplejwt.token_blacklist.admin import OutstandingTokenAdmin
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 
 
+class NegativeStockFilter(admin.SimpleListFilter):
+    title = '在庫数'
+    parameter_name = 'negative_stock'
+
+    def lookups(self, request, model_admin):
+        return (
+            ('negative', 'マイナス在庫'),
+        )
+
+    def queryset(self, request, queryset):
+        if self.value() == 'negative':
+            return queryset.filter(stock__lt=0)
+        return queryset
+
+
 class TransactionDetailInline(admin.TabularInline):
     model = TransactionDetail
     extra = 1  # 商品を追加するための空行数
@@ -22,15 +37,17 @@ class ProductAdmin(admin.ModelAdmin):
 
 @admin.register(Store)
 class StoreAdmin(admin.ModelAdmin):
+    readonly_fields =("store_code",)
     list_display = ("store_code", "name")
     search_fields = ("name", "store_code")
 
 
 @admin.register(Stock)
 class StockAdmin(admin.ModelAdmin):
+    readonly_fields = ("updated_at",)
     list_display = ("store_code", "jan", "stock")
-    search_fields = ("store_code__store_code", "jan__name")
-    list_filter = ("store_code",)
+    search_fields = ("jan__name", "jan__jan")
+    list_filter = ("store_code", NegativeStockFilter)  # カスタムフィルターを適用
 
 
 class StockReceiveHistoryItemInline(admin.TabularInline):
@@ -62,7 +79,9 @@ class TransactionDetailAdmin(admin.ModelAdmin):
 
 @admin.register(CustomUser)
 class CustomUserAdmin(admin.ModelAdmin):
-    list_display = ("staff_code", "name", "is_staff", "is_superuser", "affiliate_store")
+    readonly_fields =("staff_code","last_login",)
+    exclude = ("password",)
+    list_display = ("staff_code", "name", "permission", "is_superuser", "is_staff", "affiliate_store",)
     search_fields = ("staff_code", "name")
     list_filter = ("is_staff", "is_superuser", "affiliate_store")
 
