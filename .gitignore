@@ -1,0 +1,12 @@
+# 拡張子
+*.log
+*.pyc
+*.sqlite3
+
+# ディレクトリ
+__pycache__/
+migrations/
+
+#　隠しファイル
+.DS_Store
+.env
