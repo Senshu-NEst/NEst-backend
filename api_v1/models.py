@@ -1,4 +1,5 @@
 from django.db import models
+from django.db import transaction
 from django.contrib.auth.models import BaseUserManager, AbstractBaseUser, PermissionsMixin
 from django.core.exceptions import ValidationError
 
@@ -57,6 +58,24 @@ class Product(BaseModel):
     def validate_tax_rate(self, tax_rate):
         if tax_rate not in [0, 8, 10]:
             raise ValidationError("税率は0, 8, 10のいずれかでなければなりません。")
+
+
+    def save(self, *args, **kwargs):
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+
+            stores = Store.objects.all()
+            existing_stocks = set(Stock.objects.filter(jan=self).values_list('store_code_id', flat=True))  # 既存の在庫の店舗コードをセットで取得
+
+            stock_entries = []
+            for store in stores:
+                if store.store_code not in existing_stocks:  # 既存の在庫がない場合のみ追加
+                    stock_entries.append(Stock(store_code=store, jan=self, stock=0))  # 初期在庫は0
+
+            # バッチ処理
+            batch_size = 500  # 一度に処理する件数
+            for i in range(0, len(stock_entries), batch_size):
+                Stock.objects.bulk_create(stock_entries[i:i + batch_size])
 
 
 class Store(BaseModel):
