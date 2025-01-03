@@ -73,7 +73,7 @@ class Product(BaseModel):
                     stock_entries.append(Stock(store_code=store, jan=self, stock=0))  # 初期在庫は0
 
             # バッチ処理
-            batch_size = 500  # 一度に処理する件数
+            batch_size = 500
             for i in range(0, len(stock_entries), batch_size):
                 Stock.objects.bulk_create(stock_entries[i:i + batch_size])
 
@@ -101,6 +101,36 @@ class Stock(BaseModel):
         unique_together = ("store_code", "jan")  # 店番号とjanコードの組み合わせが一意である
         verbose_name = "在庫"
         verbose_name_plural = "在庫一覧"
+
+
+class StorePrice(models.Model):
+    """店舗ごとの価格モデル"""
+    store_code = models.ForeignKey(Store, on_delete=models.CASCADE, verbose_name="店番号")
+    jan = models.ForeignKey(Product, on_delete=models.CASCADE, verbose_name="JANコード")
+    price = models.IntegerField(verbose_name="店舗価格")
+
+    class Meta:
+        unique_together = ("store_code", "jan")  # 店番号とjanコードの組み合わせが一意である
+        verbose_name = "店舗価格"
+        verbose_name_plural = "店舗価格一覧"
+
+    def __str__(self):
+        return f"{self.store_code} - {self.jan} - {self.price}"
+
+    def clean(self):
+        """価格が商品価格と同じの場合はValidationErrorを発生させる"""
+        if self.price == self.jan.price:
+            raise ValidationError("店舗価格は商品価格と異なる必要があります。")
+
+    def save(self, *args, **kwargs):
+        self.clean()  # 保存前にcleanメソッドを呼び出す
+        super().save(*args, **kwargs)
+
+    def get_price(self):
+        """店舗ごとの価格を取得する。価格設定がない場合は商品価格を参照する。"""
+        if self.price is not None:
+            return self.price
+        return self.jan.price  # StorePriceに価格が設定されていない場合はProductから価格を取得
 
 
 class StockReceiveHistory(models.Model):

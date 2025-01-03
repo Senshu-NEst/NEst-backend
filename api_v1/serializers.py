@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.utils import timezone
 from django.db import transaction
-from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem
+from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 
@@ -97,6 +97,7 @@ class TransactionSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError("このスタッフは売価変更を行う権限がありません。")
 
         total_quantity, total_tax10, total_tax8, discount_amount = 0, 0, 0, 0
+        total_amount = 0  # total_amountを初期化
 
         with transaction.atomic():
             transaction_instance = self._create_transaction(validated_data)
@@ -109,21 +110,31 @@ class TransactionSerializer(serializers.ModelSerializer):
                 product = self._get_product(jan_code)
                 stock = self._get_stock(store_code, product)
 
+                # StorePriceを取得
+                store_price = StorePrice.objects.filter(store_code__store_code=store_code, jan=product).first()
+
+                # 店舗価格を取得
+                effective_price = store_price.get_price()
+
                 # 在庫を減らす
                 stock.stock -= quantity
                 stock.save()
 
-                # トランザクション詳細を作成
-                self._create_transaction_detail(transaction_instance, product, discount, quantity)
+                # トランザクション詳細を作成（effective_priceを使用）
+                self._create_transaction_detail(transaction_instance, product, effective_price, discount, quantity)
 
                 # 税金計算
                 total_tax10, total_tax8 = self._calculate_tax(product, discount, quantity, total_tax10, total_tax8)
+
+                # total_amountを計算
+                total_amount += (effective_price - discount) * quantity  # effective_priceを使用した計算
+
                 total_quantity += quantity
                 discount_amount += discount * quantity
 
             # 合計を計算
             self._calculate_totals(
-                transaction_instance, total_tax10, total_tax8, discount_amount, deposit, total_quantity
+                transaction_instance, total_tax10, total_tax8, discount_amount, deposit, total_quantity, total_amount
             )
 
             # 取引を保存
@@ -151,9 +162,16 @@ class TransactionSerializer(serializers.ModelSerializer):
                 f"店舗コード {store_code} と JANコード {product.jan} の在庫は登録されていません。"
             )
 
-    def _create_transaction_detail(self, transaction_instance, product, discount, quantity):
+    def _create_transaction_detail(self, transaction_instance, product, effective_price, discount, quantity):
+        """トランザクション詳細を作成（effective_priceを使用）"""
         TransactionDetail.objects.create(
-            transaction=transaction_instance, jan=product, name=product.name, price=product.price, tax=product.tax, discount=discount, quantity=quantity,
+            transaction=transaction_instance,
+            jan=product,  # Productインスタンスを直接渡す
+            name=product.name,
+            price=effective_price,  # effective_priceを使用
+            tax=product.tax,
+            discount=discount,
+            quantity=quantity,
         )
 
     def _calculate_tax(self, product, discount, quantity, total_tax10, total_tax8):
@@ -164,12 +182,12 @@ class TransactionSerializer(serializers.ModelSerializer):
         return total_tax10, total_tax8
 
     def _calculate_totals(
-        self, transaction_instance, total_tax10, total_tax8, discount_amount, deposit, total_quantity
+        self, transaction_instance, total_tax10, total_tax8, discount_amount, deposit, total_quantity, total_amount
     ):
         transaction_instance.total_tax10 = total_tax10 * 10 // 110  # 10%税額
         transaction_instance.total_tax8 = total_tax8 * 8 // 108  # 8%税額
         transaction_instance.tax_amount = transaction_instance.total_tax10 + transaction_instance.total_tax8
-        transaction_instance.total_amount = total_tax10 + total_tax8
+        transaction_instance.total_amount = total_amount  # effective_priceを使用した合計
         transaction_instance.discount_amount = discount_amount
         transaction_instance.change = deposit - transaction_instance.total_amount
         transaction_instance.total_quantity = total_quantity
@@ -182,9 +200,18 @@ class ProductSerializer(serializers.ModelSerializer):
 
 
 class StockSerializer(serializers.ModelSerializer):
+    standard_price = serializers.IntegerField(source='jan.price')  # 商品の標準価格
+    store_price = serializers.SerializerMethodField()  # 店舗価格
+    tax = serializers.IntegerField(source='jan.tax')  # 税率を追加
+
     class Meta:
         model = Stock
-        fields = ["store_code", "jan"]
+        fields = ['store_code', 'jan', 'stock', 'standard_price', 'store_price', 'tax']
+# TODO:なぜmodels側のget_priceだけでは価格が取得できないのか調査する
+# （現在のコードだとstore_priceが存在しない時のフォールバック処理を二回行なっていることになっている）
+    def get_store_price(self, obj):
+        store_price = StorePrice.objects.filter(store_code=obj.store_code, jan=obj.jan).first()
+        return store_price.get_price() if store_price else obj.jan.price  # StorePriceがない場合はProductの価格を返す
 
 
 class StockReceiveItemSerializer(serializers.Serializer):
@@ -219,7 +246,7 @@ class StockReceiveSerializer(serializers.Serializer):
 class StockReceiveHistoryItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = StockReceiveHistoryItem
-        fields = ["additional_stock", "received_at", "staff_code"]  # 必要なフィールドを指定
+        fields = ["additional_stock", "received_at", "staff_code"]
 
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):

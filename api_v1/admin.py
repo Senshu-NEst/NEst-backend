@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem
+from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice
 from django.utils import timezone
 from rest_framework_simplejwt.token_blacklist.admin import BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin
 from rest_framework_simplejwt.token_blacklist.admin import OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
@@ -33,6 +33,13 @@ class ProductAdmin(admin.ModelAdmin):
     list_display = ("jan", "name", "price", "tax", "status")
     search_fields = ("name", "jan")
     list_filter = ("status",)
+
+
+@admin.register(StorePrice)
+class ProductAdmin(admin.ModelAdmin):
+    list_display = ("store_code", "jan", "price",)
+    search_fields = ("store_code", "jan")
+    list_filter = ("store_code",)
 
 
 @admin.register(Store)
