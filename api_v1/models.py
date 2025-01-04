@@ -90,6 +90,22 @@ class Store(BaseModel):
         verbose_name = "店舗"
         verbose_name_plural = "店舗一覧"
 
+    def save(self, *args, **kwargs):
+        """新しい店舗が追加された際に全ての商品に対する在庫を生成"""
+        super().save(*args, **kwargs)
+
+        # すべての商品に対する在庫をバッチ処理で生成
+        products = Product.objects.all()
+        stock_entries = []
+
+        for product in products:
+            stock_entries.append(Stock(store_code=self, jan=product, stock=0))
+
+        batch_size = 500
+        with transaction.atomic():
+            for i in range(0, len(stock_entries), batch_size):
+                Stock.objects.bulk_create(stock_entries[i:i + batch_size])
+
 
 class Stock(BaseModel):
     """在庫モデル"""

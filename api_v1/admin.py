@@ -44,9 +44,14 @@ class ProductAdmin(admin.ModelAdmin):
 
 @admin.register(Store)
 class StoreAdmin(admin.ModelAdmin):
-    readonly_fields =("store_code",)
     list_display = ("store_code", "name")
     search_fields = ("name", "store_code")
+
+    def get_readonly_fields(self, request, obj=None):
+        # 新規店舗追加時はstore_codeを編集可能にする
+        if obj is None:
+            return []
+        return ("store_code",)  # 既存の店舗の場合はstore_codeをreadonlyにする
 
 
 @admin.register(Stock)
