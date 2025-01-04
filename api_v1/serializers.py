@@ -61,17 +61,17 @@ class TransactionSerializer(serializers.ModelSerializer):
 
     def validate_status(self, value):
         if value == "return":
-            raise serializers.ValidationError("このステータスは選択できません。")
+            raise serializers.ValidationError("This status is not selectable.")
         return value
 
     def validate_deposit(self, value):
         if value <= 0:
-            raise serializers.ValidationError("預かり金は正の値である必要があります。")
+            raise serializers.ValidationError("Deposit must be a positive value.")
         return value
 
     def validate_sale_products(self, value):
         if not value:
-            raise serializers.ValidationError("少なくとも1つの商品を提供する必要があります。")
+            raise serializers.ValidationError("At least one product must be provided.")
         return value
 
     def create(self, validated_data):
@@ -109,120 +109,71 @@ class TransactionSerializer(serializers.ModelSerializer):
             transaction_instance = self._create_transaction(validated_data)
 
             for sale_product_data in sale_products_data:
-                jan_code = sale_product_data["jan"]
-                quantity = sale_product_data.get("quantity", 1)
-                discount = sale_product_data.get("discount", 0)
+                product, stock, effective_price = self._process_product(store_code, sale_product_data, status)
+                self._create_transaction_detail(
+                    transaction_instance, product, effective_price,
+                    sale_product_data.get("discount", 0), sale_product_data.get("quantity", 1)
+                )
 
-                product = self._get_product(jan_code)
-                stock = self._get_stock(store_code, product)
+                total_tax10, total_tax8 = self._calculate_tax(
+                    product, sale_product_data.get("discount", 0),
+                    sale_product_data.get("quantity", 1), total_tax10, total_tax8
+                )
 
-                # StorePriceを取得
-                store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
+                total_amount += (effective_price - sale_product_data.get("discount", 0)) * sale_product_data.get("quantity", 1)
+                total_quantity += sale_product_data.get("quantity", 1)
+                discount_amount += sale_product_data.get("discount", 0) * sale_product_data.get("quantity", 1)
 
-                # 店舗価格を取得
-                effective_price = store_price.get_price() if store_price else product.price
-
-                # トレーニングモードの場合在庫を減らさない
-                if status == "training":
-                    # 在庫を減らさず、通常の処理を続ける
-                    pass
-                else:
-                    stock.stock -= quantity
-                    stock.save()
-
-                # トランザクション詳細を作成（effective_priceを使用）
-                self._create_transaction_detail(transaction_instance, product, effective_price, discount, quantity)
-
-                # 税金計算
-                total_tax10, total_tax8 = self._calculate_tax(product, discount, quantity, total_tax10, total_tax8)
-
-                # total_amountを計算
-                total_amount += (effective_price - discount) * quantity  # effective_priceを使用した計算
-
-                total_quantity += quantity
-                discount_amount += discount * quantity
-
-            # 合計を計算
             self._calculate_totals(
-                transaction_instance, total_tax10, total_tax8, discount_amount, deposit, total_quantity, total_amount
+                transaction_instance, total_tax10, total_tax8,
+                discount_amount, deposit, total_quantity, total_amount
             )
 
-            # 取引を保存
-            transaction_instance.save()
-
-        return transaction_instance
-
-        # 通常の処理（在庫の減少とデータベースへのコミット）
-        with transaction.atomic():
-            transaction_instance = self._create_transaction(validated_data)
-
-            for sale_product_data in sale_products_data:
-                jan_code = sale_product_data["jan"]
-                quantity = sale_product_data.get("quantity", 1)
-                discount = sale_product_data.get("discount", 0)
-
-                product = self._get_product(jan_code)
-                stock = self._get_stock(store_code, product)
-
-                # StorePriceを取得
-                store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
-
-                # 店舗価格を取得
-                effective_price = store_price.get_price() if store_price else product.price
-
-                # 在庫を減らす
-                stock.stock -= quantity
-                stock.save()
-
-                # トランザクション詳細を作成（effective_priceを使用）
-                self._create_transaction_detail(transaction_instance, product, effective_price, discount, quantity)
-
-                # 税金計算
-                total_tax10, total_tax8 = self._calculate_tax(product, discount, quantity, total_tax10, total_tax8)
-
-                # total_amountを計算
-                total_amount += (effective_price - discount) * quantity  # effective_priceを使用した計算
-
-                total_quantity += quantity
-                discount_amount += discount * quantity
-
-            # 合計を計算
-            self._calculate_totals(
-                transaction_instance, total_tax10, total_tax8, discount_amount, deposit, total_quantity, total_amount
-            )
-
-            # 取引を保存
             transaction_instance.save()
 
         return transaction_instance
 
     def _create_transaction(self, validated_data):
-        current_time = timezone.now()
         return Transaction.objects.create(
-            date=current_time, **validated_data, total_quantity=0, total_tax10=0, total_tax8=0, tax_amount=0, total_amount=0, change=0, discount_amount=0,
+            date=timezone.now(), **validated_data,
+            total_quantity=0, total_tax10=0, total_tax8=0,
+            tax_amount=0, total_amount=0, change=0, discount_amount=0,
         )
+
+    def _process_product(self, store_code, sale_product_data, status):
+        jan_code = sale_product_data["jan"]
+        product = self._get_product(jan_code)
+        stock = self._get_stock(store_code, product)
+
+        store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
+        effective_price = store_price.get_price() if store_price else product.price
+
+        if status != "training":
+            stock.stock -= sale_product_data.get("quantity", 1)
+            stock.save()
+
+        return product, stock, effective_price
 
     def _get_product(self, jan_code):
         try:
             return Product.objects.get(jan=jan_code)
         except Product.DoesNotExist:
-            raise serializers.ValidationError(f"JANコード {jan_code} は登録されていません。")
+            raise serializers.ValidationError(f"Product with JAN code {jan_code} is not registered.")
 
     def _get_stock(self, store_code, product):
         try:
             return Stock.objects.get(store_code=store_code, jan=product)
         except Stock.DoesNotExist:
             raise serializers.ValidationError(
-                f"店舗コード {store_code} と JANコード {product.jan} の在庫は登録されていません。"
+                f"Stock for store code {store_code} and JAN code {product.jan} is not registered."
             )
 
     def _create_transaction_detail(self, transaction_instance, product, effective_price, discount, quantity):
-        """トランザクション詳細を作成（effective_priceを使用）"""
         TransactionDetail.objects.create(
             transaction=transaction_instance,
-            jan=product,  # Productインスタンスを直接渡す
+            jan=product,
             name=product.name,
-            price=effective_price,  # effective_priceを使用
+            price=effective_price,
             tax=product.tax,
             discount=discount,
             quantity=quantity,
@@ -235,15 +186,13 @@ class TransactionSerializer(serializers.ModelSerializer):
             total_tax8 += (product.price - discount) * quantity
         return total_tax10, total_tax8
 
-    def _calculate_totals(
-        self, transaction_instance, total_tax10, total_tax8, discount_amount, deposit, total_quantity, total_amount
-    ):
-        transaction_instance.total_tax10 = total_tax10 * 10 // 110  # 10%税額
-        transaction_instance.total_tax8 = total_tax8 * 8 // 108  # 8%税額
+    def _calculate_totals(self, transaction_instance, total_tax10, total_tax8, discount_amount, deposit, total_quantity, total_amount):
+        transaction_instance.total_tax10 = total_tax10 * 10 // 110
+        transaction_instance.total_tax8 = total_tax8 * 8 // 108
         transaction_instance.tax_amount = transaction_instance.total_tax10 + transaction_instance.total_tax8
-        transaction_instance.total_amount = total_amount  # effective_priceを使用した合計
+        transaction_instance.total_amount = total_amount
         transaction_instance.discount_amount = discount_amount
-        transaction_instance.change = deposit - transaction_instance.total_amount
+        transaction_instance.change = deposit - total_amount
         transaction_instance.total_quantity = total_quantity
 
 
