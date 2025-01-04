@@ -163,7 +163,7 @@ class Transaction(BaseModel):
     class Status(models.TextChoices):
         SALE = "sale", "販売"
         VOID = "void", "返品"
-        TRANING = "traning", "トレーニング"
+        TRAINING = "training", "トレーニング"
 
     id = models.AutoField(primary_key=True, verbose_name="取引番号")
     status = models.CharField(max_length=50, choices=Status.choices, default=Status.SALE, verbose_name="取引状態")

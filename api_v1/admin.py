@@ -23,7 +23,7 @@ class NegativeStockFilter(admin.SimpleListFilter):
 
 class TransactionDetailInline(admin.TabularInline):
     model = TransactionDetail
-    extra = 1  # 商品を追加するための空行数
+    extra = 0  # 商品を追加するための空行数
     verbose_name = "取引詳細"
     verbose_name_plural = "取引詳細"
 

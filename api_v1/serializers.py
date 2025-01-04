@@ -52,12 +52,17 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
 
 class TransactionSerializer(serializers.ModelSerializer):
     sale_products = TransactionDetailSerializer(many=True)
-    date = serializers.DateTimeField(read_only=True)
+    date = serializers.DateTimeField(required=False)
 
     class Meta:
         model = Transaction
         fields = ["id", "status", "date", "store_code", "terminal_id", "staff_code", "total_tax10", "total_tax8", "tax_amount", "total_amount", "discount_amount", "deposit", "change", "total_quantity", "sale_products"]
-        read_only_fields = ["date", "id", "status", "total_quantity", "total_tax10", "total_tax8", "tax_amount", "total_amount", "change", "discount_amount"]
+        read_only_fields = ["id", "total_quantity", "total_tax10", "total_tax8", "tax_amount", "total_amount", "change", "discount_amount"]
+
+    def validate_status(self, value):
+        if value == "return":
+            raise serializers.ValidationError("このステータスは選択できません。")
+        return value
 
     def validate_deposit(self, value):
         if value <= 0:
@@ -74,6 +79,7 @@ class TransactionSerializer(serializers.ModelSerializer):
         deposit = validated_data.get("deposit")
         staff_code = validated_data.get("staff_code")
         store_code = validated_data["store_code"].store_code
+        status = validated_data.get("status")
 
         # 権限のチェック
         permission_checker = UserPermissionChecker(staff_code)
@@ -86,7 +92,7 @@ class TransactionSerializer(serializers.ModelSerializer):
         if "register" not in permissions:
             raise serializers.ValidationError("このスタッフは販売を行う権限がありません。")
 
-        # 所属店舗とPOSTされたstore_codeを確認
+        # staffの所属店舗とPOSTされたstore_codeを確認
         if user.affiliate_store.store_code != store_code:
             if "global" not in permissions:
                 raise serializers.ValidationError("このスタッフは自店のみ処理可能です。")
@@ -97,7 +103,7 @@ class TransactionSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError("このスタッフは売価変更を行う権限がありません。")
 
         total_quantity, total_tax10, total_tax8, discount_amount = 0, 0, 0, 0
-        total_amount = 0  # total_amountを初期化
+        total_amount = 0
 
         with transaction.atomic():
             transaction_instance = self._create_transaction(validated_data)
@@ -111,10 +117,58 @@ class TransactionSerializer(serializers.ModelSerializer):
                 stock = self._get_stock(store_code, product)
 
                 # StorePriceを取得
-                store_price = StorePrice.objects.filter(store_code__store_code=store_code, jan=product).first()
+                store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
 
                 # 店舗価格を取得
-                effective_price = store_price.get_price()
+                effective_price = store_price.get_price() if store_price else product.price
+
+                # トレーニングモードの場合在庫を減らさない
+                if status == "training":
+                    # 在庫を減らさず、通常の処理を続ける
+                    pass
+                else:
+                    stock.stock -= quantity
+                    stock.save()
+
+                # トランザクション詳細を作成（effective_priceを使用）
+                self._create_transaction_detail(transaction_instance, product, effective_price, discount, quantity)
+
+                # 税金計算
+                total_tax10, total_tax8 = self._calculate_tax(product, discount, quantity, total_tax10, total_tax8)
+
+                # total_amountを計算
+                total_amount += (effective_price - discount) * quantity  # effective_priceを使用した計算
+
+                total_quantity += quantity
+                discount_amount += discount * quantity
+
+            # 合計を計算
+            self._calculate_totals(
+                transaction_instance, total_tax10, total_tax8, discount_amount, deposit, total_quantity, total_amount
+            )
+
+            # 取引を保存
+            transaction_instance.save()
+
+        return transaction_instance
+
+        # 通常の処理（在庫の減少とデータベースへのコミット）
+        with transaction.atomic():
+            transaction_instance = self._create_transaction(validated_data)
+
+            for sale_product_data in sale_products_data:
+                jan_code = sale_product_data["jan"]
+                quantity = sale_product_data.get("quantity", 1)
+                discount = sale_product_data.get("discount", 0)
+
+                product = self._get_product(jan_code)
+                stock = self._get_stock(store_code, product)
+
+                # StorePriceを取得
+                store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
+
+                # 店舗価格を取得
+                effective_price = store_price.get_price() if store_price else product.price
 
                 # 在庫を減らす
                 stock.stock -= quantity

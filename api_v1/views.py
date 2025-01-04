@@ -260,6 +260,7 @@ class TransactionViewSet(viewsets.ModelViewSet):
         transaction_id = request.query_params.get("id")
         store_code = request.query_params.get("store_code")
         staff_code = request.query_params.get("staff_code")
+        status = request.query_params.get("status")
         start_date, end_date = self._parse_date_range(request)
 
         filters = {"date__range": [start_date, end_date]}
@@ -270,6 +271,8 @@ class TransactionViewSet(viewsets.ModelViewSet):
             filters["store_code__store_code"] = store_code
         if staff_code:
             filters["staff_code__staff_code"] = staff_code
+        if status is None:
+            filters["status"] = "sale"
 
         return self.queryset.filter(**filters)
 
