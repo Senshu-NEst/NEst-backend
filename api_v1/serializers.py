@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.utils import timezone
 from django.db import transaction
-from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice
+from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 
@@ -41,42 +41,66 @@ class UserPermissionChecker:
             raise serializers.ValidationError("指定されたスタッフが存在しません。")
 
 
+class PaymentSerializer(serializers.ModelSerializer):
+    payment_method = serializers.ChoiceField(choices=Payment.PAYMENT_METHOD_CHOICES)
+    amount = serializers.IntegerField()
+
+    class Meta:
+        model = Payment
+        fields = ['payment_method', 'amount']
+
+
 class TransactionDetailSerializer(serializers.ModelSerializer):
     jan = serializers.CharField()  # JANコードを受け取る
-    discount = serializers.IntegerField(required=False, default=0)  # 割引額を整数として受け取る
+    discount = serializers.IntegerField(required=False, default=0)
 
     class Meta:
         model = TransactionDetail
-        fields = ["jan", "discount", "quantity"]  # 必要なフィールドを指定
+        fields = ["jan", "discount", "quantity"]
 
 
 class TransactionSerializer(serializers.ModelSerializer):
     sale_products = TransactionDetailSerializer(many=True)
+    payments = PaymentSerializer(many=True)
     date = serializers.DateTimeField(required=False)
 
     class Meta:
         model = Transaction
-        fields = ["id", "status", "date", "store_code", "terminal_id", "staff_code", "total_tax10", "total_tax8", "tax_amount", "total_amount", "discount_amount", "deposit", "change", "total_quantity", "sale_products"]
-        read_only_fields = ["id", "total_quantity", "total_tax10", "total_tax8", "tax_amount", "total_amount", "change", "discount_amount"]
+        fields = ["id", "status", "date", "store_code", "terminal_id", "staff_code", "total_tax10", "total_tax8", "tax_amount", "discount_amount", "total_amount", "deposit", "change", "total_quantity", "payments", "sale_products"]
+        read_only_fields = ["id", "total_quantity", "total_tax10", "total_tax8", "tax_amount", "total_amount", "change", "discount_amount", "deposit"]
 
     def validate_status(self, value):
         if value == "return":
-            raise serializers.ValidationError("This status is not selectable.")
+            raise serializers.ValidationError("無効なstatusが指定されました。")
         return value
 
-    def validate_deposit(self, value):
-        if value <= 0:
-            raise serializers.ValidationError("Deposit must be a positive value.")
-        return value
 
     def validate_sale_products(self, value):
         if not value:
-            raise serializers.ValidationError("At least one product must be provided.")
+            raise serializers.ValidationError("")
+        return value
+
+    def validate_payments(self, value):
+        if not value:
+            raise serializers.ValidationError("支払方法を登録してください。")
+
+        total_cashless_amount = sum(
+            payment['amount'] for payment in value if payment['payment_method'] != 'cash'
+        )
+        total_amount = self.initial_data.get('total_amount', 0)
+
+        if total_cashless_amount > total_amount:
+            raise serializers.ValidationError("現金以外の支払方法の総計が合計金額を超えています。")
+
+        total_payments = sum(payment['amount'] for payment in value)
+        if total_payments < total_amount:
+            raise serializers.ValidationError("支払いの合計金額が取引の合計金額を下回っています。")
+
         return value
 
     def create(self, validated_data):
         sale_products_data = validated_data.pop("sale_products")
-        deposit = validated_data.get("deposit")
+        payments_data = validated_data.pop("payments")
         staff_code = validated_data.get("staff_code")
         store_code = validated_data["store_code"].store_code
         status = validated_data.get("status")
@@ -106,7 +130,12 @@ class TransactionSerializer(serializers.ModelSerializer):
         total_amount = 0
 
         with transaction.atomic():
-            transaction_instance = self._create_transaction(validated_data)
+            # depositの合計を計算
+            total_payments = sum(payment['amount'] for payment in payments_data)
+            
+            transaction_instance = Transaction.objects.create(
+                date=timezone.now(), **validated_data, deposit=total_payments, total_quantity=0, total_tax10=0, total_tax8=0, tax_amount=0, total_amount=0, change=0, discount_amount=0,
+            )
 
             for sale_product_data in sale_products_data:
                 product, stock, effective_price = self._process_product(store_code, sale_product_data, status)
@@ -124,20 +153,24 @@ class TransactionSerializer(serializers.ModelSerializer):
                 total_quantity += sale_product_data.get("quantity", 1)
                 discount_amount += sale_product_data.get("discount", 0) * sale_product_data.get("quantity", 1)
 
+            for payment_data in payments_data:
+                Payment.objects.create(
+                    transaction=transaction_instance,
+                    payment_method=payment_data['payment_method'],
+                    amount=payment_data['amount']
+                )
+
             self._calculate_totals(
                 transaction_instance, total_tax10, total_tax8,
-                discount_amount, deposit, total_quantity, total_amount
+                discount_amount, total_payments, total_quantity, total_amount
             )
-
             transaction_instance.save()
 
         return transaction_instance
 
     def _create_transaction(self, validated_data):
         return Transaction.objects.create(
-            date=timezone.now(), **validated_data,
-            total_quantity=0, total_tax10=0, total_tax8=0,
-            tax_amount=0, total_amount=0, change=0, discount_amount=0,
+            date=timezone.now(), **validated_data, total_quantity=0, total_tax10=0, total_tax8=0, tax_amount=0, total_amount=0, change=0, discount_amount=0,
         )
 
     def _process_product(self, store_code, sale_product_data, status):
@@ -158,25 +191,19 @@ class TransactionSerializer(serializers.ModelSerializer):
         try:
             return Product.objects.get(jan=jan_code)
         except Product.DoesNotExist:
-            raise serializers.ValidationError(f"Product with JAN code {jan_code} is not registered.")
+            raise serializers.ValidationError(f"JANコード {jan_code} は登録されていません。")
 
     def _get_stock(self, store_code, product):
         try:
             return Stock.objects.get(store_code=store_code, jan=product)
         except Stock.DoesNotExist:
             raise serializers.ValidationError(
-                f"Stock for store code {store_code} and JAN code {product.jan} is not registered."
+                f"店舗コード {store_code} と JANコード {product.jan} の在庫は登録されていません。"
             )
 
     def _create_transaction_detail(self, transaction_instance, product, effective_price, discount, quantity):
         TransactionDetail.objects.create(
-            transaction=transaction_instance,
-            jan=product,
-            name=product.name,
-            price=effective_price,
-            tax=product.tax,
-            discount=discount,
-            quantity=quantity,
+            transaction=transaction_instance, jan=product, name=product.name, price=effective_price, tax=product.tax, discount=discount, quantity=quantity,
         )
 
     def _calculate_tax(self, product, discount, quantity, total_tax10, total_tax8):
@@ -211,7 +238,7 @@ class StockSerializer(serializers.ModelSerializer):
         model = Stock
         fields = ['store_code', 'jan', 'stock', 'standard_price', 'store_price', 'tax']
 # TODO:なぜmodels側のget_priceだけでは価格が取得できないのか調査する
-# （現在のコードだとstore_priceが存在しない時のフォールバック処理を二回行なっていることになっている）
+#（現在のコードだとstore_priceが存在しない時のフォールバック処理を二回行なっていることになっている）
     def get_store_price(self, obj):
         store_price = StorePrice.objects.filter(store_code=obj.store_code, jan=obj.jan).first()
         return store_price.get_price() if store_price else obj.jan.price  # StorePriceがない場合はProductの価格を返す
@@ -232,7 +259,7 @@ class StockReceiveSerializer(serializers.Serializer):
         permission_checker = UserPermissionChecker(staff_code)
         permissions = permission_checker.get_permissions()
 
-        # スタッフの権限チェック
+        # 入荷権限のチェック
         if "stock_receive" not in permissions:
             raise serializers.ValidationError("入荷権限がありません。")
 

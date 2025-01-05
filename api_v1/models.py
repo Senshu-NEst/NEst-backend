@@ -220,6 +220,24 @@ class TransactionDetail(BaseModel):
         verbose_name_plural = "取引詳細一覧"
 
 
+class Payment(models.Model):
+    """支払い方法(中間テーブル)"""
+    PAYMENT_METHOD_CHOICES = [
+        ("cash", "現金"),
+        ("credit", "クレジットカード"),
+        ("point", "ポイント"),
+        ("voucher", "金券"),
+        ("QRcode", "QRコード決済"),
+    ]
+    transaction = models.ForeignKey('Transaction', related_name='payments', on_delete=models.CASCADE, verbose_name="取引")
+    payment_method = models.CharField(max_length=50, choices=PAYMENT_METHOD_CHOICES, verbose_name="支払方法")
+    amount = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="支払い金額")
+    class Meta:
+        unique_together = ("transaction", "payment_method")  # 同じ支払い手段は1度しか使えない
+        verbose_name = "支払い"
+        verbose_name_plural = "支払い一覧"
+
+
 class CustomUserManager(BaseUserManager):
     def create_user(self, staff_code, password=None, **extra_fields):
         """staff_codeとパスワードを使用してユーザーを作成"""
