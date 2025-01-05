@@ -51,12 +51,13 @@ class PaymentSerializer(serializers.ModelSerializer):
 
 
 class TransactionDetailSerializer(serializers.ModelSerializer):
-    jan = serializers.CharField()
+    tax = serializers.IntegerField(read_only=True)  # Intに変換しないとDRFではDecimalは文字列に変換されてしまう
     discount = serializers.IntegerField(required=False, default=0)
 
     class Meta:
         model = TransactionDetail
-        fields = ["jan", "discount", "quantity"]
+        fields = ["jan", "name", "price", "tax", "discount", "quantity"]
+        read_only_fields = ["name", "price", "tax"]
 
 
 class TransactionSerializer(serializers.ModelSerializer):
@@ -70,14 +71,13 @@ class TransactionSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "total_quantity", "total_tax10", "total_tax8", "tax_amount", "total_amount", "change", "discount_amount", "deposit"]
 
     def validate_status(self, value):
-        if value == "return":
+        if value == "void":
             raise serializers.ValidationError("無効なstatusが指定されました。")
         return value
 
-
     def validate_sale_products(self, value):
         if not value:
-            raise serializers.ValidationError("")
+            raise serializers.ValidationError("少なくとも1つの商品を指定してください。")
         return value
 
     def validate_payments(self, value):
@@ -93,22 +93,42 @@ class TransactionSerializer(serializers.ModelSerializer):
         status = validated_data.get("status")
 
         # 権限のチェック
-        permission_checker = UserPermissionChecker(staff_code)
-        permissions = permission_checker.get_permissions()
+        permissions = self._check_permissions(staff_code, store_code)
+        # 値引きがある場合のチェック
+        self._discount_check(sale_products_data, store_code, permissions)
 
-        # 所属店舗を取得
-        user = CustomUser.objects.get(staff_code=staff_code)
+        with transaction.atomic():
+            # 合計金額と支払い金額の計算
+            totals = self._calculate_totals(sale_products_data, store_code)
+            total_payments = sum(payment['amount'] for payment in payments_data)
+            
+            # トランザクションの作成（全てのフィールドに初期値を設定）
+            transaction_instance = Transaction.objects.create(
+                date=timezone.now(),
+                **validated_data,
+                deposit=total_payments,
+                change=total_payments - totals['total_amount'],  # お釣りを初期値として設定
+                total_quantity=totals['total_quantity'],
+                total_tax10=totals['total_tax10'],
+                total_tax8=totals['total_tax8'],
+                tax_amount=totals['tax_amount'],
+                discount_amount=totals['discount_amount'],
+                total_amount=totals['total_amount']
+            )
 
-        # register_permissionのチェック
-        if "register" not in permissions:
-            raise serializers.ValidationError("このスタッフは販売を行う権限がありません。")
+            # 取引詳細の作成
+            self._create_transaction_details(transaction_instance, sale_products_data, status, store_code)
 
-        # staffの所属店舗とPOSTされたstore_codeを確認
-        if user.affiliate_store.store_code != store_code:
-            if "global" not in permissions:
-                raise serializers.ValidationError("このスタッフは自店のみ処理可能です。")
+            # 支払データの保存
+            self._create_payments(transaction_instance, payments_data)
 
-        # 値引きがある場合の権限チェック
+            # 支払方法のバリデーション
+            self._validate_payments(total_payments, totals['total_amount'], payments_data)
+
+        return transaction_instance
+
+    def _discount_check(self, sale_products_data, store_code, permissions):
+        # 値引きがある際に行う共通処理
         for sale_product in sale_products_data:
             if sale_product.get("discount", 0) != 0 and "change_price" not in permissions:
                 raise serializers.ValidationError("このスタッフは売価変更を行う権限がありません。")
@@ -120,12 +140,34 @@ class TransactionSerializer(serializers.ModelSerializer):
             # 割引が商品価格を超えていないかチェック
             discount = sale_product.get("discount", 0)
             if discount > effective_price:
-                raise serializers.ValidationError(f"商品 {sale_product['jan']} の割引は商品価格を超えてはいけません。")
+                raise serializers.ValidationError(f"JAN:{sale_product['jan']} 割引額が商品価格を上回っています。")
 
-        total_quantity, total_tax10, total_tax8, discount_amount = 0, 0, 0, 0
+    def _check_permissions(self, staff_code, store_code):
+        # 権限のチェック
+        permission_checker = UserPermissionChecker(staff_code)
+        permissions = permission_checker.get_permissions()
+
+        # 所属店舗を取得
+        user = CustomUser.objects.get(staff_code=staff_code)
+
+        # レジ権限のチェック
+        if "register" not in permissions:
+            raise serializers.ValidationError("このスタッフは販売を行う権限がありません。")
+
+        # staffの所属店舗とPOSTされたstore_codeが異なる場合にglobal権限をチェック
+        if user.affiliate_store.store_code != store_code:
+            if "global" not in permissions:
+                raise serializers.ValidationError("このスタッフは自店のみ処理可能です。")
+
+        return permissions
+
+    def _calculate_totals(self, sale_products_data, store_code):
+        total_quantity = 0
+        total_tax10 = 0
+        total_tax8 = 0
+        discount_amount = 0
         total_amount = 0
 
-        # 値引きを考慮して合計金額を計算
         for sale_product_data in sale_products_data:
             product = self._get_product(sale_product_data["jan"])
             store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
@@ -133,74 +175,62 @@ class TransactionSerializer(serializers.ModelSerializer):
             discount = sale_product_data.get("discount", 0)
             quantity = sale_product_data.get("quantity", 1)
 
-            # 値引き後の金額を計算
-            total_amount += (effective_price - discount) * quantity
+            # 値引き後の商品ごとの小計を計算
+            subtotal = (effective_price - discount) * quantity
+
+            # 税額の計算（税込価格から税額を算出）
+            if product.tax == 10:
+                tax_amount = subtotal * 10 / 110
+                total_tax10 += tax_amount
+            elif product.tax == 8:
+                tax_amount = subtotal * 8 / 108
+                total_tax8 += tax_amount
+
+            total_amount += subtotal
             total_quantity += quantity
             discount_amount += discount * quantity
 
-        with transaction.atomic():
-            total_payments = sum(payment['amount'] for payment in payments_data)
-            
-            transaction_instance = Transaction.objects.create(
-                date=timezone.now(), **validated_data, deposit=total_payments, total_quantity=0, total_tax10=0, total_tax8=0, tax_amount=0, total_amount=total_amount, change=0, discount_amount=discount_amount,
+        return {
+            'total_quantity': total_quantity,
+            'total_tax10': round(total_tax10),
+            'total_tax8': round(total_tax8),
+            'tax_amount': round(total_tax10 + total_tax8),
+            'discount_amount': discount_amount,
+            'total_amount': total_amount
+        }
+
+    def _create_payments(self, transaction_instance, payments_data):
+        for payment_data in payments_data:
+            Payment.objects.create(
+                transaction=transaction_instance,
+                payment_method=payment_data['payment_method'],
+                amount=payment_data['amount']
             )
 
-            for sale_product_data in sale_products_data:
-                product, stock, effective_price = self._process_product(store_code, sale_product_data, status)
-                self._create_transaction_detail(
-                    transaction_instance, product, effective_price,
-                    sale_product_data.get("discount", 0), sale_product_data.get("quantity", 1)
-                )
+    def _validate_payments(self, total_payments, total_amount, payments_data):
+        # 支払方法のバリデーション
+        if total_payments < total_amount:
+            raise serializers.ValidationError("支払いの合計金額が取引の合計金額を下回っています。")
 
-                total_tax10, total_tax8 = self._calculate_tax(
-                    product, sale_product_data.get("discount", 0),
-                    sale_product_data.get("quantity", 1), total_tax10, total_tax8
-                )
-
-            for payment_data in payments_data:
-                Payment.objects.create(
-                    transaction=transaction_instance,
-                    payment_method=payment_data['payment_method'],
-                    amount=payment_data['amount']
-                )
-
-            # 支払方法のバリデーション
-            if total_payments < total_amount:
-                raise serializers.ValidationError("支払いの合計金額が取引の合計金額を下回っています。")
-
-            total_cashless_amount = sum(
-                payment['amount'] for payment in payments_data if payment['payment_method'] != 'cash'
-            )
-            
-            if total_cashless_amount > total_amount:
-                raise serializers.ValidationError("現金以外の支払方法の総計が合計金額を超えています。")
-
-            self._calculate_totals(
-                transaction_instance, total_tax10, total_tax8,
-                discount_amount, total_payments, total_quantity, total_amount
-            )
-            transaction_instance.save()
-
-        return transaction_instance
-
-    def _create_transaction(self, validated_data):
-        return Transaction.objects.create(
-            date=timezone.now(), **validated_data, total_quantity=0, total_tax10=0, total_tax8=0, tax_amount=0, total_amount=0, change=0, discount_amount=0,
+        total_cashless_amount = sum(
+            payment['amount'] for payment in payments_data if payment['payment_method'] != 'cash'
         )
+        
+        if total_cashless_amount > total_amount:
+            raise serializers.ValidationError("現金以外の支払方法の総計が合計金額を超えています。")
 
     def _process_product(self, store_code, sale_product_data, status):
-        jan_code = sale_product_data["jan"]
-        product = self._get_product(jan_code)
-        stock = self._get_stock(store_code, product)
-
+        product = self._get_product(sale_product_data["jan"])
         store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
         effective_price = store_price.get_price() if store_price else product.price
 
+        # トレーニングモードでない場合、在庫を減らす
         if status != "training":
+            stock = self._get_stock(store_code, product)
             stock.stock -= sale_product_data.get("quantity", 1)
             stock.save()
 
-        return product, stock, effective_price
+        return product, effective_price
 
     def _get_product(self, jan_code):
         try:
@@ -216,26 +246,21 @@ class TransactionSerializer(serializers.ModelSerializer):
                 f"店舗コード {store_code} と JANコード {product.jan} の在庫は登録されていません。"
             )
 
-    def _create_transaction_detail(self, transaction_instance, product, effective_price, discount, quantity):
-        TransactionDetail.objects.create(
-            transaction=transaction_instance, jan=product, name=product.name, price=effective_price, tax=product.tax, discount=discount, quantity=quantity,
-        )
+    def _create_transaction_details(self, transaction_instance, sale_products_data, status, store_code):
+        for sale_product_data in sale_products_data:
+            product, effective_price = self._process_product(store_code, sale_product_data, status)
+            discount = sale_product_data.get("discount", 0)
+            quantity = sale_product_data.get("quantity", 1)
 
-    def _calculate_tax(self, product, discount, quantity, total_tax10, total_tax8):
-        if product.tax == 10:
-            total_tax10 += (product.price - discount) * quantity
-        elif product.tax == 8:
-            total_tax8 += (product.price - discount) * quantity
-        return total_tax10, total_tax8
-
-    def _calculate_totals(self, transaction_instance, total_tax10, total_tax8, discount_amount, deposit, total_quantity, total_amount):
-        transaction_instance.total_tax10 = total_tax10 * 10 // 110
-        transaction_instance.total_tax8 = total_tax8 * 8 // 108
-        transaction_instance.tax_amount = transaction_instance.total_tax10 + transaction_instance.total_tax8
-        transaction_instance.total_amount = total_amount
-        transaction_instance.discount_amount = discount_amount
-        transaction_instance.change = deposit - total_amount
-        transaction_instance.total_quantity = total_quantity
+            TransactionDetail.objects.create(
+                transaction=transaction_instance,
+                jan=product,
+                name=product.name,
+                price=effective_price,
+                tax=product.tax,
+                discount=discount,
+                quantity=quantity
+            )
 
 
 class ProductSerializer(serializers.ModelSerializer):

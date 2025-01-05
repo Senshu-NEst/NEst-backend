@@ -1,8 +1,11 @@
 from django.contrib import admin
-from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice
+from django import forms
+from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment
 from django.utils import timezone
-from rest_framework_simplejwt.token_blacklist.admin import BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin
-from rest_framework_simplejwt.token_blacklist.admin import OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
+from rest_framework_simplejwt.token_blacklist.admin import (
+    BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin,
+    OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
+)
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 
 
@@ -28,16 +31,31 @@ class TransactionDetailInline(admin.TabularInline):
     verbose_name_plural = "取引詳細"
 
 
+class PaymentDetailInline(admin.TabularInline):
+    model = Payment
+    extra = 0  # 商品を追加するための空行数
+    verbose_name = "支払"
+    verbose_name_plural = "支払詳細"
+
+
+class StockInline(admin.TabularInline):
+    model = Stock
+    extra = 0  # 新しい在庫を追加するための空行数
+    verbose_name = "在庫"
+    verbose_name_plural = "在庫情報"
+
+
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
     list_display = ("jan", "name", "price", "tax", "status")
     search_fields = ("name", "jan")
-    list_filter = ("status",)
+    list_filter = ("status", "tax")
+    inlines = [StockInline]
 
 
 @admin.register(StorePrice)
-class ProductAdmin(admin.ModelAdmin):
-    list_display = ("store_code", "jan", "price",)
+class StorePriceAdmin(admin.ModelAdmin):
+    list_display = ("store_code", "jan", "jan__name", "price")
     search_fields = ("store_code", "jan")
     list_filter = ("store_code",)
 
@@ -57,7 +75,7 @@ class StoreAdmin(admin.ModelAdmin):
 @admin.register(Stock)
 class StockAdmin(admin.ModelAdmin):
     readonly_fields = ("updated_at",)
-    list_display = ("store_code", "jan", "stock")
+    list_display = ("store_code", "jan", "jan__name", "stock")
     search_fields = ("jan__name", "jan__jan")
     list_filter = ("store_code", NegativeStockFilter)  # カスタムフィルターを適用
 
@@ -65,42 +83,67 @@ class StockAdmin(admin.ModelAdmin):
 class StockReceiveHistoryItemInline(admin.TabularInline):
     model = StockReceiveHistoryItem
     extra = 0  # 商品を追加するための空行数
+    verbose_name = "入荷"
+    verbose_name_plural = "入荷商品"
 
 
 @admin.register(StockReceiveHistory)
 class StockReceiveHistoryAdmin(admin.ModelAdmin):
-    list_display = ("received_at", "store_code", "staff_code")
-    search_fields = ("store_code__store_code", "staff_code__staff_code")
-    inlines = [StockReceiveHistoryItemInline]  # 入荷した商品を関連づけて表示させる
+    list_display = ("received_at", "store_code__store_code", "staff_code__name")
+    search_fields = ()
+    list_filter = ("received_at", "store_code", "staff_code__name", "store_code")
+    inlines = [StockReceiveHistoryItemInline]  # 入荷した商品を紐づける
 
 
 @admin.register(Transaction)
 class TransactionAdmin(admin.ModelAdmin):
     list_display = ("id", "date", "store_code", "staff_code", "status", "total_amount")
     search_fields = ("id", "store_code__store_code", "staff_code__staff_code")
-    list_filter = ("status", "date", "store_code")
-    inlines = [TransactionDetailInline]  # 購入商品を関連づけて表示させる
+    list_filter = ("status", "date", "staff_code__name", "store_code")
+    inlines = [PaymentDetailInline, TransactionDetailInline]  # 支払い方法と購入商品を紐づける
 
 
-@admin.register(TransactionDetail)
-class TransactionDetailAdmin(admin.ModelAdmin):
-    list_display = ("transaction", "jan", "name", "price", "quantity")
-    search_fields = ("transaction__id", "jan__name")
-    list_filter = ("transaction",)
+class CustomUserAdminForm(forms.ModelForm):
+    password = forms.CharField(
+        label='パスワード',
+        widget=forms.PasswordInput,
+        required=False
+    )
+
+    class Meta:
+        model = CustomUser
+        fields = ('staff_code', 'name', 'affiliate_store', 'password', 'is_staff', 'is_superuser', 'permission')
 
 
 @admin.register(CustomUser)
 class CustomUserAdmin(admin.ModelAdmin):
-    readonly_fields =("staff_code","last_login",)
-    exclude = ("password",)
-    list_display = ("staff_code", "name", "permission", "is_superuser", "is_staff", "affiliate_store",)
+    form = CustomUserAdminForm
+    list_display = ("staff_code", "name", "is_staff", "is_superuser", "affiliate_store")
     search_fields = ("staff_code", "name")
     list_filter = ("is_staff", "is_superuser", "affiliate_store")
+
+    def get_form(self, request, obj=None, **kwargs):
+        form = super().get_form(request, obj, **kwargs)
+        if obj is None:  # 新規作成時
+            form.base_fields['password'].required = True  # 新規作成時はパスワードを必須にする
+        else:
+            form.base_fields.pop('password', None)  # 既存ユーザーの場合はパスワードフォームを表示させない
+        return form
+
+    def save_model(self, request, obj, form, change):
+        if not change:  # 新規作成の場合
+            password = form.cleaned_data.get('password')
+            if password:
+                obj.set_password(password)  # パスワードをハッシュ化して保存
+        obj.save()
 
 
 @admin.register(UserPermission)
 class UserPermissionAdmin(admin.ModelAdmin):
-    list_display = ("role_name", "register_permission", "global_permission", "change_price_permission", "void_permission", "stock_receive_permission")
+    list_display = (
+        "role_name", "register_permission", "global_permission",
+        "change_price_permission", "void_permission", "stock_receive_permission"
+    )
 
 
 # ブラックリストトークンの管理
@@ -111,23 +154,23 @@ class BlacklistedTokenAdmin(DefaultBlacklistedTokenAdmin):
         expired_tokens = queryset.filter(expires_at__lt=timezone.now())
         count = expired_tokens.count()
         expired_tokens.delete()
-        self.message_user(request, f"{count} expired blacklisted tokens deleted.")
+        self.message_user(request, f"{count} の期限切れのブラックリストトークンを削除しました。")
 
-    delete_expired_blacklisted_tokens.short_description = "Delete expired blacklisted tokens"
+    delete_expired_blacklisted_tokens.short_description = "期限切れのブラックリストトークンを削除"
 
 
 # 有効なトークンの管理
 class OutstandingTokenAdmin(DefaultOutstandingTokenAdmin):
     actions = ["delete_expired_outstanding_tokens"]
-    readonly_fields = ("user", "token", "created_at", "expires_at")  # 読み取り専用フィールド
+    readonly_fields = ("user", "token", "created_at", "expires_at")
 
     def delete_expired_outstanding_tokens(self, request, queryset):
         expired_tokens = queryset.filter(expires_at__lt=timezone.now())
         count = expired_tokens.count()
         expired_tokens.delete()
-        self.message_user(request, f"{count} expired outstanding tokens deleted.")
+        self.message_user(request, f"{count} の期限切れの有効トークンを削除しました。")
 
-    delete_expired_outstanding_tokens.short_description = "Delete expired outstanding tokens"
+    delete_expired_outstanding_tokens.short_description = "期限切れの有効トークンを削除"
 
     def has_add_permission(self, request):
         return False  # 新規作成を禁止

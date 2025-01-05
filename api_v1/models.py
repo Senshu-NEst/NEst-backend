@@ -27,19 +27,19 @@ class Product(BaseModel):
         DISCON = "discon", "終売"
 
     TAX_CHOICES = (
-        (0, "0% - 免税"),
-        (8, "8% - 軽減"),
-        (10, "10% - 通常"),
+        (0.0, "0% - 免税"),
+        (8.0, "8% - 軽減"),
+        (10.0, "10% - 通常"),
     )
 
     jan = models.CharField(max_length=13, primary_key=True, verbose_name="JANコード")
     name = models.CharField(max_length=255, verbose_name="商品名")
     price = models.IntegerField(validators=[MinValueValidator(0)],verbose_name="商品価格")
-    tax = models.IntegerField(default=8, choices=TAX_CHOICES, verbose_name="消費税率")
+    tax = models.DecimalField(max_digits=3, decimal_places=1, default=8.0, choices=TAX_CHOICES, verbose_name="消費税率")
     status = models.CharField(max_length=50, choices=Status.choices, default=Status.IN_DEAL, verbose_name="取引状態")
 
     def __str__(self):
-        return self.name
+        return self.jan
 
     class Meta:
         verbose_name = "商品"
@@ -123,6 +123,9 @@ class Stock(BaseModel):
         unique_together = ("store_code", "jan")  # 店番号とjanコードの組み合わせが一意である
         verbose_name = "在庫"
         verbose_name_plural = "在庫一覧"
+
+    def __str__(self):
+        return f"{self.store_code.store_code} - {self.jan}"
 
 
 class StorePrice(models.Model):
