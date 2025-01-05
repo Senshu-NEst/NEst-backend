@@ -2,6 +2,7 @@ from django.db import models
 from django.db import transaction
 from django.contrib.auth.models import BaseUserManager, AbstractBaseUser, PermissionsMixin
 from django.core.exceptions import ValidationError
+from django.core.validators import MaxValueValidator, MinValueValidator
 
 
 class BaseModel(models.Model):
@@ -11,6 +12,11 @@ class BaseModel(models.Model):
 
     class Meta:
         abstract = True
+
+    # save前にmodelsのバリデーションチェックを行う
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
 
 
 class Product(BaseModel):
@@ -28,7 +34,7 @@ class Product(BaseModel):
 
     jan = models.CharField(max_length=13, primary_key=True, verbose_name="JANコード")
     name = models.CharField(max_length=255, verbose_name="商品名")
-    price = models.IntegerField(verbose_name="商品価格")
+    price = models.IntegerField(validators=[MinValueValidator(0)],verbose_name="商品価格")
     tax = models.IntegerField(default=8, choices=TAX_CHOICES, verbose_name="消費税率")
     status = models.CharField(max_length=50, choices=Status.choices, default=Status.IN_DEAL, verbose_name="取引状態")
 
@@ -187,14 +193,14 @@ class Transaction(BaseModel):
     store_code = models.ForeignKey(Store, on_delete=models.CASCADE, verbose_name="店番号")
     terminal_id = models.CharField(max_length=50, verbose_name="端末番号")
     staff_code = models.ForeignKey("CustomUser", on_delete=models.CASCADE, verbose_name="スタッフコード")
-    total_tax10 = models.IntegerField(verbose_name="10%合計小計")
-    total_tax8 = models.IntegerField(verbose_name="8%税額小計")
-    tax_amount = models.IntegerField(verbose_name="税額合計")
-    total_amount = models.IntegerField(verbose_name="合計購入金額")
+    total_tax10 = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="10%合計小計")
+    total_tax8 = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="8%税額小計")
+    tax_amount = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="税額合計")
+    total_amount = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="合計購入金額")
     discount_amount = models.IntegerField(verbose_name="値引金額")
-    deposit = models.IntegerField(verbose_name="預かり金額")
-    change = models.IntegerField(verbose_name="釣銭金額")
-    total_quantity = models.IntegerField(verbose_name="合計購入点数")
+    deposit = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="預かり金額")
+    change = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="釣銭金額")
+    total_quantity = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="合計購入点数")
 
     def __str__(self):
         return f"取引番号: {self.id}"
@@ -212,7 +218,7 @@ class TransactionDetail(BaseModel):
     price = models.IntegerField(verbose_name="商品価格")
     tax = models.DecimalField(max_digits=3, decimal_places=1, verbose_name="消費税率")
     discount = models.IntegerField(verbose_name="値引金額")
-    quantity = models.IntegerField(verbose_name="購入点数")
+    quantity = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="購入点数")
 
     class Meta:
         unique_together = ("transaction", "jan")  # 1取引に同じ商品が存在しないことを保証
