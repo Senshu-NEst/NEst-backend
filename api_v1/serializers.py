@@ -51,7 +51,7 @@ class PaymentSerializer(serializers.ModelSerializer):
 
 
 class TransactionDetailSerializer(serializers.ModelSerializer):
-    jan = serializers.CharField()  # JANコードを受け取る
+    jan = serializers.CharField()
     discount = serializers.IntegerField(required=False, default=0)
 
     class Meta:
@@ -83,19 +83,6 @@ class TransactionSerializer(serializers.ModelSerializer):
     def validate_payments(self, value):
         if not value:
             raise serializers.ValidationError("支払方法を登録してください。")
-
-        total_cashless_amount = sum(
-            payment['amount'] for payment in value if payment['payment_method'] != 'cash'
-        )
-        total_amount = self.initial_data.get('total_amount', 0)
-
-        if total_cashless_amount > total_amount:
-            raise serializers.ValidationError("現金以外の支払方法の総計が合計金額を超えています。")
-
-        total_payments = sum(payment['amount'] for payment in value)
-        if total_payments < total_amount:
-            raise serializers.ValidationError("支払いの合計金額が取引の合計金額を下回っています。")
-
         return value
 
     def create(self, validated_data):
@@ -126,15 +113,36 @@ class TransactionSerializer(serializers.ModelSerializer):
             if sale_product.get("discount", 0) != 0 and "change_price" not in permissions:
                 raise serializers.ValidationError("このスタッフは売価変更を行う権限がありません。")
 
+            product = self._get_product(sale_product["jan"])
+            store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
+            effective_price = store_price.get_price() if store_price else product.price
+
+            # 割引が商品価格を超えていないかチェック
+            discount = sale_product.get("discount", 0)
+            if discount > effective_price:
+                raise serializers.ValidationError(f"商品 {sale_product['jan']} の割引は商品価格を超えてはいけません。")
+
         total_quantity, total_tax10, total_tax8, discount_amount = 0, 0, 0, 0
         total_amount = 0
 
+        # 値引きを考慮して合計金額を計算
+        for sale_product_data in sale_products_data:
+            product = self._get_product(sale_product_data["jan"])
+            store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
+            effective_price = store_price.get_price() if store_price else product.price
+            discount = sale_product_data.get("discount", 0)
+            quantity = sale_product_data.get("quantity", 1)
+
+            # 値引き後の金額を計算
+            total_amount += (effective_price - discount) * quantity
+            total_quantity += quantity
+            discount_amount += discount * quantity
+
         with transaction.atomic():
-            # depositの合計を計算
             total_payments = sum(payment['amount'] for payment in payments_data)
             
             transaction_instance = Transaction.objects.create(
-                date=timezone.now(), **validated_data, deposit=total_payments, total_quantity=0, total_tax10=0, total_tax8=0, tax_amount=0, total_amount=0, change=0, discount_amount=0,
+                date=timezone.now(), **validated_data, deposit=total_payments, total_quantity=0, total_tax10=0, total_tax8=0, tax_amount=0, total_amount=total_amount, change=0, discount_amount=discount_amount,
             )
 
             for sale_product_data in sale_products_data:
@@ -149,16 +157,23 @@ class TransactionSerializer(serializers.ModelSerializer):
                     sale_product_data.get("quantity", 1), total_tax10, total_tax8
                 )
 
-                total_amount += (effective_price - sale_product_data.get("discount", 0)) * sale_product_data.get("quantity", 1)
-                total_quantity += sale_product_data.get("quantity", 1)
-                discount_amount += sale_product_data.get("discount", 0) * sale_product_data.get("quantity", 1)
-
             for payment_data in payments_data:
                 Payment.objects.create(
                     transaction=transaction_instance,
                     payment_method=payment_data['payment_method'],
                     amount=payment_data['amount']
                 )
+
+            # 支払方法のバリデーション
+            if total_payments < total_amount:
+                raise serializers.ValidationError("支払いの合計金額が取引の合計金額を下回っています。")
+
+            total_cashless_amount = sum(
+                payment['amount'] for payment in payments_data if payment['payment_method'] != 'cash'
+            )
+            
+            if total_cashless_amount > total_amount:
+                raise serializers.ValidationError("現金以外の支払方法の総計が合計金額を超えています。")
 
             self._calculate_totals(
                 transaction_instance, total_tax10, total_tax8,
