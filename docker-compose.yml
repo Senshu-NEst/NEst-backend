@@ -1,0 +1,58 @@
+# db(Postgres),app(Django)のコンテナを作成
+services:
+  db:
+    # コンテナ名をpostgresに設定
+    container_name: postgres
+    # PostgreSQLのDockerfileをビルドする
+    build:
+      # ビルドコンテキストはカレントディレクトリ
+      context: .
+      dockerfile: containers/postgres/Dockerfile
+    # M1チップでも動くように
+    # Intel Macの場合あってもなくても動く
+    platform: linux/arm64/v8
+    # DBのボリュームを指定
+    # ローカルの/data/dbをコンテナの/var/lib/postgresql/dataにマウントする
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    # ヘルスチェック
+    healthcheck:
+      test: pg_isready -U "${POSTGRES_USER:-postgres}" || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # コンテナ内の環境変数を.envを使って設定
+    env_file:
+      - .env
+    environment:
+        TZ: Asia/Tokyo
+  api:
+    # コンテナ名をappに設定
+    container_name: api
+    # DjangoのDockerfileをビルドする
+    build:
+      # ビルドコンテキストはカレントディレクトリ
+      context: .
+      dockerfile: containers/django/Dockerfile
+    # ボリュームを指定
+    # ローカルのカレントディレクトリをコンテナの/codeにマウントする
+    # ローカルの/staticをコンテナの/staticにマウントする
+    volumes:
+      - ./backend:/api
+    # ローカルの8000番ポートとコンテナの8000番ポートをつなぐ
+    ports:
+      - "8500:8500"
+    # シェルスクリプトを実行
+    command: sh -c "/usr/local/bin/entrypoint.sh"
+    # コンテナ内の環境変数を.envを使って設定
+    env_file:
+      - .env
+    # 先にdbを起動してからappを起動する
+    depends_on:
+      db:
+        condition: service_healthy
+volumes:
+  db_data:
