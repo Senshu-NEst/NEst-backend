@@ -1,10 +1,11 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import TestViewSet, ProductViewSet, StockViewSet, TransactionViewSet, StockReceiveHistoryViewSet
+from .views import TestViewSet, ProductViewSet, StockViewSet, TransactionViewSet, StockReceiveHistoryViewSet, ProductVariationViewSet
 
 router = DefaultRouter()
 router.register(r"test", TestViewSet, basename="test")
 router.register(r"products", ProductViewSet)
+router.register(r'variations', ProductVariationViewSet)
 router.register(r'stocks', StockViewSet, basename='stock')
 router.register(r"transactions", TransactionViewSet)
 router.register(r'stock-receive-history', StockReceiveHistoryViewSet, basename='stockreceivehistory')

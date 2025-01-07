@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django import forms
-from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment
+from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail
 from django.utils import timezone
 from rest_framework_simplejwt.token_blacklist.admin import (
     BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin,
@@ -45,12 +45,25 @@ class StockInline(admin.TabularInline):
     verbose_name_plural = "在庫情報"
 
 
+class VariationDetailInline(admin.TabularInline):
+    model = ProductVariationDetail
+    extra = 1  # 新しいバリエーションを追加するための空行数
+    verbose_name = "商品色名"
+    verbose_name_plural = "商品色名一覧"
+
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
     list_display = ("jan", "name", "price", "tax", "status")
     search_fields = ("name", "jan")
     list_filter = ("status", "tax")
     inlines = [StockInline]
+
+
+@admin.register(ProductVariation)
+class ProductVariationAdmin(admin.ModelAdmin):
+    list_display = ("instore_jan", "name")
+    search_fields = ("instore_jan", "name")
+    inlines = [VariationDetailInline]  # 色名を関連づけて表示させる
 
 
 @admin.register(StorePrice)

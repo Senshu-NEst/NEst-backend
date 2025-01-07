@@ -6,8 +6,8 @@ from django.utils import timezone
 from django.db.models.query import QuerySet
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
-from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem
-from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer
+from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, ProductVariationDetail
+from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer, ProductVariationSerializer, ProductVariationDetailSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 
@@ -15,6 +15,12 @@ class ProductViewSet(viewsets.ModelViewSet):
     """商品情報に関するCRUD操作を提供するViewSet"""
     queryset = Product.objects.all()
     serializer_class = ProductSerializer
+
+
+class ProductVariationViewSet(viewsets.ModelViewSet):
+    """商品バリエーション情報を提供するViewSet"""
+    queryset = ProductVariation.objects.all()
+    serializer_class = ProductVariationSerializer
 
 
 class StockViewSet(viewsets.ModelViewSet):

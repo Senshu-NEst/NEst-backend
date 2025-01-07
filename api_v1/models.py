@@ -3,6 +3,7 @@ from django.db import transaction
 from django.contrib.auth.models import BaseUserManager, AbstractBaseUser, PermissionsMixin
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
+import random
 
 
 class BaseModel(models.Model):
@@ -82,6 +83,59 @@ class Product(BaseModel):
             batch_size = 500
             for i in range(0, len(stock_entries), batch_size):
                 Stock.objects.bulk_create(stock_entries[i:i + batch_size])
+
+
+class ProductVariation(models.Model):
+    """インストアJANコードを管理するモデル"""
+    instore_jan = models.CharField(primary_key=True, max_length=13, unique=True, editable=False, verbose_name="インストアJANコード")
+    name = models.CharField(max_length=50, verbose_name="代表商品名")
+    products = models.ManyToManyField(Product, through='ProductVariationDetail', related_name='variations')
+
+    def save(self, *args, **kwargs):
+        if not self.instore_jan:
+            self.instore_jan = self.generate_unique_instore_jan()
+        super().save(*args, **kwargs)
+
+    def generate_unique_instore_jan(self):
+        """ユニークなインストアJANを生成する"""
+        while True:
+            random_code = "20" + ''.join(random.choices('0123456789', k=10))
+            check_digit = self.calculate_check_digit(random_code)
+            instore_jan = random_code + str(check_digit)
+            if not ProductVariation.objects.filter(instore_jan=instore_jan).exists():
+                return instore_jan
+
+    def calculate_check_digit(self, base_jan):
+        """チェックデジットを計算する"""
+        if len(base_jan) != 12 or not base_jan.isdigit():
+            raise ValidationError("JANコードは12桁の数字である必要があります。")
+
+        total = sum(int(base_jan[i]) * (1 if i % 2 == 0 else 3) for i in range(12))
+        check_digit = (10 - (total % 10)) % 10
+        return check_digit
+
+    def __str__(self):
+        return self.instore_jan
+
+    class Meta:
+        verbose_name = "商品バリエーション"
+        verbose_name_plural = "商品バリエーション一覧"
+
+class ProductVariationDetail(models.Model):
+    """中間テーブル：商品とバリエーションの関係を管理するモデル"""
+    product_variation = models.ForeignKey(ProductVariation, on_delete=models.CASCADE, related_name='variation_details')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='variation_colors')
+    color_name = models.CharField(null=True, blank=True, max_length=50, verbose_name="色名")
+
+    class Meta:
+        unique_together = ('product_variation', 'product')  # 同じ商品が重複登録できないようにする
+
+    def __str__(self):
+        return f"{self.product.name} - {self.color_name} ({self.product_variation.instore_jan})"
+
+    class Meta:
+        verbose_name = "商品バリエーション詳細"
+        verbose_name_plural = "商品バリエーション詳細一覧"
 
 
 class Store(BaseModel):
