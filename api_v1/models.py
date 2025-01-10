@@ -3,6 +3,7 @@ from django.db import transaction
 from django.contrib.auth.models import BaseUserManager, AbstractBaseUser, PermissionsMixin
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
+import random
 
 
 class BaseModel(models.Model):
@@ -18,6 +19,25 @@ class BaseModel(models.Model):
         self.full_clean()
         super().save(*args, **kwargs)
 
+def calculate_checksum(numbers):
+    """チェックディジットを計算するための関数"""
+    accumulated_sum, multiplier = 0, 3
+    for number in reversed(numbers):
+        accumulated_sum += int(number) * multiplier
+        multiplier = 1 if multiplier == 3 else 3
+    return accumulated_sum
+
+def is_valid_jan_code(jan_code_str):
+    """JANコードのチェックディジットを検証する"""
+    if len(jan_code_str) not in [8, 13] or not jan_code_str.isdigit():
+        return False  # JANコードは8桁または13桁の数字である必要があります
+
+    numbers = list(jan_code_str[:-1])  # 最後の桁を除く
+    expected_cd = calculate_checksum(numbers) % 10
+    expected_cd = 10 - expected_cd if expected_cd != 0 else 0
+
+    actual_cd = int(jan_code_str[-1])  # 最後の桁を取得
+    return expected_cd == actual_cd
 
 class Product(BaseModel):
     """商品モデル"""
@@ -34,7 +54,7 @@ class Product(BaseModel):
 
     jan = models.CharField(max_length=13, primary_key=True, verbose_name="JANコード")
     name = models.CharField(max_length=255, verbose_name="商品名")
-    price = models.IntegerField(validators=[MinValueValidator(0)],verbose_name="商品価格")
+    price = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="商品価格")
     tax = models.DecimalField(max_digits=3, decimal_places=1, default=8.0, choices=TAX_CHOICES, verbose_name="消費税率")
     status = models.CharField(max_length=50, choices=Status.choices, default=Status.IN_DEAL, verbose_name="取引状態")
 
@@ -51,20 +71,12 @@ class Product(BaseModel):
 
     def validate_jan_code(self, jan_code):
         """JANコードのチェックディジットを検証する"""
-        if len(jan_code) not in [8, 13] or not jan_code.isdigit():
-            raise ValidationError("JANコードは8桁または13桁の数字である必要があります。")
-
-        # チェックディジットの計算
-        total = sum(int(jan_code[i]) * (1 if i % 2 == 0 else 3) for i in range(12))
-        check_digit = (10 - (total % 10)) % 10
-
-        if int(jan_code[-1]) != check_digit:
-            raise ValidationError("JANコードのチェックディジットが無効です。")
+        if not is_valid_jan_code(jan_code):
+            raise ValidationError("JANコードは8桁または13桁の数字である必要があります、またはチェックディジットが無効です。")
 
     def validate_tax_rate(self, tax_rate):
         if tax_rate not in [0, 8, 10]:
             raise ValidationError("税率は0, 8, 10のいずれかでなければなりません。")
-
 
     def save(self, *args, **kwargs):
         with transaction.atomic():
@@ -82,6 +94,59 @@ class Product(BaseModel):
             batch_size = 500
             for i in range(0, len(stock_entries), batch_size):
                 Stock.objects.bulk_create(stock_entries[i:i + batch_size])
+
+
+class ProductVariation(models.Model):
+    """インストアJANコードを管理するモデル"""
+    instore_jan = models.CharField(primary_key=True, max_length=13, unique=True, editable=False, verbose_name="インストアJANコード")
+    name = models.CharField(max_length=50, verbose_name="代表商品名")
+    products = models.ManyToManyField(Product, through='ProductVariationDetail', related_name='variations')
+
+    def save(self, *args, **kwargs):
+        if not self.instore_jan:
+            self.instore_jan = self.generate_unique_instore_jan()
+        super().save(*args, **kwargs)
+
+    def generate_unique_instore_jan(self):
+        """ユニークなインストアJANを生成する"""
+        while True:
+            random_code = "20" + ''.join(random.choices('0123456789', k=10))
+            check_digit = self.calculate_check_digit(random_code)
+            instore_jan = random_code + str(check_digit)
+            if not ProductVariation.objects.filter(instore_jan=instore_jan).exists():
+                return instore_jan
+
+    def calculate_check_digit(self, base_jan):
+        """チェックデジットを計算する"""
+        if len(base_jan) != 12 or not base_jan.isdigit():
+            raise ValidationError("JANコードは12桁の数字である必要があります。")
+
+        total = sum(int(base_jan[i]) * (1 if i % 2 == 0 else 3) for i in range(12))
+        check_digit = (10 - (total % 10)) % 10
+        return check_digit
+
+    def __str__(self):
+        return self.instore_jan
+
+    class Meta:
+        verbose_name = "商品バリエーション"
+        verbose_name_plural = "商品バリエーション一覧"
+
+class ProductVariationDetail(models.Model):
+    """中間テーブル：商品とバリエーションの関係を管理するモデル"""
+    product_variation = models.ForeignKey(ProductVariation, on_delete=models.CASCADE, related_name='variation_details')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='variation_colors')
+    color_name = models.CharField(null=True, blank=True, max_length=50, verbose_name="色名")
+
+    class Meta:
+        unique_together = ('product_variation', 'product')  # 同じ商品が重複登録できないようにする
+
+    def __str__(self):
+        return f"{self.product.name} - {self.color_name} ({self.product_variation.instore_jan})"
+
+    class Meta:
+        verbose_name = "商品バリエーション詳細"
+        verbose_name_plural = "商品バリエーション詳細一覧"
 
 
 class Store(BaseModel):
@@ -128,7 +193,7 @@ class Stock(BaseModel):
         return f"{self.store_code.store_code} - {self.jan}"
 
 
-class StorePrice(models.Model):
+class StorePrice(BaseModel):
     """店舗ごとの価格モデル"""
     store_code = models.ForeignKey(Store, on_delete=models.CASCADE, verbose_name="店番号")
     jan = models.ForeignKey(Product, on_delete=models.CASCADE, verbose_name="JANコード")
@@ -158,7 +223,7 @@ class StorePrice(models.Model):
         return self.jan.price  # StorePriceに価格が設定されていない場合はProductから価格を取得
 
 
-class StockReceiveHistory(models.Model):
+class StockReceiveHistory(BaseModel):
     """入荷履歴モデル"""
     store_code = models.ForeignKey(Store, on_delete=models.CASCADE, verbose_name="店番号")
     staff_code = models.ForeignKey("CustomUser", on_delete=models.CASCADE, verbose_name="入荷担当者")
@@ -173,7 +238,7 @@ class StockReceiveHistory(models.Model):
         verbose_name_plural = "入荷履歴一覧"
 
 
-class StockReceiveHistoryItem(models.Model):
+class StockReceiveHistoryItem(BaseModel):
     """入荷商品履歴モデル(中間テーブル)"""
     history = models.ForeignKey(StockReceiveHistory, related_name='items', on_delete=models.CASCADE)
     jan = models.ForeignKey('Product', on_delete=models.CASCADE, verbose_name="JANコード")
@@ -229,7 +294,7 @@ class TransactionDetail(BaseModel):
         verbose_name_plural = "取引詳細一覧"
 
 
-class Payment(models.Model):
+class Payment(BaseModel):
     """支払い方法(中間テーブル)"""
     PAYMENT_METHOD_CHOICES = [
         ("cash", "現金"),

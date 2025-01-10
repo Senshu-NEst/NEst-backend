@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.utils import timezone
 from django.db import transaction
-from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment
+from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 
@@ -264,9 +264,34 @@ class TransactionSerializer(serializers.ModelSerializer):
 
 
 class ProductSerializer(serializers.ModelSerializer):
+    """商品情報のシリアライザー"""
     class Meta:
         model = Product
-        fields = "__all__"
+        fields = ['jan', 'name', 'price', 'tax', 'status']
+
+
+class ProductVariationDetailSerializer(serializers.ModelSerializer):
+    """商品バリエーション詳細のシリアライザー"""
+    product = ProductSerializer()
+    class Meta:
+        model = ProductVariationDetail
+        fields = ['product', 'color_name', 'product_variation']
+
+
+class ProductVariationSerializer(serializers.ModelSerializer):
+    """商品バリエーションのシリアライザー"""
+    variations = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProductVariation
+        fields = ['instore_jan', 'name', 'variations']
+
+    def get_variations(self, obj):
+        """バリエーション詳細を取得するメソッド"""
+        variation_details = ProductVariationDetail.objects.filter(
+            product_variation=obj
+        ).select_related('product')
+        return ProductVariationDetailSerializer(variation_details, many=True).data
 
 
 class StockSerializer(serializers.ModelSerializer):
