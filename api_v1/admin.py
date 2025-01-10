@@ -1,11 +1,10 @@
 from django.contrib import admin
+from import_export import resources, fields
+from import_export.admin import ImportExportModelAdmin
 from django import forms
 from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail
 from django.utils import timezone
-from rest_framework_simplejwt.token_blacklist.admin import (
-    BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin,
-    OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
-)
+from rest_framework_simplejwt.token_blacklist.admin import BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin, OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 
 
@@ -22,6 +21,24 @@ class NegativeStockFilter(admin.SimpleListFilter):
         if self.value() == 'negative':
             return queryset.filter(stock__lt=0)
         return queryset
+
+
+class ProductResource(resources.ModelResource):
+    jan = fields.Field(attribute='jan', column_name='jan')
+
+    class Meta:
+        model = Product
+        fields = ('jan', 'name', 'price', 'tax')
+        import_id_fields = ('jan',)
+
+
+class StoreResource(resources.ModelResource):
+    store_code = fields.Field(attribute='store_code', column_name='store_code')
+
+    class Meta:
+        model = Store
+        fields = ('store_code', 'name',)
+        import_id_fields = ('store_code',)
 
 
 class TransactionDetailInline(admin.TabularInline):
@@ -51,8 +68,10 @@ class VariationDetailInline(admin.TabularInline):
     verbose_name = "商品色名"
     verbose_name_plural = "商品色名一覧"
 
+
 @admin.register(Product)
-class ProductAdmin(admin.ModelAdmin):
+class ProductAdmin(ImportExportModelAdmin):
+    resource_class = ProductResource
     list_display = ("jan", "name", "price", "tax", "status")
     search_fields = ("name", "jan")
     list_filter = ("status", "tax")
@@ -74,7 +93,8 @@ class StorePriceAdmin(admin.ModelAdmin):
 
 
 @admin.register(Store)
-class StoreAdmin(admin.ModelAdmin):
+class StoreAdmin(ImportExportModelAdmin):
+    resource_class = StoreResource
     list_display = ("store_code", "name")
     search_fields = ("name", "store_code")
 
