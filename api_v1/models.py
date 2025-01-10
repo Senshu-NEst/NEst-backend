@@ -1,9 +1,11 @@
+import random
 from django.db import models
 from django.db import transaction
 from django.contrib.auth.models import BaseUserManager, AbstractBaseUser, PermissionsMixin
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
-import random
+from .utils import is_valid_jan_code, calculate_check_digit
+
 
 
 class BaseModel(models.Model):
@@ -18,26 +20,6 @@ class BaseModel(models.Model):
     def save(self, *args, **kwargs):
         self.full_clean()
         super().save(*args, **kwargs)
-
-def calculate_checksum(numbers):
-    """チェックディジットを計算するための関数"""
-    accumulated_sum, multiplier = 0, 3
-    for number in reversed(numbers):
-        accumulated_sum += int(number) * multiplier
-        multiplier = 1 if multiplier == 3 else 3
-    return accumulated_sum
-
-def is_valid_jan_code(jan_code_str):
-    """JANコードのチェックディジットを検証する"""
-    if len(jan_code_str) not in [8, 13] or not jan_code_str.isdigit():
-        return False  # JANコードは8桁または13桁の数字である必要があります
-
-    numbers = list(jan_code_str[:-1])  # 最後の桁を除く
-    expected_cd = calculate_checksum(numbers) % 10
-    expected_cd = 10 - expected_cd if expected_cd != 0 else 0
-
-    actual_cd = int(jan_code_str[-1])  # 最後の桁を取得
-    return expected_cd == actual_cd
 
 class Product(BaseModel):
     """商品モデル"""
@@ -66,13 +48,9 @@ class Product(BaseModel):
         verbose_name_plural = "商品一覧"
 
     def clean(self):
-        self.validate_jan_code(self.jan)
+        is_valid_jan_code(self.jan)
         self.validate_tax_rate(self.tax)
 
-    def validate_jan_code(self, jan_code):
-        """JANコードのチェックディジットを検証する"""
-        if not is_valid_jan_code(jan_code):
-            raise ValidationError("JANコードは8桁または13桁の数字である必要があります、またはチェックディジットが無効です。")
 
     def validate_tax_rate(self, tax_rate):
         if tax_rate not in [0, 8, 10]:
@@ -95,7 +73,6 @@ class Product(BaseModel):
             for i in range(0, len(stock_entries), batch_size):
                 Stock.objects.bulk_create(stock_entries[i:i + batch_size])
 
-
 class ProductVariation(models.Model):
     """インストアJANコードを管理するモデル"""
     instore_jan = models.CharField(primary_key=True, max_length=13, unique=True, editable=False, verbose_name="インストアJANコード")
@@ -111,19 +88,10 @@ class ProductVariation(models.Model):
         """ユニークなインストアJANを生成する"""
         while True:
             random_code = "20" + ''.join(random.choices('0123456789', k=10))
-            check_digit = self.calculate_check_digit(random_code)
+            check_digit = calculate_check_digit(random_code)
             instore_jan = random_code + str(check_digit)
             if not ProductVariation.objects.filter(instore_jan=instore_jan).exists():
                 return instore_jan
-
-    def calculate_check_digit(self, base_jan):
-        """チェックデジットを計算する"""
-        if len(base_jan) != 12 or not base_jan.isdigit():
-            raise ValidationError("JANコードは12桁の数字である必要があります。")
-
-        total = sum(int(base_jan[i]) * (1 if i % 2 == 0 else 3) for i in range(12))
-        check_digit = (10 - (total % 10)) % 10
-        return check_digit
 
     def __str__(self):
         return self.instore_jan
@@ -147,7 +115,6 @@ class ProductVariationDetail(models.Model):
     class Meta:
         verbose_name = "商品バリエーション詳細"
         verbose_name_plural = "商品バリエーション詳細一覧"
-
 
 class Store(BaseModel):
     """店舗モデル"""

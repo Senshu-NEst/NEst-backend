@@ -30,6 +30,7 @@ class ProductResource(resources.ModelResource):
         model = Product
         fields = ('jan', 'name', 'price', 'tax')
         import_id_fields = ('jan',)
+        skip_unchanged = True
 
 
 class StoreResource(resources.ModelResource):
@@ -39,6 +40,7 @@ class StoreResource(resources.ModelResource):
         model = Store
         fields = ('store_code', 'name',)
         import_id_fields = ('store_code',)
+        skip_unchanged = True
 
 
 class TransactionDetailInline(admin.TabularInline):
