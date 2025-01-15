@@ -6,6 +6,7 @@
 # ディレクトリ
 __pycache__/
 migrations/
+static/
 
 #　隠しファイル
 .DS_Store

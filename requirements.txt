@@ -1,0 +1,13 @@
+Django
+psycopg2
+gunicorn
+djangorestframework
+djangorestframework_simplejwt
+#django-debug-toolbar
+#django-import-export
+
+#djangorestframework-api-key
+#requests==2.32.3
+#sqids==0.4.1
+#ulid-py==1.1.0
+#django-cors-headers==4.4.0
