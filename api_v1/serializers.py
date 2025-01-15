@@ -107,7 +107,7 @@ class TransactionSerializer(serializers.ModelSerializer):
                 date=timezone.now(),
                 **validated_data,
                 deposit=total_payments,
-                change=total_payments - totals['total_amount'],  # お釣りを初期値として設定
+                change=total_payments - totals['total_amount'],
                 total_quantity=totals['total_quantity'],
                 total_tax10=totals['total_tax10'],
                 total_tax8=totals['total_tax8'],
@@ -137,10 +137,10 @@ class TransactionSerializer(serializers.ModelSerializer):
             store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
             effective_price = store_price.get_price() if store_price else product.price
 
-            # 割引が商品価格を超えていないかチェック
+            # 割引が商品価格を超えていないかチェック、割引額は自然数のみ
             discount = sale_product.get("discount", 0)
-            if discount > effective_price:
-                raise serializers.ValidationError(f"JAN:{sale_product['jan']} 割引額が商品価格を上回っています。")
+            if discount > effective_price or discount < 0:
+                raise serializers.ValidationError(f"JAN:{sale_product['jan']} 不正な割引額が入力されました。")
 
     def _check_permissions(self, staff_code, store_code):
         # 権限のチェック
@@ -163,10 +163,9 @@ class TransactionSerializer(serializers.ModelSerializer):
 
     def _calculate_totals(self, sale_products_data, store_code):
         total_quantity = 0
-        total_tax10 = 0
-        total_tax8 = 0
+        total_amount_tax10 = 0
+        total_amount_tax8 = 0
         discount_amount = 0
-        total_amount = 0
 
         for sale_product_data in sale_products_data:
             product = self._get_product(sale_product_data["jan"])
@@ -175,26 +174,31 @@ class TransactionSerializer(serializers.ModelSerializer):
             discount = sale_product_data.get("discount", 0)
             quantity = sale_product_data.get("quantity", 1)
 
-            # 値引き後の商品ごとの小計を計算
-            subtotal = (effective_price - discount) * quantity
+            # 値引き後の商品ごとの税込小計を計算
+            subtotal_with_tax = (effective_price - discount) * quantity
 
-            # 税額の計算（税込価格から税額を算出）
+            # 税率ごとに税込合計金額を求める
             if product.tax == 10:
-                tax_amount = subtotal * 10 / 110
-                total_tax10 += tax_amount
+                total_amount_tax10 += subtotal_with_tax
             elif product.tax == 8:
-                tax_amount = subtotal * 8 / 108
-                total_tax8 += tax_amount
+                total_amount_tax8 += subtotal_with_tax
 
-            total_amount += subtotal
             total_quantity += quantity
             discount_amount += discount * quantity
 
+        # 税率ごとの合計金額に基づいて税額を計算
+        total_tax10 = total_amount_tax10 * 10 / 110
+        total_tax8 = total_amount_tax8 * 8 / 108
+        total_tax = total_tax10 + total_tax8
+        
+        # 合計金額を計算
+        total_amount = total_amount_tax10 + total_amount_tax8
+
         return {
             'total_quantity': total_quantity,
-            'total_tax10': round(total_tax10),
-            'total_tax8': round(total_tax8),
-            'tax_amount': round(total_tax10 + total_tax8),
+            'total_tax10': int(total_tax10),
+            'total_tax8': int(total_tax8),
+            'tax_amount': round(total_tax),
             'discount_amount': discount_amount,
             'total_amount': total_amount
         }
