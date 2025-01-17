@@ -6,6 +6,8 @@ from .models import Product, Store, Stock, Transaction, TransactionDetail, Custo
 from django.utils import timezone
 from rest_framework_simplejwt.token_blacklist.admin import BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin, OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
+from django.urls import reverse
+from django.utils.html import format_html
 
 
 class NegativeStockFilter(admin.SimpleListFilter):
@@ -132,10 +134,18 @@ class StockReceiveHistoryAdmin(admin.ModelAdmin):
 
 @admin.register(Transaction)
 class TransactionAdmin(admin.ModelAdmin):
-    list_display = ("id", "date", "store_code", "staff_code", "status", "total_amount")
+    list_display = ("id", "date", "store_code", "staff_code", "status", "total_amount", "receipt_button")
     search_fields = ("id", "store_code__store_code", "staff_code__staff_code")
     list_filter = ("status", "date", "staff_code__name", "store_code")
+    ordering = ("-id",)
     inlines = [PaymentDetailInline, TransactionDetailInline]  # 支払い方法と購入商品を紐づける
+
+    def receipt_button(self, obj):
+        return format_html(
+            '<a class="button" href="{}">レシート</a>',
+            reverse('generate_receipt_view', args=[obj.id, 'sale'])  # obj.id を使用
+        )
+    receipt_button.short_description = 'レシートを表示'
 
 
 class CustomUserAdminForm(forms.ModelForm):

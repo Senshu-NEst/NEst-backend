@@ -9,6 +9,11 @@ from typing import List, Dict, Tuple
 from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, ProductVariationDetail
 from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer, ProductVariationSerializer, ProductVariationDetailSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView
+from django.http import HttpResponse
+from django.shortcuts import get_object_or_404
+import requests
+from .get_receipt_data import generate_receipt_text, generate_return_receipt
+from django.contrib.auth.decorators import login_required
 
 
 class ProductViewSet(viewsets.ModelViewSet):
@@ -297,3 +302,30 @@ class TestViewSet(viewsets.ViewSet):
 class CustomTokenObtainPairView(TokenObtainPairView):
     """カスタマイズされたJWTトークン発行View"""
     serializer_class = CustomTokenObtainPairSerializer
+
+
+@login_required
+def generate_receipt_view(request, transaction_id, receipt_type):
+    try:
+        # Transactionオブジェクトの取得
+        transaction = get_object_or_404(Transaction, id=transaction_id)
+
+        # レシートの種類に応じてテキスト生成関数を切り替える
+        if receipt_type == 'sale':
+            receipt_text = generate_receipt_text(transaction)
+        elif receipt_type == 'return':
+            receipt_text = generate_return_receipt(transaction)
+        else:
+            return HttpResponse("無効な取引種別", content_type="text/plain")
+
+        # レシートデータをPOSTリクエストで送信
+        response = requests.post("http://receipt:6573/generate", data={"text": receipt_text})
+        if response.status_code == 200:
+            # HTMLコンテンツを取得してそのままレスポンスとして返す
+            html_content = response.text
+            return HttpResponse(html_content, content_type="text/html; charset=utf-8")
+        else:
+            return HttpResponse("レシートデータの取得に失敗しました", content_type="text/plain")
+
+    except Transaction.DoesNotExist:
+        return HttpResponse("取引が見つかりません", content_type="text/plain")

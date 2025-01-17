@@ -1,6 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import TestViewSet, ProductViewSet, StockViewSet, TransactionViewSet, StockReceiveHistoryViewSet, ProductVariationViewSet
+from .views import TestViewSet, ProductViewSet, StockViewSet, TransactionViewSet, StockReceiveHistoryViewSet, ProductVariationViewSet, generate_receipt_view 
 
 router = DefaultRouter()
 router.register(r"test", TestViewSet, basename="test")
@@ -13,4 +13,5 @@ router.register(r'stock-receive-history', StockReceiveHistoryViewSet, basename='
 
 urlpatterns = [
     path("", include(router.urls)),
+    path('transactions/receipt/id=<int:transaction_id>/<str:receipt_type>/', generate_receipt_view, name='generate_receipt_view'),
 ]
