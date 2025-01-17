@@ -20,6 +20,11 @@ SECRET_KEY = os.environ.get("SECRET_KEY")
 DEBUG = True
 ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS").split(" ")
 
+# debug toolberを表示するURL
+INTERNAL_IPS = [
+    "127.0.0.1",
+]
+
 INSTALLED_APPS = [
     # Djangoのデフォルトライブラリ
     "django.contrib.admin",
@@ -35,6 +40,7 @@ INSTALLED_APPS = [
     # 追加ライブラリ
     "rest_framework",
     "rest_framework_simplejwt.token_blacklist",
+    "debug_toolbar",
     "import_export",
 ]
 
@@ -47,6 +53,7 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "debug_toolbar.middleware.DebugToolbarMiddleware", # デバックツールバー
 ]
 
 TEMPLATES = [
@@ -68,7 +75,7 @@ TEMPLATES = [
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
 
-# データベース
+# データベース(sqlite3)
 #DATABASES = {
 #    "default": {
 #        "ENGINE": "django.db.backends.sqlite3",  # SQLite
@@ -76,7 +83,7 @@ WSGI_APPLICATION = "config.wsgi.application"
 #    }
 #}
 
-# データベース設定
+# データベース(postgresql)
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
@@ -113,7 +120,13 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # 作成したカスタムユーザーモデルを指定
 AUTH_USER_MODEL = "api_v1.CustomUser"
 
-mimetypes.add_type("text/css", ".css", True)
+# 本番環境で静的ファイルが読み込まれない時に試す
+# mimetypes.add_type("text/css", ".css", True)
+
+# リバースプロキシを噛ませてもデバックツールバーを表示する
+DEBUG_TOOLBAR_CONFIG = {
+    "SHOW_TOOLBAR_CALLBACK": lambda request: True,
+}
 
 # DRF設定
 REST_FRAMEWORK = {
