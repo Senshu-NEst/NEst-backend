@@ -135,6 +135,11 @@ class StockReceiveHistoryAdmin(admin.ModelAdmin):
 @admin.register(Transaction)
 class TransactionAdmin(admin.ModelAdmin):
     list_display = ("id", "date", "store_code", "staff_code", "status", "total_amount", "receipt_button")
+    fieldsets = [
+    ('取引情報',   {'fields': ("status", "date", ("store_code", "staff_code", "terminal_id"))}),
+    ('消費税', {'fields': (("total_tax10", "total_tax8"), "tax_amount")}),
+    ('金額情報',   {'fields': ("discount_amount", ("deposit", "change"), ("total_quantity","total_amount"))}),
+]
     search_fields = ("id", "store_code__store_code", "staff_code__staff_code")
     list_filter = ("status", "date", "staff_code__name", "store_code")
     ordering = ("-id",)
