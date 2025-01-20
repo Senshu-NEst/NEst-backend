@@ -14,6 +14,7 @@ from django.shortcuts import get_object_or_404
 import requests
 from .get_receipt_data import generate_receipt_text, generate_return_receipt
 from django.contrib.auth.decorators import login_required
+from collections import defaultdict
 
 
 class ProductViewSet(viewsets.ModelViewSet):
@@ -175,7 +176,7 @@ class StockReceiveHistoryViewSet(viewsets.ReadOnlyModelViewSet):
             start_date=start_date,
             end_date=end_date
         )
-        response_data = self._format_history_response(histories, jan)
+        response_data = self._format_history_response(histories)
         return Response(response_data)
 
     def _parse_date_range(self, request) -> Tuple[datetime, datetime]:
@@ -211,24 +212,31 @@ class StockReceiveHistoryViewSet(viewsets.ReadOnlyModelViewSet):
 
     def _format_history_response(
         self, 
-        histories: List[StockReceiveHistory], 
-        jan: str = None
+        histories: List[StockReceiveHistory]
     ) -> List[Dict]:
         """入荷履歴のレスポンスデータを整形"""
         response_data = []
         for history in histories:
-            items = history.items.filter(jan__jan=jan) if jan else history.items.all()
+            items = history.items.all()  # この履歴に関連する全アイテムを取得
+            
+            # アイテムをリストとしてまとめる
+            item_list = []
             for item in items:
-                response_data.append({
-                    "received_at": history.received_at,
-                    "staff_code": history.staff_code.staff_code,
-                    #"staff_name": history.staff_code.name,
-                    "store_code": history.store_code.store_code,
-                    #"store_name": history.store_code.name,
+                item_list.append({
                     "jan": item.jan.jan,
-                    #"product_name": item.jan.name,
                     "additional_stock": item.additional_stock,
+                    #"product_name": item.jan.name,  # 商品名を追加する場合
                 })
+            
+            # 履歴ごとにまとめてレスポンスに追加
+            response_data.append({
+                "received_at": history.received_at,
+                "staff_code": history.staff_code.staff_code,
+                #"staff_name": history.staff_code.name,  # スタッフ名を追加する場合
+                "store_code": history.store_code.store_code,
+                #"store_name": history.store_code.name,  # 店舗名を追加する場合
+                "items": item_list  # アイテムリストを追加
+            })
         return response_data
 
 
