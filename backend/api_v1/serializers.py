@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.utils import timezone
 from django.db import transaction
-from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer
+from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, WalletTransaction
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 
@@ -92,29 +92,41 @@ class TransactionSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         sale_products_data = validated_data.pop("sale_products", [])
         payments_data = validated_data.pop("payments", [])
-        staff_code = validated_data.pop("staff_code", None)  # staff_codeをpopする
-        store_code = validated_data.pop("store_code", None)  # store_codeをpopする
+        staff_code = validated_data.pop("staff_code", None)
+        store_code = validated_data.pop("store_code", None)
         status = validated_data.get("status")
-        user = validated_data.pop("user", None)  # userをpopする
-        terminal_id = validated_data.pop("terminal_id", None)  # terminal_idをpopする
+        user = validated_data.pop("user", None)
+        terminal_id = validated_data.pop("terminal_id", None)
 
         # 権限のチェック
         permissions = self._check_permissions(staff_code, store_code)
         # 値引きがある場合のチェック
         self._discount_check(sale_products_data, store_code, permissions)
 
+        # 合計金額の計算
+        totals = self._calculate_totals(sale_products_data, store_code)
+        total_payments = sum(payment['amount'] for payment in payments_data)
+
+        # 支払方法のバリデーションを先に行う
+        self._validate_payments(total_payments, totals['total_amount'], payments_data)
+
         with transaction.atomic():
-            # 合計金額と支払い金額の計算
-            totals = self._calculate_totals(sale_products_data, store_code)
-            total_payments = sum(payment['amount'] for payment in payments_data)
-            
+            wallet = user.wallet
+
+            # ウォレット残高のチェック
+            wallet_payments = [p for p in payments_data if p['payment_method'] == 'wallet']
+            if wallet_payments:
+                total_wallet_payment = sum(p['amount'] for p in wallet_payments)
+                if total_wallet_payment > wallet.balance:
+                    raise serializers.ValidationError("ウォレットの残高が不足しています。")
+
             # トランザクションの作成
             transaction_instance = Transaction.objects.create(
                 date=timezone.now(),
-                user=user,  # userフィールドを設定
-                terminal_id=terminal_id,  # terminal_idを設定
-                staff_code=staff_code,  # staff_codeを設定
-                store_code=store_code,  # store_codeを設定
+                user=user,
+                terminal_id=terminal_id,
+                staff_code=staff_code,
+                store_code=store_code,
                 deposit=total_payments,
                 change=total_payments - totals['total_amount'],
                 total_quantity=totals['total_quantity'],
@@ -123,17 +135,18 @@ class TransactionSerializer(serializers.ModelSerializer):
                 tax_amount=totals['tax_amount'],
                 discount_amount=totals['discount_amount'],
                 total_amount=totals['total_amount'],
-                **validated_data  # その他のフィールドを設定
+                **validated_data
             )
+
+            # ウォレットからの支払い処理
+            if wallet_payments:
+                wallet.withdraw(total_wallet_payment, transaction=transaction_instance)  # Transaction IDを渡す
 
             # 取引詳細の作成
             self._create_transaction_details(transaction_instance, sale_products_data, status, store_code)
 
             # 支払データの保存
             self._create_payments(transaction_instance, payments_data)
-
-            # 支払方法のバリデーション
-            self._validate_payments(total_payments, totals['total_amount'], payments_data)
 
         return transaction_instance
 
@@ -350,6 +363,30 @@ class StockReceiveSerializer(serializers.Serializer):
                 raise serializers.ValidationError("このスタッフは他店舗の在庫を操作できません。")
 
         return data
+
+
+class WalletChargeSerializer(serializers.Serializer):
+    user_id = serializers.CharField() 
+    amount = serializers.DecimalField(max_digits=10, decimal_places=2)
+
+    def validate_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("入金額は正の値である必要があります。")
+        return value
+
+    def validate_user_id(self, value):
+        if not CustomUser.objects.filter(id=value).exists():
+            raise serializers.ValidationError("指定されたユーザーは存在しません。")
+        return value
+
+
+class WalletBalanceSerializer(serializers.Serializer):
+    user_id = serializers.CharField() 
+
+    def validate_user_id(self, value):
+        if not CustomUser.objects.filter(id=value).exists():
+            raise serializers.ValidationError("指定されたユーザーは存在しません。")
+        return value
 
 
 class StockReceiveHistoryItemSerializer(serializers.ModelSerializer):

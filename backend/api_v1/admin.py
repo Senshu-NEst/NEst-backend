@@ -2,11 +2,12 @@ from django.contrib import admin
 from import_export import resources, fields
 from import_export.admin import ImportExportModelAdmin
 from django import forms
-from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, \
-    StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer
+from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction
 from django.utils import timezone
-from rest_framework_simplejwt.token_blacklist.admin import BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin, \
+from rest_framework_simplejwt.token_blacklist.admin import (
+    BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin,
     OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
+)
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 from django.urls import reverse
 from django.utils.html import format_html
@@ -17,46 +18,36 @@ class NegativeStockFilter(admin.SimpleListFilter):
     parameter_name = 'negative_stock'
 
     def lookups(self, request, model_admin):
-        return (
-            ('negative', 'マイナス在庫'),
-        )
+        return (('negative', 'マイナス在庫'),)
 
     def queryset(self, request, queryset):
-        if self.value() == 'negative':
-            return queryset.filter(stock__lt=0)
-        return queryset
+        return queryset.filter(stock__lt=0) if self.value() == 'negative' else queryset
 
 
 class ProductResource(resources.ModelResource):
-    jan = fields.Field(attribute='jan', column_name='jan')
-
     class Meta:
         model = Product
-        fields = ('jan', 'name', 'price', 'tax')
         import_id_fields = ('jan',)
         skip_unchanged = True
 
 
 class StoreResource(resources.ModelResource):
-    store_code = fields.Field(attribute='store_code', column_name='store_code')
-
     class Meta:
         model = Store
-        fields = ('store_code', 'name',)
         import_id_fields = ('store_code',)
         skip_unchanged = True
 
 
 class TransactionDetailInline(admin.TabularInline):
     model = TransactionDetail
-    extra = 0  # 商品を追加するための空行数
+    extra = 0
     verbose_name = "取引詳細"
     verbose_name_plural = "取引詳細"
 
 
 class PaymentDetailInline(admin.TabularInline):
     model = Payment
-    extra = 0  # 商品を追加するための空行数
+    extra = 0
     verbose_name = "支払"
     verbose_name_plural = "支払詳細"
 
@@ -105,10 +96,7 @@ class StoreAdmin(ImportExportModelAdmin):
     search_fields = ("name", "store_code")
 
     def get_readonly_fields(self, request, obj=None):
-        # 新規店舗追加時はstore_codeを編集可能にする
-        if obj is None:
-            return []
-        return ("store_code",)  # 既存の店舗の場合はstore_codeをreadonlyにする
+        return [] if obj is None else ("store_code",)
 
 
 @admin.register(Stock)
@@ -116,12 +104,12 @@ class StockAdmin(admin.ModelAdmin):
     readonly_fields = ("updated_at",)
     list_display = ("store_code", "jan", "jan__name", "stock")
     search_fields = ("jan__name", "jan__jan")
-    list_filter = ("store_code", NegativeStockFilter)  # カスタムフィルターを適用
+    list_filter = ("store_code", NegativeStockFilter)
 
 
 class StockReceiveHistoryItemInline(admin.TabularInline):
     model = StockReceiveHistoryItem
-    extra = 0  # 商品を追加するための空行数
+    extra = 0
     verbose_name = "入荷"
     verbose_name_plural = "入荷商品"
 
@@ -129,43 +117,71 @@ class StockReceiveHistoryItemInline(admin.TabularInline):
 @admin.register(StockReceiveHistory)
 class StockReceiveHistoryAdmin(admin.ModelAdmin):
     list_display = ("received_at", "store_code__store_code", "staff_code__name")
-    search_fields = ()
-    list_filter = ("received_at", "store_code", "staff_code__name", "store_code")
-    inlines = [StockReceiveHistoryItemInline]  # 入荷した商品を紐づける
+    list_filter = ("received_at", "store_code", "staff_code__name")
+    inlines = [StockReceiveHistoryItemInline]
 
 
 @admin.register(Transaction)
 class TransactionAdmin(admin.ModelAdmin):
     list_display = ("id", "date", "store_code", "staff_code", "status", "total_amount", "receipt_button")
     fieldsets = [
-    ('取引情報',   {'fields': ("status", "date", ("store_code", "staff_code","user", "terminal_id"))}),
-    ('消費税', {'fields': (("total_tax10", "total_tax8"), "tax_amount")}),
-    ('金額情報',   {'fields': ("discount_amount", ("deposit", "change"), ("total_quantity","total_amount"))}),
-]
+        ('取引情報', {'fields': ("status", "date", ("store_code", "staff_code", "user", "terminal_id"))}),
+        ('消費税', {'fields': (("total_tax10", "total_tax8"), "tax_amount")}),
+        ('金額情報', {'fields': ("discount_amount", ("deposit", "change"), ("total_quantity", "total_amount"))}),
+    ]
     search_fields = ("id", "store_code__store_code", "staff_code__staff_code")
     list_filter = ("status", "date", "staff_code__name", "store_code")
     ordering = ("-id",)
-    inlines = [PaymentDetailInline, TransactionDetailInline]  # 支払い方法と購入商品を紐づける
+    inlines = [PaymentDetailInline, TransactionDetailInline]
 
     def receipt_button(self, obj):
-        return format_html(
-            '<a class="button" href="{}">レシート</a>',
-            reverse('generate_receipt_view', args=[obj.id, 'sale'])  # obj.id を使用
-        )
+        return format_html('<a class="button" href="{}">レシート</a>', reverse('generate_receipt_view', args=[obj.id, 'sale']))
     receipt_button.short_description = 'レシートを表示'
 
 
+class WalletTransactionInline(admin.TabularInline):
+    model = WalletTransaction
+    extra = 0
+    fields = ('transaction_type', 'amount', 'balance', 'transaction', 'created_at')
+    readonly_fields = ('created_at',)
+    ordering = ('-created_at',)
+
+
+@admin.register(WalletTransaction)
+class WalletTransactionAdmin(admin.ModelAdmin):
+    list_display = ('transaction_type', 'amount', 'balance', 'transaction_link', 'created_at', 'user_email')
+    readonly_fields = ('created_at',)
+    ordering = ('-created_at',)
+    list_filter = ('transaction_type',)
+    search_fields = ('wallet__user__email',)
+
+    def user_email(self, obj):
+        return obj.wallet.user.email if obj.wallet and obj.wallet.user else '不明'
+    user_email.short_description = 'ユーザーのメールアドレス'
+
+    def transaction_link(self, obj):
+        if obj.transaction:
+            url = f"/admin/api_v1/transaction/{obj.transaction.id}/"
+            return format_html('<a href="{}">{}</a>', url, obj.transaction)
+        return '不明'
+    transaction_link.short_description = '関連取引'
+    transaction_link.admin_order_field = 'transaction'
+
+
+@admin.register(Wallet)
+class WalletAdmin(admin.ModelAdmin):
+    list_display = ("user", "balance")
+    search_fields = ("user__email",)
+    list_filter = ("user",)
+    inlines = [WalletTransactionInline]
+
+
 class CustomUserAdminForm(forms.ModelForm):
-    password = forms.CharField(
-        label='パスワード',
-        widget=forms.PasswordInput,
-        required=False
-    )
+    password = forms.CharField(label='パスワード', widget=forms.PasswordInput, required=False)
 
     class Meta:
         model = CustomUser
         fields = ('email', 'password', 'user_type', 'is_staff', 'is_superuser')
-
 
 
 @admin.register(CustomUser)
@@ -181,14 +197,11 @@ class CustomUserAdmin(admin.ModelAdmin):
             form.base_fields['password'].required = True
         else:
             form.base_fields.pop('password', None)
-            return form
+        return form
 
     def get_inlines(self, request, obj=None):
-        if obj is not None:
-            if obj.user_type == 'staff':
-                return [StaffInline]
-            elif obj.user_type == 'customer':
-                return [CustomerInline]
+        if obj:
+            return [StaffInline] if obj.user_type == 'staff' else [CustomerInline]
         return []
 
     def save_model(self, request, obj, form, change):
@@ -206,23 +219,21 @@ class CustomUserAdmin(admin.ModelAdmin):
 
         # ユーザータイプによる情報の自動生成
         if obj.user_type == 'staff':
-            # 既存のStaffインスタンスを取得
             staff_profile, created = Staff.objects.get_or_create(user=obj)
             if created:
-                staff_profile.staff_code = '初期コード'  # 適切な初期値を設定
-                staff_profile.name = 'スタッフ名'        # 適切な初期値を設定
-                staff_profile.affiliate_store = None      # 適切な初期値を設定
-                staff_profile.permission = None            # 適切な初期値を設定
+                staff_profile.staff_code = '初期コード'
+                staff_profile.name = 'スタッフ名'
+                staff_profile.affiliate_store = None
+                staff_profile.permission = None
                 staff_profile.save()  # 変更を保存
 
         elif obj.user_type == 'customer':
-            # 既存のCustomerインスタンスを取得
             customer_profile, created = Customer.objects.get_or_create(user=obj)
             if created:
-                customer_profile.name = '顧客名'            # 適切な初期値を設定
-                customer_profile.phone_number = ''          # 初期値
-                customer_profile.address = ''                # 初期値
-                customer_profile.save()  # 変更を保存
+                customer_profile.name = '顧客名'
+                customer_profile.phone_number = ''
+                customer_profile.address = ''
+                customer_profile.save()
 
         # ユーザータイプが変更された場合、元の関連テーブルから情報を削除
         if change:
@@ -309,3 +320,8 @@ admin.site.unregister(OutstandingToken)
 
 admin.site.register(BlacklistedToken, BlacklistedTokenAdmin)
 admin.site.register(OutstandingToken, OutstandingTokenAdmin)
+
+# 管理画面のタイトル設定
+admin.site.site_header = "商品管理システム"
+admin.site.index_title = "管理画面"
+admin.site.site_title = "管理者"

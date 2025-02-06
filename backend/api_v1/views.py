@@ -6,8 +6,8 @@ from django.utils import timezone
 from django.db.models.query import QuerySet
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
-from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, ProductVariationDetail
-from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer, ProductVariationSerializer, ProductVariationDetailSerializer
+from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, ProductVariationDetail, Wallet, WalletTransaction
+from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer, ProductVariationSerializer, ProductVariationDetailSerializer, WalletChargeSerializer, WalletBalanceSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
@@ -308,6 +308,50 @@ class TestViewSet(viewsets.ViewSet):
             "remote_address": request.META.get("REMOTE_ADDR"),
             "current_time": timezone.now(),
         })
+
+
+class WalletViewSet(viewsets.ViewSet):
+
+    @action(detail=False, methods=['post'], url_path='charge')
+    def charge(self, request):
+        serializer = WalletChargeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        user_id = serializer.validated_data['user_id']
+        amount = serializer.validated_data['amount']
+
+        try:
+            user = CustomUser.objects.get(id=user_id)
+            wallet = user.wallet
+            wallet.deposit(amount)
+
+            # ウォレットトランザクションを作成（transactionはnullに設定）
+            WalletTransaction.objects.create(
+                wallet=wallet,
+                amount=amount,
+                transaction_type='credit',
+                transaction=None  # チャージ時はnull
+            )
+
+            return Response({"message": "チャージが成功しました。", "new_balance": str(wallet.balance)}, status=status.HTTP_200_OK)
+        except Wallet.DoesNotExist:
+            return Response({"error": "指定されたユーザーのウォレットは存在しません。"}, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['get'], url_path='balance')
+    def get_balance(self, request):
+        serializer = WalletBalanceSerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+
+        user_id = serializer.validated_data['user_id']
+
+        try:
+            user = CustomUser.objects.get(id=user_id)
+            wallet = user.wallet
+            return Response({"user_id": user_id, "balance": str(wallet.balance)}, status=status.HTTP_200_OK)
+        except Wallet.DoesNotExist:
+            return Response({"error": "指定されたユーザーのウォレットは存在しません。"}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class CustomTokenObtainPairView(TokenObtainPairView):
