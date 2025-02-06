@@ -1,5 +1,6 @@
 import random, string
 
+
 def calculate_checksum(numbers):
     """チェックディジットを計算するための関数"""
     accumulated_sum, multiplier = 0, 3
@@ -7,6 +8,7 @@ def calculate_checksum(numbers):
         accumulated_sum += int(number) * multiplier
         multiplier = 1 if multiplier == 3 else 3
     return accumulated_sum
+
 
 def is_valid_jan_code(jan_code_str):
     """JANコードのチェックディジットを検証する"""
@@ -20,6 +22,7 @@ def is_valid_jan_code(jan_code_str):
     actual_cd = int(jan_code_str[-1])  # 最後の桁を取得
     return expected_cd == actual_cd
 
+
 def calculate_check_digit(base_jan):
     """JANコードのチェックデジットを計算する"""
     if len(base_jan) != 12 or not base_jan.isdigit():
@@ -28,6 +31,17 @@ def calculate_check_digit(base_jan):
     total = sum(int(base_jan[i]) * (1 if i % 2 == 0 else 3) for i in range(12))
     check_digit = (10 - (total % 10)) % 10
     return check_digit
+
+
+def generate_unique_instore_jan(existing_variations):
+    """ユニークなインストアJANを生成する関数"""
+    while True:
+        random_code = "20" + ''.join(random.choices('0123456789', k=10))
+        check_digit = calculate_check_digit(random_code)
+        instore_jan = random_code + str(check_digit)
+        if instore_jan not in existing_variations:
+            return instore_jan
+
 
 def generate_random_password(length):
     """指定された長さのランダムなパスワードを生成します。"""

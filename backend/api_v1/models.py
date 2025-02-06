@@ -1,11 +1,10 @@
-import random, ulid
-from django.db import models
-from django.db import transaction
+import random
+import ulid
+from django.db import models, transaction
 from django.contrib.auth.models import BaseUserManager, AbstractBaseUser, PermissionsMixin
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
-from .utils import is_valid_jan_code, calculate_check_digit
-
+from .utils import is_valid_jan_code, generate_unique_instore_jan
 
 
 class BaseModel(models.Model):
@@ -20,6 +19,7 @@ class BaseModel(models.Model):
     def save(self, *args, **kwargs):
         self.full_clean()
         super().save(*args, **kwargs)
+
 
 class Product(BaseModel):
     """商品モデル"""
@@ -40,17 +40,16 @@ class Product(BaseModel):
     tax = models.DecimalField(max_digits=3, decimal_places=1, default=8.0, choices=TAX_CHOICES, verbose_name="消費税率")
     status = models.CharField(max_length=50, choices=Status.choices, default=Status.IN_DEAL, verbose_name="取引状態")
 
-    def __str__(self):
-        return self.jan
-
     class Meta:
         verbose_name = "商品"
         verbose_name_plural = "商品一覧"
 
+    def __str__(self):
+        return self.jan
+
     def clean(self):
         is_valid_jan_code(self.jan)
         self.validate_tax_rate(self.tax)
-
 
     def validate_tax_rate(self, tax_rate):
         if tax_rate not in [0, 8, 10]:
@@ -59,85 +58,36 @@ class Product(BaseModel):
     def save(self, *args, **kwargs):
         with transaction.atomic():
             super().save(*args, **kwargs)
-
             stores = Store.objects.all()
-            existing_stocks = set(Stock.objects.filter(jan=self).values_list('store_code_id', flat=True))  # 既存の在庫の店舗コードをセットで取得
+            existing_stocks = set(Stock.objects.filter(jan=self).values_list('store_code_id', flat=True))
 
-            stock_entries = []
-            for store in stores:
-                if store.store_code not in existing_stocks:  # 既存の在庫がない場合のみ追加
-                    stock_entries.append(Stock(store_code=store, jan=self, stock=0))  # 初期在庫は0
+            stock_entries = [
+                Stock(store_code=store, jan=self, stock=0)
+                for store in stores if store.store_code not in existing_stocks
+            ]
 
-            # バッチ処理
             batch_size = 500
             for i in range(0, len(stock_entries), batch_size):
                 Stock.objects.bulk_create(stock_entries[i:i + batch_size])
 
-class ProductVariation(models.Model):
-    """インストアJANコードを管理するモデル"""
-    instore_jan = models.CharField(primary_key=True, max_length=13, unique=True, editable=False, verbose_name="インストアJANコード")
-    name = models.CharField(max_length=50, verbose_name="代表商品名")
-    products = models.ManyToManyField(Product, through='ProductVariationDetail', related_name='variations')
-
-    def save(self, *args, **kwargs):
-        if not self.instore_jan:
-            self.instore_jan = self.generate_unique_instore_jan()
-        super().save(*args, **kwargs)
-
-    def generate_unique_instore_jan(self):
-        """ユニークなインストアJANを生成する"""
-        while True:
-            random_code = "20" + ''.join(random.choices('0123456789', k=10))
-            check_digit = calculate_check_digit(random_code)
-            instore_jan = random_code + str(check_digit)
-            if not ProductVariation.objects.filter(instore_jan=instore_jan).exists():
-                return instore_jan
-
-    def __str__(self):
-        return self.instore_jan
-
-    class Meta:
-        verbose_name = "商品バリエーション"
-        verbose_name_plural = "商品バリエーション一覧"
-
-class ProductVariationDetail(models.Model):
-    """中間テーブル：商品とバリエーションの関係を管理するモデル"""
-    product_variation = models.ForeignKey(ProductVariation, on_delete=models.CASCADE, related_name='variation_details')
-    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='variation_colors')
-    color_name = models.CharField(null=True, blank=True, max_length=50, verbose_name="色名")
-
-    class Meta:
-        unique_together = ('product_variation', 'product')  # 同じ商品が重複登録できないようにする
-
-    def __str__(self):
-        return f"{self.product.name} - {self.color_name} ({self.product_variation.instore_jan})"
-
-    class Meta:
-        verbose_name = "商品バリエーション詳細"
-        verbose_name_plural = "商品バリエーション詳細一覧"
 
 class Store(BaseModel):
     """店舗モデル"""
     store_code = models.CharField(max_length=20, primary_key=True, verbose_name="店番号")
     name = models.CharField(max_length=255, verbose_name="店名")
 
-    def __str__(self):
-        return self.name
-
     class Meta:
         verbose_name = "店舗"
         verbose_name_plural = "店舗一覧"
 
+    def __str__(self):
+        return self.name
+
     def save(self, *args, **kwargs):
         """新しい店舗が追加された際に全ての商品に対する在庫を生成"""
         super().save(*args, **kwargs)
-
-        # すべての商品に対する在庫をバッチ処理で生成
         products = Product.objects.all()
-        stock_entries = []
-
-        for product in products:
-            stock_entries.append(Stock(store_code=self, jan=product, stock=0))
+        stock_entries = [Stock(store_code=self, jan=product, stock=0) for product in products]
 
         batch_size = 500
         with transaction.atomic():
@@ -152,7 +102,7 @@ class Stock(BaseModel):
     stock = models.IntegerField(default=0, verbose_name="在庫数")
 
     class Meta:
-        unique_together = ("store_code", "jan")  # 店番号とjanコードの組み合わせが一意である
+        unique_together = ("store_code", "jan")
         verbose_name = "在庫"
         verbose_name_plural = "在庫一覧"
 
@@ -167,7 +117,7 @@ class StorePrice(BaseModel):
     price = models.IntegerField(verbose_name="店舗価格")
 
     class Meta:
-        unique_together = ("store_code", "jan")  # 店番号とjanコードの組み合わせが一意である
+        unique_together = ("store_code", "jan")
         verbose_name = "店舗価格"
         verbose_name_plural = "店舗価格一覧"
 
@@ -175,7 +125,6 @@ class StorePrice(BaseModel):
         return f"{self.store_code} - {self.jan} - {self.price}"
 
     def clean(self):
-        """価格が商品価格と同じの場合はValidationErrorを発生させる"""
         if self.price == self.jan.price:
             raise ValidationError("店舗価格は商品価格と異なる必要があります。")
 
@@ -184,10 +133,34 @@ class StorePrice(BaseModel):
         super().save(*args, **kwargs)
 
     def get_price(self):
-        """店舗ごとの価格を取得する。価格設定がない場合は商品価格を参照する。"""
-        if self.price is not None:
-            return self.price
-        return self.jan.price  # StorePriceに価格が設定されていない場合はProductから価格を取得
+        return self.price if self.price is not None else self.jan.price
+
+
+class ProductVariation(models.Model):
+    """インストアJANコードを管理するモデル"""
+    instore_jan = models.CharField(primary_key=True, max_length=13, unique=True, editable=False, verbose_name="インストアJANコード")
+    name = models.CharField(max_length=50, verbose_name="代表商品名")
+    products = models.ManyToManyField(Product, through='ProductVariationDetail', related_name='variations')
+
+    def save(self, *args, **kwargs):
+        if not self.instore_jan:
+            self.instore_jan = generate_unique_instore_jan(ProductVariation.objects.values_list('instore_jan', flat=True))
+        super().save(*args, **kwargs)
+
+
+class ProductVariationDetail(models.Model):
+    """中間テーブル：商品とバリエーションの関係を管理するモデル"""
+    product_variation = models.ForeignKey(ProductVariation, on_delete=models.CASCADE, related_name='variation_details')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='variation_colors')
+    color_name = models.CharField(null=True, blank=True, max_length=50, verbose_name="色名")
+
+    class Meta:
+        unique_together = ('product_variation', 'product')
+        verbose_name = "商品バリエーション詳細"
+        verbose_name_plural = "商品バリエーション詳細一覧"
+
+    def __str__(self):
+        return f"{self.product.name} - {self.color_name} ({self.product_variation.instore_jan})"
 
 
 class StockReceiveHistory(BaseModel):
@@ -197,12 +170,12 @@ class StockReceiveHistory(BaseModel):
     received_at = models.DateTimeField(auto_now_add=True, verbose_name="入荷日時")
     products = models.ManyToManyField('Product', through='StockReceiveHistoryItem', related_name='receive_histories')
 
-    def __str__(self):
-        return f"{self.store_code} - {self.staff_code} - {self.received_at}"
-
     class Meta:
         verbose_name = "入荷"
         verbose_name_plural = "入荷履歴一覧"
+
+    def __str__(self):
+        return f"{self.store_code} - {self.staff_code} - {self.received_at}"
 
 
 class StockReceiveHistoryItem(BaseModel):
@@ -210,6 +183,10 @@ class StockReceiveHistoryItem(BaseModel):
     history = models.ForeignKey(StockReceiveHistory, related_name='items', on_delete=models.CASCADE)
     jan = models.ForeignKey('Product', on_delete=models.CASCADE, verbose_name="JANコード")
     additional_stock = models.IntegerField(verbose_name="入荷数")
+
+    class Meta:
+        verbose_name = "入荷商品"
+        verbose_name_plural = "入荷商品一覧"
 
     def __str__(self):
         return f"{self.jan.jan} - {self.additional_stock}"
@@ -238,12 +215,12 @@ class Transaction(BaseModel):
     change = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="釣銭金額")
     total_quantity = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="合計購入点数")
 
-    def __str__(self):
-        return f"取引番号: {self.id}"
-
     class Meta:
         verbose_name = "取引"
         verbose_name_plural = "取引一覧"
+
+    def __str__(self):
+        return f"取引番号: {self.id}"
 
 
 class TransactionDetail(BaseModel):
@@ -261,30 +238,39 @@ class TransactionDetail(BaseModel):
         verbose_name = "明細"
         verbose_name_plural = "取引詳細一覧"
 
+    def __str__(self):
+        return f"{self.transaction} - {self.jan}"
+
 
 class Payment(BaseModel):
     """支払い方法(中間テーブル)"""
     PAYMENT_METHOD_CHOICES = [
         ("cash", "現金"),
         ("credit", "クレジットカード"),
-        ("point", "ポイント"),
+        ("wallet", "ウォレット"),
         ("voucher", "金券"),
         ("QRcode", "QRコード決済"),
     ]
     transaction = models.ForeignKey('Transaction', related_name='payments', on_delete=models.CASCADE, verbose_name="取引")
     payment_method = models.CharField(max_length=50, choices=PAYMENT_METHOD_CHOICES, verbose_name="支払方法")
     amount = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="支払い金額")
+
     class Meta:
         unique_together = ("transaction", "payment_method")  # 同じ支払い手段は1度しか使えない
         verbose_name = "支払い"
         verbose_name_plural = "支払い一覧"
 
+    def __str__(self):
+        return f"{self.transaction} - {self.payment_method}"
+
 
 class Wallet(BaseModel):
     user = models.OneToOneField('CustomUser', on_delete=models.CASCADE, related_name='wallet')
     balance = models.DecimalField(max_digits=10, decimal_places=2, default=0.00, verbose_name="残高")
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name="作成日時")
-    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新日時")
+
+    class Meta:
+        verbose_name = "ウォレット"
+        verbose_name_plural = "ウォレット一覧"
 
     def __str__(self):
         return f"Wallet of {self.user.email} - Balance: {self.balance}"
@@ -296,18 +282,23 @@ class Wallet(BaseModel):
         with transaction.atomic():
             self.balance += amount
             self.save()
-            WalletTransaction.objects.create(wallet=self, amount=amount, transaction_type='credit')
+            WalletTransaction.objects.create(wallet=self, amount=amount, balance=self.balance, transaction_type='credit')
 
-    def withdraw(self, amount):
+    def withdraw(self, amount, transaction=None):
         if amount <= 0:
             raise ValueError("出金額は正の値である必要があります。")
         if amount > self.balance:
             raise ValueError("残高が不足しています。")
 
-        with transaction.atomic():
-            self.balance -= amount
-            self.save()
-            WalletTransaction.objects.create(wallet=self, amount=amount, transaction_type='debit')
+        self.balance -= amount
+        self.save()
+        WalletTransaction.objects.create(
+            wallet=self,
+            amount=amount,
+            balance=self.balance,
+            transaction_type='debit',
+            transaction=transaction
+        )
 
 
 class WalletTransaction(BaseModel):
@@ -315,15 +306,20 @@ class WalletTransaction(BaseModel):
         ('credit', '入金'),
         ('debit', '出金'),
     )
-    wallet = models.ForeignKey(Wallet, on_delete=models.CASCADE, related_name='transactions')
+    wallet = models.ForeignKey(Wallet, on_delete=models.CASCADE, related_name='wallettransactions')
     amount = models.DecimalField(max_digits=10, decimal_places=2, verbose_name="金額")
+    balance = models.DecimalField(max_digits=10, decimal_places=2, verbose_name="残高")
     transaction_type = models.CharField(max_length=10, choices=TRANSACTION_TYPE_CHOICES, verbose_name="取引タイプ")
+    transaction = models.ForeignKey('Transaction', on_delete=models.CASCADE, related_name='wallet_transactions', null=True, blank=True)
+
+    class Meta:
+        verbose_name = "取引"
+        verbose_name_plural = "ウォレット履歴"
 
     def __str__(self):
         return f"{self.transaction_type.capitalize()} of {self.amount} in wallet of {self.wallet.user.email} on {self.created_at}"
 
 
-# カスタムユーザーマネージャー
 class CustomUserManager(BaseUserManager):
     def create_user(self, email, password=None, **extra_fields):
         if not email:
@@ -347,7 +343,6 @@ class CustomUserManager(BaseUserManager):
         return self.create_user(email, password, **extra_fields)
 
 
-# カスタムユーザーモデル
 class CustomUser(AbstractBaseUser, PermissionsMixin):
 
     def generate_ulid():
@@ -385,21 +380,33 @@ class CustomUser(AbstractBaseUser, PermissionsMixin):
     def social_user(self):
         return self.social_auth.first()
 
+    class Meta:
+        verbose_name = "人"
+        verbose_name_plural = "ユーザーマスター"
 
-class Staff(models.Model):
+
+class Staff(BaseModel):
     user = models.OneToOneField(CustomUser, on_delete=models.CASCADE, related_name='staff_profile')
     staff_code = models.CharField(max_length=6, verbose_name="スタッフコード", unique=True)
     name = models.CharField(max_length=30, null=True, blank=True, verbose_name="ユーザー名")
     affiliate_store = models.ForeignKey('Store', null=True, on_delete=models.CASCADE, verbose_name="所属店舗")
     permission = models.ForeignKey("UserPermission", null=True, blank=True, on_delete=models.CASCADE, verbose_name="権限")
 
+    class Meta:
+        verbose_name = "人"
+        verbose_name_plural = "スタッフマスター"
+
     def __str__(self):
         return self.staff_code
 
 
-class Customer(models.Model):
+class Customer(BaseModel):
     user = models.OneToOneField(CustomUser, on_delete=models.CASCADE, related_name='customer_profile')
     name = models.CharField(max_length=30, null=True, blank=True, verbose_name="ユーザー名")
+
+    class Meta:
+        verbose_name = "人"
+        verbose_name_plural = "顧客マスター"
 
     def __str__(self):
         return self.name if self.name else f"顧客 ({self.user.email})"
@@ -414,9 +421,9 @@ class UserPermission(BaseModel):
     global_permission = models.BooleanField(default=False, verbose_name="他店舗操作権限")
     change_price_permission = models.BooleanField(default=False, verbose_name="売価変更権限")
 
-    def __str__(self):
-        return str(self.role_name)
-
     class Meta:
         verbose_name = "役職"
         verbose_name_plural = "役職一覧"
+
+    def __str__(self):
+        return self.role_name
