@@ -1,4 +1,4 @@
-FROM python:3
+FROM python:3.12-slim-bullseye
 # PYTHONDONTWRITEBYTECODEとPYTHONUNBUFFEREDはオプション
 # pycファイル(および__pycache__)の生成を行わないようにする
 ENV PYTHONDONTWRITEBYTECODE=1

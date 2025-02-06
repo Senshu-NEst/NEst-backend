@@ -1,11 +1,13 @@
 Django
-psycopg2
+psycopg2-binary
 gunicorn
+ulid-py
+requests
 djangorestframework
 djangorestframework_simplejwt
 django-debug-toolbar
 django-import-export
-requests
+social-auth-app-django
 
 #djangorestframework-api-key
 #sqids==0.4.1
