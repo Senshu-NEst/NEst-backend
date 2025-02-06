@@ -1,0 +1,37 @@
+<!-- api_v1/profile.html -->
+
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>プロフィール</title>
+</head>
+
+<body>
+    <h1>プロフィール情報</h1>
+
+    <h2>ユーザー情報</h2>
+    <ul>
+        <li><strong>メールアドレス:</strong> {{ user.email }}</li>
+        <li><strong>ユーザータイプ:</strong> {{ user.user_type }}</li>
+        <li><strong>アカウントの状態:</strong> {{ user.is_active|yesno:"有効,無効" }}</li>
+    </ul>
+
+    <h2>ソーシャルアカウント情報</h2>
+    {% if user.social_auth.exists %}
+    <ul>
+        {% for social in user.social_auth.all %}
+        <li><strong>プロバイダー:</strong> {{ social.provider }}</li>
+        <li><strong>UID:</strong> {{ social.uid }}</li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p>ソーシャルアカウント情報はありません。</p>
+    {% endif %}
+
+    <a href="{% url 'logout' %}">ログアウト</a>
+</body>
+
+</html>

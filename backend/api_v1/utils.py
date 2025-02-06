@@ -1,3 +1,5 @@
+import random, string
+
 def calculate_checksum(numbers):
     """チェックディジットを計算するための関数"""
     accumulated_sum, multiplier = 0, 3
@@ -26,3 +28,8 @@ def calculate_check_digit(base_jan):
     total = sum(int(base_jan[i]) * (1 if i % 2 == 0 else 3) for i in range(12))
     check_digit = (10 - (total % 10)) % 10
     return check_digit
+
+def generate_random_password(length):
+    """指定された長さのランダムなパスワードを生成します。"""
+    characters = string.ascii_letters + string.digits + string.punctuation
+    return ''.join(random.choice(characters) for _ in range(length))

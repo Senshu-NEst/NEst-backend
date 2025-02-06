@@ -1,4 +1,4 @@
-import random
+import random, ulid
 from django.db import models
 from django.db import transaction
 from django.contrib.auth.models import BaseUserManager, AbstractBaseUser, PermissionsMixin
@@ -193,7 +193,7 @@ class StorePrice(BaseModel):
 class StockReceiveHistory(BaseModel):
     """入荷履歴モデル"""
     store_code = models.ForeignKey(Store, on_delete=models.CASCADE, verbose_name="店番号")
-    staff_code = models.ForeignKey("CustomUser", on_delete=models.CASCADE, verbose_name="入荷担当者")
+    staff_code = models.ForeignKey('Staff', on_delete=models.CASCADE, verbose_name="入荷担当")
     received_at = models.DateTimeField(auto_now_add=True, verbose_name="入荷日時")
     products = models.ManyToManyField('Product', through='StockReceiveHistoryItem', related_name='receive_histories')
 
@@ -227,7 +227,8 @@ class Transaction(BaseModel):
     date = models.DateTimeField(verbose_name="購入日時")
     store_code = models.ForeignKey(Store, on_delete=models.CASCADE, verbose_name="店番号")
     terminal_id = models.CharField(max_length=50, verbose_name="端末番号")
-    staff_code = models.ForeignKey("CustomUser", on_delete=models.CASCADE, verbose_name="スタッフコード")
+    staff_code = models.ForeignKey('Staff', to_field='staff_code', on_delete=models.CASCADE, verbose_name="スタッフコード")
+    user = models.ForeignKey('CustomUser', on_delete=models.CASCADE, verbose_name="ユーザー")
     total_tax10 = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="10%合計小計")
     total_tax8 = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="8%税額小計")
     tax_amount = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="税額合計")
@@ -279,52 +280,129 @@ class Payment(BaseModel):
         verbose_name_plural = "支払い一覧"
 
 
+class Wallet(BaseModel):
+    user = models.OneToOneField('CustomUser', on_delete=models.CASCADE, related_name='wallet')
+    balance = models.DecimalField(max_digits=10, decimal_places=2, default=0.00, verbose_name="残高")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="作成日時")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新日時")
+
+    def __str__(self):
+        return f"Wallet of {self.user.email} - Balance: {self.balance}"
+
+    def deposit(self, amount):
+        if amount <= 0:
+            raise ValueError("入金額は正の値である必要があります。")
+
+        with transaction.atomic():
+            self.balance += amount
+            self.save()
+            WalletTransaction.objects.create(wallet=self, amount=amount, transaction_type='credit')
+
+    def withdraw(self, amount):
+        if amount <= 0:
+            raise ValueError("出金額は正の値である必要があります。")
+        if amount > self.balance:
+            raise ValueError("残高が不足しています。")
+
+        with transaction.atomic():
+            self.balance -= amount
+            self.save()
+            WalletTransaction.objects.create(wallet=self, amount=amount, transaction_type='debit')
+
+
+class WalletTransaction(BaseModel):
+    TRANSACTION_TYPE_CHOICES = (
+        ('credit', '入金'),
+        ('debit', '出金'),
+    )
+    wallet = models.ForeignKey(Wallet, on_delete=models.CASCADE, related_name='transactions')
+    amount = models.DecimalField(max_digits=10, decimal_places=2, verbose_name="金額")
+    transaction_type = models.CharField(max_length=10, choices=TRANSACTION_TYPE_CHOICES, verbose_name="取引タイプ")
+
+    def __str__(self):
+        return f"{self.transaction_type.capitalize()} of {self.amount} in wallet of {self.wallet.user.email} on {self.created_at}"
+
+
+# カスタムユーザーマネージャー
 class CustomUserManager(BaseUserManager):
-    def create_user(self, staff_code, password=None, **extra_fields):
-        """staff_codeとパスワードを使用してユーザーを作成"""
-        if not staff_code:
-            raise ValueError("ユーザー登録にはスタッフコードが必要です")
-        user = self.model(staff_code=staff_code, **extra_fields)
+    def create_user(self, email, password=None, **extra_fields):
+        if not email:
+            raise ValueError("ユーザー登録にはメールアドレスが必要です")
+        
+        email = self.normalize_email(email)
+        user = self.model(email=email, **extra_fields)
         user.set_password(password)
         user.save(using=self._db)
         return user
 
-    def create_superuser(self, staff_code, password=None, **extra_fields):
-        """staff_codeとパスワードを使用してスーパーユーザーを作成"""
+    def create_superuser(self, email, password=None, **extra_fields):
         extra_fields.setdefault("is_staff", True)
         extra_fields.setdefault("is_superuser", True)
 
         if extra_fields.get("is_staff") is not True:
             raise ValueError("スーパーユーザーはスタッフフラグがTrueである必要があります。")
         if extra_fields.get("is_superuser") is not True:
-            raise ValueError("スーパーユーザーはsuフラグがTrueである必要があります。")
+            raise ValueError("スーパーユーザーはスーパーユーザーフラグがTrueである必要があります。")
 
-        return self.create_user(staff_code, password, **extra_fields)
+        return self.create_user(email, password, **extra_fields)
 
 
+# カスタムユーザーモデル
 class CustomUser(AbstractBaseUser, PermissionsMixin):
-    staff_code = models.CharField(max_length=6, primary_key=True, verbose_name="スタッフコード")
-    name = models.CharField(max_length=30, null=True, blank=True, verbose_name="ユーザー名")
-    affiliate_store = models.ForeignKey(Store, null=True, on_delete=models.CASCADE, verbose_name="所属店舗")
+
+    def generate_ulid():
+        return str(ulid.new())
+
+    USER_TYPE_CHOICES = (
+        ('staff', 'スタッフ'),
+        ('customer', '顧客'),
+    )
+
+    id = models.CharField(default=generate_ulid, max_length=26, primary_key=True, editable=False)
+    email = models.EmailField(unique=True, verbose_name="メールアドレス")
+    password = models.CharField(max_length=128, verbose_name="パスワード")
+    user_type = models.CharField(max_length=10, choices=USER_TYPE_CHOICES, verbose_name="ユーザータイプ")
     is_staff = models.BooleanField(default=False, verbose_name="スタッフフラグ")
     is_superuser = models.BooleanField(default=False, verbose_name="スーパーユーザーフラグ")
     is_active = models.BooleanField(default=True, verbose_name="アクティブフラグ")
-    permission = models.ForeignKey("UserPermission", null=True, blank=True, on_delete=models.CASCADE, verbose_name="権限")
     last_login = models.DateTimeField(null=True, blank=True, verbose_name="最終ログイン")
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="作成日時")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="更新日時")
 
     objects = CustomUserManager()
 
-    USERNAME_FIELD = "staff_code"
+    USERNAME_FIELD = 'email'
     REQUIRED_FIELDS = []
 
-    def __str__(self):
-        return str(self.staff_code)
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if self.is_superuser and self.user_type != 'staff':
+            self.user_type = 'staff'
+            self.save(update_fields=['user_type'])
+            Staff.objects.get_or_create(user=self)
 
-    class Meta:
-        verbose_name = "販売員"
-        verbose_name_plural = "販売員一覧"
+    @property
+    def social_user(self):
+        return self.social_auth.first()
+
+
+class Staff(models.Model):
+    user = models.OneToOneField(CustomUser, on_delete=models.CASCADE, related_name='staff_profile')
+    staff_code = models.CharField(max_length=6, verbose_name="スタッフコード", unique=True)
+    name = models.CharField(max_length=30, null=True, blank=True, verbose_name="ユーザー名")
+    affiliate_store = models.ForeignKey('Store', null=True, on_delete=models.CASCADE, verbose_name="所属店舗")
+    permission = models.ForeignKey("UserPermission", null=True, blank=True, on_delete=models.CASCADE, verbose_name="権限")
+
+    def __str__(self):
+        return self.staff_code
+
+
+class Customer(models.Model):
+    user = models.OneToOneField(CustomUser, on_delete=models.CASCADE, related_name='customer_profile')
+    name = models.CharField(max_length=30, null=True, blank=True, verbose_name="ユーザー名")
+
+    def __str__(self):
+        return self.name if self.name else f"顧客 ({self.user.email})"
 
 
 class UserPermission(BaseModel):

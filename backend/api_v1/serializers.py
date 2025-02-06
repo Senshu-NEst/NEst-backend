@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.utils import timezone
 from django.db import transaction
-from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail
+from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 
@@ -12,15 +12,19 @@ class UserPermissionChecker:
     def get_permissions(self):
         """スタッフの権限を取得して、権限リストを返す"""
         try:
-            user = CustomUser.objects.select_related("permission").get(staff_code=self.staff_code)
+            # staff_codeを持つStaffを直接取得
+            staff = Staff.objects.select_related("permission", "user").get(staff_code=self.staff_code)
 
-            if not user.is_active:
+            # CustomUserのis_activeを確認
+            if not staff.user.is_active:
                 raise serializers.ValidationError("このスタッフは現在無効です。")
 
             permissions = []
-            if user.is_superuser:
+            if staff.user.is_superuser:
                 permissions.append("superuser")
-            if not user.permission:
+
+            # スタッフの権限を取得
+            if not staff.permission:
                 raise serializers.ValidationError("このスタッフに権限が設定されていません。")
 
             # 権限の追加
@@ -32,12 +36,12 @@ class UserPermissionChecker:
             ]
 
             for field, name in permission_fields:
-                if getattr(user.permission, field):
+                if getattr(staff.permission, field):
                     permissions.append(name)
 
             return permissions
 
-        except CustomUser.DoesNotExist:
+        except Staff.DoesNotExist:
             raise serializers.ValidationError("指定されたスタッフが存在しません。")
 
 
@@ -67,7 +71,7 @@ class TransactionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Transaction
-        fields = ["id", "status", "date", "store_code", "terminal_id", "staff_code", "total_tax10", "total_tax8", "tax_amount", "discount_amount", "total_amount", "deposit", "change", "total_quantity", "payments", "sale_products"]
+        fields = ["id", "status", "date", "store_code", "terminal_id", "staff_code", "user", "total_tax10", "total_tax8", "tax_amount", "discount_amount", "total_amount", "deposit", "change", "total_quantity", "payments", "sale_products"]
         read_only_fields = ["id", "total_quantity", "total_tax10", "total_tax8", "tax_amount", "total_amount", "change", "discount_amount", "deposit"]
 
     def validate_status(self, value):
@@ -86,11 +90,13 @@ class TransactionSerializer(serializers.ModelSerializer):
         return value
 
     def create(self, validated_data):
-        sale_products_data = validated_data.pop("sale_products")
-        payments_data = validated_data.pop("payments")
-        staff_code = validated_data.get("staff_code")
-        store_code = validated_data["store_code"].store_code
+        sale_products_data = validated_data.pop("sale_products", [])
+        payments_data = validated_data.pop("payments", [])
+        staff_code = validated_data.pop("staff_code", None)  # staff_codeをpopする
+        store_code = validated_data.pop("store_code", None)  # store_codeをpopする
         status = validated_data.get("status")
+        user = validated_data.pop("user", None)  # userをpopする
+        terminal_id = validated_data.pop("terminal_id", None)  # terminal_idをpopする
 
         # 権限のチェック
         permissions = self._check_permissions(staff_code, store_code)
@@ -102,10 +108,13 @@ class TransactionSerializer(serializers.ModelSerializer):
             totals = self._calculate_totals(sale_products_data, store_code)
             total_payments = sum(payment['amount'] for payment in payments_data)
             
-            # トランザクションの作成（全てのフィールドに初期値を設定）
+            # トランザクションの作成
             transaction_instance = Transaction.objects.create(
                 date=timezone.now(),
-                **validated_data,
+                user=user,  # userフィールドを設定
+                terminal_id=terminal_id,  # terminal_idを設定
+                staff_code=staff_code,  # staff_codeを設定
+                store_code=store_code,  # store_codeを設定
                 deposit=total_payments,
                 change=total_payments - totals['total_amount'],
                 total_quantity=totals['total_quantity'],
@@ -113,7 +122,8 @@ class TransactionSerializer(serializers.ModelSerializer):
                 total_tax8=totals['total_tax8'],
                 tax_amount=totals['tax_amount'],
                 discount_amount=totals['discount_amount'],
-                total_amount=totals['total_amount']
+                total_amount=totals['total_amount'],
+                **validated_data  # その他のフィールドを設定
             )
 
             # 取引詳細の作成
@@ -147,15 +157,15 @@ class TransactionSerializer(serializers.ModelSerializer):
         permission_checker = UserPermissionChecker(staff_code)
         permissions = permission_checker.get_permissions()
 
-        # 所属店舗を取得
-        user = CustomUser.objects.get(staff_code=staff_code)
+        # 所属店舗をStaffモデルから取得
+        staff = Staff.objects.get(staff_code=staff_code)
 
         # レジ権限のチェック
         if "register" not in permissions:
             raise serializers.ValidationError("このスタッフは販売を行う権限がありません。")
 
         # staffの所属店舗とPOSTされたstore_codeが異なる場合にglobal権限をチェック
-        if user.affiliate_store.store_code != store_code:
+        if staff.affiliate_store.store_code != store_code:
             if "global" not in permissions:
                 raise serializers.ValidationError("このスタッフは自店のみ処理可能です。")
 
@@ -334,7 +344,7 @@ class StockReceiveSerializer(serializers.Serializer):
 
         # 入荷店舗とスタッフの所属店舗が異なる場合、global権限をチェック
         store_code = data["store_code"]
-        staff = CustomUser.objects.get(staff_code=staff_code)
+        staff = Staff.objects.get(staff_code=staff_code)
         if staff.affiliate_store.store_code != store_code:
             if "global" not in permissions:
                 raise serializers.ValidationError("このスタッフは他店舗の在庫を操作できません。")

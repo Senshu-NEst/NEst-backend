@@ -15,6 +15,9 @@ import requests
 from .get_receipt_data import generate_receipt_text, generate_return_receipt
 from django.contrib.auth.decorators import login_required
 from collections import defaultdict
+from django.shortcuts import redirect
+from django.contrib.auth import logout
+from django.shortcuts import render
 
 
 class ProductViewSet(viewsets.ModelViewSet):
@@ -337,3 +340,24 @@ def generate_receipt_view(request, transaction_id, receipt_type):
 
     except Transaction.DoesNotExist:
         return HttpResponse("取引が見つかりません", content_type="text/plain")
+
+
+def login_view(request):
+    return render(request, 'login.html')
+
+def google_login_redirect(request):
+    if request.user.is_authenticated:
+        logout(request)
+
+    # Googleのログインを開始
+    return redirect('social:begin', 'google-oauth2')
+
+@login_required
+def profile_view(request):
+    user = request.user  # 現在のユーザー情報を取得
+    return render(request, 'api_v1/profile.html', {'user': user})
+
+
+def logout_view(request):
+    logout(request)  # ユーザーをログアウト
+    return redirect('login')  # ログアウト後のリダイレクト先

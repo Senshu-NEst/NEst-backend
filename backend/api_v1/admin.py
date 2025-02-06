@@ -2,9 +2,11 @@ from django.contrib import admin
 from import_export import resources, fields
 from import_export.admin import ImportExportModelAdmin
 from django import forms
-from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail
+from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, \
+    StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer
 from django.utils import timezone
-from rest_framework_simplejwt.token_blacklist.admin import BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin, OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
+from rest_framework_simplejwt.token_blacklist.admin import BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin, \
+    OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 from django.urls import reverse
 from django.utils.html import format_html
@@ -61,14 +63,14 @@ class PaymentDetailInline(admin.TabularInline):
 
 class StockInline(admin.TabularInline):
     model = Stock
-    extra = 0  # 新しい在庫を追加するための空行数
+    extra = 0
     verbose_name = "在庫"
     verbose_name_plural = "在庫情報"
 
 
 class VariationDetailInline(admin.TabularInline):
     model = ProductVariationDetail
-    extra = 1  # 新しいバリエーションを追加するための空行数
+    extra = 1
     verbose_name = "商品色名"
     verbose_name_plural = "商品色名一覧"
 
@@ -86,7 +88,7 @@ class ProductAdmin(ImportExportModelAdmin):
 class ProductVariationAdmin(admin.ModelAdmin):
     list_display = ("instore_jan", "name")
     search_fields = ("instore_jan", "name")
-    inlines = [VariationDetailInline]  # 色名を関連づけて表示させる
+    inlines = [VariationDetailInline]
 
 
 @admin.register(StorePrice)
@@ -136,7 +138,7 @@ class StockReceiveHistoryAdmin(admin.ModelAdmin):
 class TransactionAdmin(admin.ModelAdmin):
     list_display = ("id", "date", "store_code", "staff_code", "status", "total_amount", "receipt_button")
     fieldsets = [
-    ('取引情報',   {'fields': ("status", "date", ("store_code", "staff_code", "terminal_id"))}),
+    ('取引情報',   {'fields': ("status", "date", ("store_code", "staff_code","user", "terminal_id"))}),
     ('消費税', {'fields': (("total_tax10", "total_tax8"), "tax_amount")}),
     ('金額情報',   {'fields': ("discount_amount", ("deposit", "change"), ("total_quantity","total_amount"))}),
 ]
@@ -162,30 +164,100 @@ class CustomUserAdminForm(forms.ModelForm):
 
     class Meta:
         model = CustomUser
-        fields = ('staff_code', 'name', 'affiliate_store', 'password', 'is_staff', 'is_superuser', 'permission')
+        fields = ('email', 'password', 'user_type', 'is_staff', 'is_superuser')
+
 
 
 @admin.register(CustomUser)
 class CustomUserAdmin(admin.ModelAdmin):
     form = CustomUserAdminForm
-    list_display = ("staff_code", "name", "is_staff", "is_superuser", "affiliate_store")
-    search_fields = ("staff_code", "name")
-    list_filter = ("is_staff", "is_superuser", "affiliate_store")
+    list_display = ("pk", "email", "user_type", "is_staff", "is_superuser")
+    search_fields = ("email",)
+    list_filter = ("user_type", "is_staff", "is_superuser")
 
     def get_form(self, request, obj=None, **kwargs):
         form = super().get_form(request, obj, **kwargs)
-        if obj is None:  # 新規作成時
-            form.base_fields['password'].required = True  # 新規作成時はパスワードを必須にする
+        if obj is None:
+            form.base_fields['password'].required = True
         else:
-            form.base_fields.pop('password', None)  # 既存ユーザーの場合はパスワードフォームを表示させない
-        return form
+            form.base_fields.pop('password', None)
+            return form
+
+    def get_inlines(self, request, obj=None):
+        if obj is not None:
+            if obj.user_type == 'staff':
+                return [StaffInline]
+            elif obj.user_type == 'customer':
+                return [CustomerInline]
+        return []
 
     def save_model(self, request, obj, form, change):
         if not change:  # 新規作成の場合
             password = form.cleaned_data.get('password')
             if password:
                 obj.set_password(password)  # パスワードをハッシュ化して保存
+            
+            # スーパーユーザーの場合は自動的にユーザータイプをstaffに設定
+            if obj.is_superuser:
+                obj.user_type = 'staff'
+
+        # まずCustomUserを保存
         obj.save()
+
+        # ユーザータイプによる情報の自動生成
+        if obj.user_type == 'staff':
+            # 既存のStaffインスタンスを取得
+            staff_profile, created = Staff.objects.get_or_create(user=obj)
+            if created:
+                staff_profile.staff_code = '初期コード'  # 適切な初期値を設定
+                staff_profile.name = 'スタッフ名'        # 適切な初期値を設定
+                staff_profile.affiliate_store = None      # 適切な初期値を設定
+                staff_profile.permission = None            # 適切な初期値を設定
+                staff_profile.save()  # 変更を保存
+
+        elif obj.user_type == 'customer':
+            # 既存のCustomerインスタンスを取得
+            customer_profile, created = Customer.objects.get_or_create(user=obj)
+            if created:
+                customer_profile.name = '顧客名'            # 適切な初期値を設定
+                customer_profile.phone_number = ''          # 初期値
+                customer_profile.address = ''                # 初期値
+                customer_profile.save()  # 変更を保存
+
+        # ユーザータイプが変更された場合、元の関連テーブルから情報を削除
+        if change:
+            if obj.user_type != form.initial['user_type']:
+                if form.initial['user_type'] == 'staff':
+                    Staff.objects.filter(user=obj).delete()  # 既存のスタッフ情報を削除
+                elif form.initial['user_type'] == 'customer':
+                    Customer.objects.filter(user=obj).delete()  # 既存の顧客情報を削除
+
+
+class StaffInline(admin.StackedInline):
+    model = Staff
+    extra = 0
+    verbose_name = "スタッフ情報"
+    verbose_name_plural = "スタッフ情報"
+
+
+class CustomerInline(admin.StackedInline):
+    model = Customer
+    extra = 0
+    verbose_name = "顧客情報"
+    verbose_name_plural = "顧客情報"
+
+
+@admin.register(Staff)
+class StaffAdmin(admin.ModelAdmin):
+    list_display = ("user", "name", "affiliate_store")
+    search_fields = ("name", "user__email")
+    list_filter = ("affiliate_store",)
+
+
+@admin.register(Customer)
+class CustomerAdmin(admin.ModelAdmin):
+    list_display = ("user", "name")
+    search_fields = ("name", "user__email")
 
 
 @admin.register(UserPermission)
