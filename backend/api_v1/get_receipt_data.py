@@ -1,8 +1,43 @@
-from .models import Payment
+from django.utils import timezone
+from .models import WalletTransaction, Transaction, Payment
+
+def get_wallet_info(transaction_id):
+    
+    # 取引IDに基づいてウォレットトランザクションを取得
+    wallet_transactions = WalletTransaction.objects.filter(transaction_id=transaction_id)
+
+    if not wallet_transactions.exists():
+        return None  # トランザクションが存在しない場合はNoneを返す
+
+    # 最初のトランザクションからbalanceとamountを取得
+    latest_transaction = wallet_transactions.last()
+    balance = latest_transaction.balance
+    amount = latest_transaction.amount
+
+    # ユーザーのIDを取得
+    user = latest_transaction.wallet.user
+
+    # 最終利用日を取得（前回の取引の日付）
+    previous_transaction = Transaction.objects.filter(user=user).exclude(id=transaction_id).order_by('-date').first()
+
+    if previous_transaction:
+        last_used_date = previous_transaction.date
+    else:
+        last_used_date = None  # 前回の取引が存在しない場合
+
+    return {
+        "pre_balance": balance,
+        "last_used_date": last_used_date,
+        "amount": amount
+    }
+
 
 def generate_receipt_text(transaction):
     staff_code = transaction.staff_code.staff_code
     staff_name = transaction.staff_code.name
+    user = transaction.user  # ユーザーオブジェクトを取得
+    user_id = user.id  # ユーザーIDを取得
+    user_id_hyphenated = f"{user_id[:4]}-{user_id[4:8]}-{user_id[8:12]}-{user_id[12:16]}-{user_id[16:]}"
     terminal_id = transaction.terminal_id
     sale_products = transaction.sale_products.all()
     sale_id = transaction.id
@@ -49,10 +84,46 @@ def generate_receipt_text(transaction):
 -
 """
 
+    # ユーザー情報とウォレット情報を追加
+    wallet = getattr(user, 'wallet', None)  # ユーザーのウォレットを取得
+
+    # ユーザーIDを追加
+    receipt += f"""{{width: *}}
+    |UID:
+    |{user_id_hyphenated}
+    {{width:12,*}}
+    """
+
+    # ウォレットが存在するか確認
+    if wallet:
+        # 取引IDに関連するウォレットトランザクションを取得
+        wallet_transaction = WalletTransaction.objects.filter(transaction__id=sale_id, wallet=wallet).first()
+
+        if wallet_transaction:
+            last_used_date = wallet_transaction.transaction.date.strftime('%Y年%m月%d日')  # 最終利用日を取得
+            pre_balance = wallet_transaction.balance  # 利用前残高を取得
+            used_amount = wallet_transaction.amount  # 今回利用金額を取得
+            post_balance = pre_balance - used_amount  # 利用後残高を計算
+
+            # 最終利用日、利用前残高、今回利用金額、利用後残高を追加
+            receipt += f"|最終利用日 | {last_used_date}\n"
+            receipt += f"|利用前残高 | ¥{pre_balance:,}\n"
+            receipt += f"|今回利用金額 | ¥{used_amount:,}\n"
+            receipt += f"|利用後残高 | ¥{post_balance:,}\n"
+        else:
+            pass
+    else:
+        pass
+    receipt += f"-\n"
     # バーコードの挿入
     receipt += f"{{code:{sale_id}; option:code128,3,48,nohri}}\n"
 
     return receipt
+
+
+
+
+
 
 
 def generate_return_receipt(transaction):

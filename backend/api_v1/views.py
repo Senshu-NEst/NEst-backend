@@ -6,7 +6,7 @@ from django.utils import timezone
 from django.db.models.query import QuerySet
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
-from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, ProductVariationDetail, Wallet, WalletTransaction
+from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, ProductVariationDetail, Wallet, WalletTransaction, Staff
 from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer, ProductVariationSerializer, ProductVariationDetailSerializer, WalletChargeSerializer, WalletBalanceSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView
 from django.http import HttpResponse
@@ -50,7 +50,7 @@ class StockViewSet(viewsets.ModelViewSet):
 
         if not store_code and not jan:
             return Response(
-                {"error": "店舗コードまたはJANコードが必要です。"}, 
+                {"error": "店舗コードまたはJANコードが必要です。"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -95,7 +95,7 @@ class StockViewSet(viewsets.ModelViewSet):
 
         except Exception as e:
             return Response(
-                {"error": f"入荷処理中にエラーが発生しました: {str(e)}"}, 
+                {"error": f"入荷処理中にエラーが発生しました: {str(e)}"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -103,12 +103,12 @@ class StockViewSet(viewsets.ModelViewSet):
         """入荷履歴レコードを作成"""
         return StockReceiveHistory.objects.create(
             store_code=Store.objects.get(store_code=store_code),
-            staff_code=CustomUser.objects.get(staff_code=staff_code),
+            staff_code=Staff.objects.get(staff_code=staff_code),
         )
 
     def _process_received_items(
-        self, 
-        items: List[Dict], 
+        self,
+        items: List[Dict],
         history: StockReceiveHistory
     ) -> List[Dict]:
         """各商品の入荷処理と履歴項目の作成"""
@@ -214,7 +214,7 @@ class StockReceiveHistoryViewSet(viewsets.ReadOnlyModelViewSet):
         return StockReceiveHistory.objects.filter(**filters).distinct()
 
     def _format_history_response(
-        self, 
+        self,
         histories: List[StockReceiveHistory]
     ) -> List[Dict]:
         """入荷履歴のレスポンスデータを整形"""
@@ -228,16 +228,16 @@ class StockReceiveHistoryViewSet(viewsets.ReadOnlyModelViewSet):
                 item_list.append({
                     "jan": item.jan.jan,
                     "additional_stock": item.additional_stock,
-                    #"product_name": item.jan.name,  # 商品名を追加する場合
+                    # "product_name": item.jan.name,  # 商品名を追加する場合
                 })
             
             # 履歴ごとにまとめてレスポンスに追加
             response_data.append({
                 "received_at": history.received_at,
                 "staff_code": history.staff_code.staff_code,
-                #"staff_name": history.staff_code.name,  # スタッフ名を追加する場合
+                # "staff_name": history.staff_code.name,  # スタッフ名を追加する場合
                 "store_code": history.store_code.store_code,
-                #"store_name": history.store_code.name,  # 店舗名を追加する場合
+                # "store_name": history.store_code.name,  # 店舗名を追加する場合
                 "items": item_list  # アイテムリストを追加
             })
         return response_data
@@ -322,20 +322,25 @@ class WalletViewSet(viewsets.ViewSet):
 
         try:
             user = CustomUser.objects.get(id=user_id)
-            wallet = user.wallet
-            wallet.deposit(amount)
 
-            # ウォレットトランザクションを作成（transactionはnullに設定）
-            WalletTransaction.objects.create(
-                wallet=wallet,
-                amount=amount,
-                transaction_type='credit',
-                transaction=None  # チャージ時はnull
-            )
+            with transaction.atomic():  # トランザクションで保護
+                new_balance, created = serializer.create_wallet_transaction(user, amount)
 
-            return Response({"message": "チャージが成功しました。", "new_balance": str(wallet.balance)}, status=status.HTTP_200_OK)
-        except Wallet.DoesNotExist:
-            return Response({"error": "指定されたユーザーのウォレットは存在しません。"}, status=status.HTTP_400_BAD_REQUEST)
+            # メッセージを設定
+            if created and amount == 0:
+                message = "新規にウォレットを作成しました。"
+            elif created:
+                message = "新規にウォレットを作成し、チャージが成功しました。"
+            else:
+                message = "チャージが成功しました。"
+
+            return Response({
+                "message": message,
+                "amount": str(amount),  # チャージ金額を追加
+                "new_balance": str(new_balance)
+            }, status=status.HTTP_200_OK)
+        except CustomUser.DoesNotExist:
+            return Response({"error": "指定されたユーザーは存在しません。"}, status=status.HTTP_400_BAD_REQUEST)
         except ValueError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -350,8 +355,8 @@ class WalletViewSet(viewsets.ViewSet):
             user = CustomUser.objects.get(id=user_id)
             wallet = user.wallet
             return Response({"user_id": user_id, "balance": str(wallet.balance)}, status=status.HTTP_200_OK)
-        except Wallet.DoesNotExist:
-            return Response({"error": "指定されたユーザーのウォレットは存在しません。"}, status=status.HTTP_400_BAD_REQUEST)
+        except CustomUser.DoesNotExist:
+            return Response({"error": "指定されたユーザーは存在しません。"}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class CustomTokenObtainPairView(TokenObtainPairView):
@@ -389,12 +394,14 @@ def generate_receipt_view(request, transaction_id, receipt_type):
 def login_view(request):
     return render(request, 'login.html')
 
+
 def google_login_redirect(request):
     if request.user.is_authenticated:
         logout(request)
 
     # Googleのログインを開始
     return redirect('social:begin', 'google-oauth2')
+
 
 @login_required
 def profile_view(request):

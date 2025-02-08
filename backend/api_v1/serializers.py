@@ -366,18 +366,34 @@ class StockReceiveSerializer(serializers.Serializer):
 
 
 class WalletChargeSerializer(serializers.Serializer):
-    user_id = serializers.CharField() 
+    user_id = serializers.CharField()
     amount = serializers.DecimalField(max_digits=10, decimal_places=2)
 
     def validate_amount(self, value):
-        if value <= 0:
-            raise serializers.ValidationError("入金額は正の値である必要があります。")
+        if value < 0:
+            raise serializers.ValidationError("入金額は0以上である必要があります。")
+        if value > 10000:
+            raise serializers.ValidationError("一度にチャージできる金額は10000円までです。")
+        if value % 100 != 0:
+            raise serializers.ValidationError("チャージは100円単位で行う必要があります。")
         return value
 
     def validate_user_id(self, value):
         if not CustomUser.objects.filter(id=value).exists():
             raise serializers.ValidationError("指定されたユーザーは存在しません。")
         return value
+
+    def create_wallet_transaction(self, user, amount):
+        # ウォレットが存在しない場合は新規作成
+        wallet, created = Wallet.objects.get_or_create(user=user, defaults={'balance': 0})
+
+        # amountが0の場合は新規作成のみ
+        if created and amount == 0:
+            return wallet.balance, created
+
+        # 既存のウォレットに入金処理を行う
+        wallet.deposit(amount)
+        return wallet.balance, created
 
 
 class WalletBalanceSerializer(serializers.Serializer):
