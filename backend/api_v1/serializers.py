@@ -1,7 +1,8 @@
 from rest_framework import serializers
 from django.utils import timezone
 from django.db import transaction
-from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, WalletTransaction
+from rest_framework.fields import empty
+from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, WalletTransaction, Wallet
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 
@@ -54,14 +55,97 @@ class PaymentSerializer(serializers.ModelSerializer):
         fields = ['payment_method', 'amount']
 
 
+class TaxRateManager:
+    @staticmethod
+    def get_applied_tax(product, specified_tax_rate):
+        # 指定がなければ、商品の元の税率を返す
+        if specified_tax_rate is None:
+            return product.tax
+        # 指定税率は 0, 8, 10 のいずれかでなければならない
+        if specified_tax_rate not in [0, 8, 10]:
+            raise serializers.ValidationError(
+                f"JAN:{product.jan} 不正な税率。税率は0, 8, 10のいずれかを指定してください。"
+            )
+        # 税率10%の商品は変更不可
+        if product.tax == 10 and specified_tax_rate != 10:
+            raise serializers.ValidationError(
+                f"JAN:{product.jan} 税率10%の商品は税率変更できません。"
+            )
+        # 税率変更が禁止されている場合は、指定税率と元の税率が一致しなければならない
+        if product.disable_change_tax:
+            if specified_tax_rate != product.tax:
+                raise serializers.ValidationError(
+                    f"JAN:{product.jan} は税率の変更が禁止されています。"
+                )
+            return product.tax
+        # 8%の商品について、指定が10%であれば変更を許可
+        if product.tax == 8 and specified_tax_rate == 10:
+            return 10
+        # それ以外で、指定税率が元と異なる場合はエラー
+        if specified_tax_rate != product.tax:
+            raise serializers.ValidationError(
+                f"JAN:{product.jan} は税率変更できません。"
+            )
+        return product.tax
+
+
+class NonStopListSerializer(serializers.ListSerializer):
+    def run_validation(self, data=empty):
+        if data is empty:
+            return []
+        ret = []
+        errors = []
+        for index, item in enumerate(data):
+            try:
+                value = self.child.run_validation(item)
+                ret.append(value)
+                errors.append({})  # 正常なら空の辞書
+            except serializers.ValidationError as exc:
+                # 例外は捕捉して、エラー内容をリストに追加
+                ret.append(item)
+                errors.append(exc.detail)
+        # 1件でもエラーがあれば、全件分のエラー情報をまとめて返す
+        if any(error for error in errors if error):
+            raise serializers.ValidationError(errors)
+        return ret
+
+
 class TransactionDetailSerializer(serializers.ModelSerializer):
-    tax = serializers.IntegerField(read_only=True)  # Intに変換しないとDRFではDecimalは文字列に変換されてしまう
+    tax = serializers.IntegerField(required=False)
     discount = serializers.IntegerField(required=False, default=0)
+    quantity = serializers.IntegerField(min_value=1)
 
     class Meta:
         model = TransactionDetail
         fields = ["jan", "name", "price", "tax", "discount", "quantity"]
-        read_only_fields = ["name", "price", "tax"]
+        # name, price はシステム側で設定されるので read_only
+        read_only_fields = ["name", "price"]
+        # many=True時にカスタムListSerializerを利用
+        list_serializer_class = NonStopListSerializer
+
+    def validate(self, data):
+        # --- 値引きの基本チェック（負の値はNG） ---
+        discount = data.get('discount', 0)
+        if discount < 0:
+            raise serializers.ValidationError({"discount": "割引額は0以上である必要があります。"})
+
+        # --- 商品の存在確認 ---
+        jan = data.get('jan')
+        try:
+            product = Product.objects.get(jan=jan)
+        except Product.DoesNotExist:
+            raise serializers.ValidationError({"jan": f"JANコード {jan} は登録されていません。"})
+
+        # --- 税率のバリデーション ---
+        # クライアント側から tax が指定されていなければ、商品の税率を使用
+        specified_tax_rate = data.get('tax')
+        try:
+            applied_tax_rate = TaxRateManager.get_applied_tax(product, specified_tax_rate)
+        except serializers.ValidationError as e:
+            raise serializers.ValidationError({"tax": e.detail if hasattr(e, "detail") else str(e)})
+
+        data['tax'] = applied_tax_rate
+        return data
 
 
 class TransactionSerializer(serializers.ModelSerializer):
@@ -89,81 +173,68 @@ class TransactionSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("支払方法を登録してください。")
         return value
 
-    def create(self, validated_data):
-        sale_products_data = validated_data.pop("sale_products", [])
-        payments_data = validated_data.pop("payments", [])
-        staff_code = validated_data.pop("staff_code", None)
-        store_code = validated_data.pop("store_code", None)
-        status = validated_data.get("status")
-        user = validated_data.pop("user", None)
-        terminal_id = validated_data.pop("terminal_id", None)
+    def validate(self, data):
+        errors = {}
 
-        # 権限のチェック
-        permissions = self._check_permissions(staff_code, store_code)
-        # 値引きがある場合のチェック
-        self._discount_check(sale_products_data, store_code, permissions)
+        staff_code = data.get("staff_code")
+        store_code = data.get("store_code")
+        payments_data = data.get("payments", [])
+        sale_products_data = data.get("sale_products", [])
 
-        # 合計金額の計算
-        totals = self._calculate_totals(sale_products_data, store_code)
-        total_payments = sum(payment['amount'] for payment in payments_data)
+        # スタッフ権限のチェック
+        try:
+            permissions = self._check_permissions(staff_code, store_code)
+        except serializers.ValidationError as e:
+            errors["staff"] = e.detail
+            permissions = None  # 以降のチェックは実施できないが、エラーを残すためにNoneとする
 
-        # 支払方法のバリデーションを先に行う
-        self._validate_payments(total_payments, totals['total_amount'], payments_data)
+        # 値引き（ディスカウント）のチェック（各商品ごとにエラーを集約）
+        discount_errors = self._aggregate_discount_errors(sale_products_data, store_code, permissions)
+        if discount_errors:
+            errors["sale_products_discount"] = discount_errors
 
-        with transaction.atomic():
-            wallet = user.wallet
+        # 支払い金額のチェック
+        try:
+            totals = self._calculate_totals(sale_products_data, store_code)
+        except serializers.ValidationError as e:
+            errors["sale_products_totals"] = e.detail
+            totals = None
 
-            # ウォレット残高のチェック
-            wallet_payments = [p for p in payments_data if p['payment_method'] == 'wallet']
-            if wallet_payments:
-                total_wallet_payment = sum(p['amount'] for p in wallet_payments)
-                if total_wallet_payment > wallet.balance:
-                    raise serializers.ValidationError("ウォレットの残高が不足しています。")
+        if totals is not None:
+            total_payments = sum(payment['amount'] for payment in payments_data)
+            try:
+                self._validate_payments(total_payments, totals['total_amount'], payments_data)
+            except serializers.ValidationError as e:
+                errors["payments"] = e.detail
 
-            # トランザクションの作成
-            transaction_instance = Transaction.objects.create(
-                date=timezone.now(),
-                user=user,
-                terminal_id=terminal_id,
-                staff_code=staff_code,
-                store_code=store_code,
-                deposit=total_payments,
-                change=total_payments - totals['total_amount'],
-                total_quantity=totals['total_quantity'],
-                total_tax10=totals['total_tax10'],
-                total_tax8=totals['total_tax8'],
-                tax_amount=totals['tax_amount'],
-                discount_amount=totals['discount_amount'],
-                total_amount=totals['total_amount'],
-                **validated_data
-            )
+        if errors:
+            raise serializers.ValidationError(errors)
 
-            # ウォレットからの支払い処理
-            if wallet_payments:
-                wallet.withdraw(total_wallet_payment, transaction=transaction_instance)  # Transaction IDを渡す
+        return data
 
-            # 取引詳細の作成
-            self._create_transaction_details(transaction_instance, sale_products_data, status, store_code)
-
-            # 支払データの保存
-            self._create_payments(transaction_instance, payments_data)
-
-        return transaction_instance
+    def _aggregate_discount_errors(self, sale_products_data, store_code, permissions):
+        discount_error_list = []
+        for index, sale_product in enumerate(sale_products_data):
+            try:
+                # 個別の商品について、値引きチェックを実施
+                self._discount_check([sale_product], store_code, permissions)
+            except serializers.ValidationError as e:
+                discount_error_list.append({f"product_{index}": e.detail})
+        return discount_error_list
 
     def _discount_check(self, sale_products_data, store_code, permissions):
-        # 値引きがある際に行う共通処理
         for sale_product in sale_products_data:
-            if sale_product.get("discount", 0) != 0 and "change_price" not in permissions:
-                raise serializers.ValidationError("このスタッフは売価変更を行う権限がありません。")
-
             product = self._get_product(sale_product["jan"])
-            store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
-            effective_price = store_price.get_price() if store_price else product.price
-
-            # 割引が商品価格を超えていないかチェック、割引額は自然数のみ
             discount = sale_product.get("discount", 0)
-            if discount > effective_price or discount < 0:
-                raise serializers.ValidationError(f"JAN:{sale_product['jan']} 不正な割引額が入力されました。")
+            if discount > 0:
+                if product.disable_change_price:
+                    raise serializers.ValidationError(f"JAN:{sale_product['jan']} の値引きは許可されていません。")
+                store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
+                effective_price = store_price.get_price() if store_price else product.price
+                if discount > effective_price:
+                    raise serializers.ValidationError(f"JAN:{sale_product['jan']} 不正な割引額が入力されました。")
+                if discount < 0:
+                    raise serializers.ValidationError(f"JAN:{sale_product['jan']} 割引額は0以上である必要があります。")
 
     def _check_permissions(self, staff_code, store_code):
         # 権限のチェック
@@ -196,25 +267,21 @@ class TransactionSerializer(serializers.ModelSerializer):
             effective_price = store_price.get_price() if store_price else product.price
             discount = sale_product_data.get("discount", 0)
             quantity = sale_product_data.get("quantity", 1)
-
-            # 値引き後の商品ごとの税込小計を計算
             subtotal_with_tax = (effective_price - discount) * quantity
 
-            # 税率ごとに税込合計金額を求める
-            if product.tax == 10:
+            # 既に TransactionDetailSerializer で検証済みの tax を利用
+            applied_tax_rate = sale_product_data.get("tax")
+            if applied_tax_rate == 10:
                 total_amount_tax10 += subtotal_with_tax
-            elif product.tax == 8:
+            else:
                 total_amount_tax8 += subtotal_with_tax
 
             total_quantity += quantity
             discount_amount += discount * quantity
 
-        # 税率ごとの合計金額に基づいて税額を計算
         total_tax10 = total_amount_tax10 * 10 / 110
         total_tax8 = total_amount_tax8 * 8 / 108
         total_tax = total_tax10 + total_tax8
-        
-        # 合計金額を計算
         total_amount = total_amount_tax10 + total_amount_tax8
 
         return {
@@ -235,14 +302,11 @@ class TransactionSerializer(serializers.ModelSerializer):
             )
 
     def _validate_payments(self, total_payments, total_amount, payments_data):
-        # 支払方法のバリデーション
         if total_payments < total_amount:
             raise serializers.ValidationError("支払いの合計金額が取引の合計金額を下回っています。")
-
         total_cashless_amount = sum(
             payment['amount'] for payment in payments_data if payment['payment_method'] != 'cash'
         )
-        
         if total_cashless_amount > total_amount:
             raise serializers.ValidationError("現金以外の支払方法の総計が合計金額を超えています。")
 
@@ -251,7 +315,6 @@ class TransactionSerializer(serializers.ModelSerializer):
         store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
         effective_price = store_price.get_price() if store_price else product.price
 
-        # トレーニングモードでない場合、在庫を減らす
         if status != "training":
             stock = self._get_stock(store_code, product)
             stock.stock -= sale_product_data.get("quantity", 1)
@@ -278,16 +341,63 @@ class TransactionSerializer(serializers.ModelSerializer):
             product, effective_price = self._process_product(store_code, sale_product_data, status)
             discount = sale_product_data.get("discount", 0)
             quantity = sale_product_data.get("quantity", 1)
+            applied_tax_rate = sale_product_data.get("tax")
 
             TransactionDetail.objects.create(
                 transaction=transaction_instance,
                 jan=product,
                 name=product.name,
                 price=effective_price,
-                tax=product.tax,
+                tax=applied_tax_rate,
                 discount=discount,
                 quantity=quantity
             )
+
+    def create(self, validated_data):
+        sale_products_data = validated_data.pop("sale_products", [])
+        payments_data = validated_data.pop("payments", [])
+        staff_code = validated_data.pop("staff_code", None)
+        store_code = validated_data.pop("store_code", None)
+        status = validated_data.get("status")
+        user = validated_data.pop("user", None)
+        terminal_id = validated_data.pop("terminal_id", None)
+        totals = self._calculate_totals(sale_products_data, store_code)
+        total_payments = sum(payment['amount'] for payment in payments_data)
+
+        with transaction.atomic():
+            # ウォレット支払いのバリデーション
+            wallet = user.wallet
+            wallet_payments = [p for p in payments_data if p['payment_method'] == 'wallet']
+            if wallet_payments:
+                total_wallet_payment = sum(p['amount'] for p in wallet_payments)
+                if total_wallet_payment > wallet.balance:
+                    shortage = total_wallet_payment - wallet.balance
+                    raise serializers.ValidationError(f"ウォレット残高不足。{int(shortage)}円分不足しています。")
+
+            transaction_instance = Transaction.objects.create(
+                date=timezone.now(),
+                user=user,
+                terminal_id=terminal_id,
+                staff_code=staff_code,
+                store_code=store_code,
+                deposit=total_payments,
+                change=total_payments - totals['total_amount'],
+                total_quantity=totals['total_quantity'],
+                total_tax10=totals['total_tax10'],
+                total_tax8=totals['total_tax8'],
+                tax_amount=totals['tax_amount'],
+                discount_amount=totals['discount_amount'],
+                total_amount=totals['total_amount'],
+                **validated_data
+            )
+
+            if wallet_payments:
+                wallet.withdraw(total_wallet_payment, transaction=transaction_instance)
+
+            self._create_transaction_details(transaction_instance, sale_products_data, status, store_code)
+            self._create_payments(transaction_instance, payments_data)
+
+        return transaction_instance
 
 
 class ProductSerializer(serializers.ModelSerializer):
@@ -300,6 +410,7 @@ class ProductSerializer(serializers.ModelSerializer):
 class ProductVariationDetailSerializer(serializers.ModelSerializer):
     """商品バリエーション詳細のシリアライザー"""
     product = ProductSerializer()
+
     class Meta:
         model = ProductVariationDetail
         fields = ['product', 'color_name', 'product_variation']
@@ -330,7 +441,8 @@ class StockSerializer(serializers.ModelSerializer):
         model = Stock
         fields = ['store_code', 'jan', 'stock', 'standard_price', 'store_price', 'tax']
 # TODO:なぜmodels側のget_priceだけでは価格が取得できないのか調査する
-#（現在のコードだとstore_priceが存在しない時のフォールバック処理を二回行なっていることになっている）
+# （現在のコードだとstore_priceが存在しない時のフォールバック処理を二回行なっていることになっている）
+
     def get_store_price(self, obj):
         store_price = StorePrice.objects.filter(store_code=obj.store_code, jan=obj.jan).first()
         return store_price.get_price() if store_price else obj.jan.price  # StorePriceがない場合はProductの価格を返す
@@ -397,7 +509,7 @@ class WalletChargeSerializer(serializers.Serializer):
 
 
 class WalletBalanceSerializer(serializers.Serializer):
-    user_id = serializers.CharField() 
+    user_id = serializers.CharField()
 
     def validate_user_id(self, value):
         if not CustomUser.objects.filter(id=value).exists():

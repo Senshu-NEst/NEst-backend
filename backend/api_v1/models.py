@@ -39,6 +39,8 @@ class Product(BaseModel):
     price = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="商品価格")
     tax = models.DecimalField(max_digits=3, decimal_places=1, default=8.0, choices=TAX_CHOICES, verbose_name="消費税率")
     status = models.CharField(max_length=50, choices=Status.choices, default=Status.IN_DEAL, verbose_name="取引状態")
+    disable_change_tax = models.BooleanField(default=False, verbose_name="POSでの税率変更を禁止")
+    disable_change_price = models.BooleanField(default=False, verbose_name="POSでの価格変更を禁止")
 
     class Meta:
         verbose_name = "商品"
@@ -266,7 +268,7 @@ class Payment(BaseModel):
 
 class Wallet(BaseModel):
     user = models.OneToOneField('CustomUser', on_delete=models.CASCADE, related_name='wallet')
-    balance = models.DecimalField(max_digits=10, decimal_places=2, default=0.00, verbose_name="残高")
+    balance = models.IntegerField(verbose_name="残高")
 
     class Meta:
         verbose_name = "ウォレット"
@@ -307,8 +309,8 @@ class WalletTransaction(BaseModel):
         ('debit', '出金'),
     )
     wallet = models.ForeignKey(Wallet, on_delete=models.CASCADE, related_name='wallettransactions')
-    amount = models.DecimalField(max_digits=10, decimal_places=2, verbose_name="金額")
-    balance = models.DecimalField(max_digits=10, decimal_places=2, verbose_name="残高")
+    amount = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="金額")
+    balance = models.IntegerField(verbose_name="残高")
     transaction_type = models.CharField(max_length=10, choices=TRANSACTION_TYPE_CHOICES, verbose_name="取引タイプ")
     transaction = models.ForeignKey('Transaction', on_delete=models.CASCADE, related_name='wallet_transactions', null=True, blank=True)
 

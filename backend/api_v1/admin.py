@@ -70,6 +70,7 @@ class VariationDetailInline(admin.TabularInline):
 class ProductAdmin(ImportExportModelAdmin):
     resource_class = ProductResource
     list_display = ("jan", "name", "price", "tax", "status")
+    fields = ("jan", "name", ("price", "tax"), "status", ("disable_change_tax", "disable_change_price"))
     search_fields = ("name", "jan")
     list_filter = ("status", "tax")
     inlines = [StockInline]
