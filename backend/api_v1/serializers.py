@@ -2,7 +2,7 @@ from rest_framework import serializers
 from django.utils import timezone
 from django.db import transaction
 from rest_framework.fields import empty
-from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, WalletTransaction, Wallet
+from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, WalletTransaction, Wallet, Approval, Store
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 
@@ -152,11 +152,12 @@ class TransactionSerializer(serializers.ModelSerializer):
     sale_products = TransactionDetailSerializer(many=True)
     payments = PaymentSerializer(many=True)
     date = serializers.DateTimeField(required=False)
+    approval_number = serializers.CharField(required=True, write_only=True)
 
     class Meta:
         model = Transaction
-        fields = ["id", "status", "date", "store_code", "terminal_id", "staff_code", "user", "total_tax10", "total_tax8", "tax_amount", "discount_amount", "total_amount", "deposit", "change", "total_quantity", "payments", "sale_products"]
-        read_only_fields = ["id", "total_quantity", "total_tax10", "total_tax8", "tax_amount", "total_amount", "change", "discount_amount", "deposit"]
+        fields = ["id", "status", "date", "store_code", "terminal_id", "staff_code", "approval_number", "user", "total_tax10", "total_tax8", "tax_amount", "discount_amount", "total_amount", "deposit", "change", "total_quantity", "payments", "sale_products"]
+        read_only_fields = ["id", "user", "total_quantity", "total_tax10", "total_tax8", "tax_amount", "total_amount", "change", "discount_amount", "deposit"]
 
     def validate_status(self, value):
         if value == "void":
@@ -186,7 +187,26 @@ class TransactionSerializer(serializers.ModelSerializer):
             permissions = self._check_permissions(staff_code, store_code)
         except serializers.ValidationError as e:
             errors["staff"] = e.detail
-            permissions = None  # 以降のチェックは実施できないが、エラーを残すためにNoneとする
+            permissions = None
+
+        # ③ 承認番号のチェック
+        approval_errors = {}
+        approval_number = data.get("approval_number")
+        if not approval_number:
+            approval_errors["approval_number"] = "承認番号が入力されていません。"
+        else:
+            # 形式チェック：8桁の数字であるか
+            if not (len(approval_number) == 8 and approval_number.isdigit()):
+                approval_errors["approval_number"] = "承認番号の形式に誤りがあります。数字8桁を入力してください。"
+            else:
+                try:
+                    approval = Approval.objects.get(approval_number=approval_number)
+                    if approval.is_used:
+                        approval_errors["approval_number"] = "承認番号は既に使用済みです。"
+                except Approval.DoesNotExist:
+                    approval_errors["approval_number"] = "承認番号が存在しません。"
+        if approval_errors:
+            errors.update(approval_errors)
 
         # 値引き（ディスカウント）のチェック（各商品ごとにエラーを集約）
         discount_errors = self._aggregate_discount_errors(sale_products_data, store_code, permissions)
@@ -359,8 +379,19 @@ class TransactionSerializer(serializers.ModelSerializer):
         staff_code = validated_data.pop("staff_code", None)
         store_code = validated_data.pop("store_code", None)
         status = validated_data.get("status")
-        user = validated_data.pop("user", None)
         terminal_id = validated_data.pop("terminal_id", None)
+
+        # 承認番号の取得（validate() でチェック済み）
+        approval_number = validated_data.pop("approval_number", None)
+        try:
+            approval = Approval.objects.get(approval_number=approval_number)
+            # トレーニングモードでない場合のみ、既に使用済みかどうかのチェックを行う
+            if status != "training" and approval.is_used:
+                raise serializers.ValidationError("承認番号は既に使用済みです。")
+            user = approval.user
+        except Approval.DoesNotExist:
+            raise serializers.ValidationError("無効または期限切れの承認番号です。")
+
         totals = self._calculate_totals(sale_products_data, store_code)
         total_payments = sum(payment['amount'] for payment in payments_data)
 
@@ -376,7 +407,7 @@ class TransactionSerializer(serializers.ModelSerializer):
 
             transaction_instance = Transaction.objects.create(
                 date=timezone.now(),
-                user=user,
+                user=user,  # 承認番号から取得したユーザーを設定
                 terminal_id=terminal_id,
                 staff_code=staff_code,
                 store_code=store_code,
@@ -524,9 +555,21 @@ class StockReceiveHistoryItemSerializer(serializers.ModelSerializer):
 
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    # 既存の JWT 発行エンドポイント用（メールアドレス/パスワード認証用）のシリアライザー
     @classmethod
     def get_token(cls, user):
         token = super().get_token(user)
-        token["staff_code"] = user.staff_code
-
+        token["staff_code"] = getattr(user, "staff_code", None)
         return token
+
+class CustomUserTokenSerializer(serializers.Serializer):
+    """カスタムユーザー用のトークンシリアライザー（custom-token エンドポイント用）"""
+    # こちらは出力用のシンプルなシリアライザー。入力値は特になし。
+    refresh = serializers.CharField(required=False)
+    access = serializers.CharField(required=False)
+
+class ApprovalSerializer(serializers.ModelSerializer):
+    """承認番号モデル用のシリアライザー"""
+    class Meta:
+        model = Approval
+        fields = ['id', 'user', 'approval_number', 'created_at']

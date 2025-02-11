@@ -429,3 +429,20 @@ class UserPermission(BaseModel):
 
     def __str__(self):
         return self.role_name
+
+
+class Approval(BaseModel):
+    """
+    承認番号（8桁の数字）を保存するモデル。
+    CustomUser を親とし、外部キーで紐付ける。
+    """
+    user = models.ForeignKey("CustomUser", on_delete=models.CASCADE, related_name="approvals")
+    approval_number = models.CharField(max_length=8)
+    is_used = models.BooleanField(default=False, verbose_name="使用済みフラグ")
+
+    class Meta:
+        verbose_name = "承認番号"
+        verbose_name_plural = "ウォレット承認番号"
+
+    def __str__(self):
+        return f"Approval {self.approval_number} for {self.user.email}"

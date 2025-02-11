@@ -280,6 +280,14 @@ class UserPermissionAdmin(admin.ModelAdmin):
     )
 
 
+@admin.register(Approval)
+class ApprovalAdmin(admin.ModelAdmin):
+    list_display = ("user", "approval_number", "is_used")
+    fields = ("user", "approval_number", "created_at", "is_used")
+    readonly_fields = ("created_at",)
+    search_fields = ("user__email",)
+    list_filter = ("user", "created_at")
+
 # ブラックリストトークンの管理
 class BlacklistedTokenAdmin(DefaultBlacklistedTokenAdmin):
     actions = ["delete_expired_blacklisted_tokens"]

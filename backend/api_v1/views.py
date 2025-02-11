@@ -6,8 +6,8 @@ from django.utils import timezone
 from django.db.models.query import QuerySet
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
-from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, ProductVariationDetail, Wallet, WalletTransaction, Staff
-from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer, ProductVariationSerializer, ProductVariationDetailSerializer, WalletChargeSerializer, WalletBalanceSerializer
+from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, ProductVariationDetail, Wallet, WalletTransaction, Staff, Approval
+from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer, ProductVariationSerializer, ProductVariationDetailSerializer, WalletChargeSerializer, WalletBalanceSerializer, CustomUserTokenSerializer, ApprovalSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
@@ -18,6 +18,10 @@ from collections import defaultdict
 from django.shortcuts import redirect
 from django.contrib.auth import logout
 from django.shortcuts import render
+from rest_framework_simplejwt.tokens import AccessToken
+from rest_framework_simplejwt.exceptions import TokenError
+import random
+from rest_framework_simplejwt.settings import api_settings
 
 
 class ProductViewSet(viewsets.ModelViewSet):
@@ -409,6 +413,86 @@ def profile_view(request):
     return render(request, 'api_v1/profile.html', {'user': user})
 
 
-def logout_view(request):
-    logout(request)  # ユーザーをログアウト
-    return redirect('login')  # ログアウト後のリダイレクト先
+class SimpleAccessToken(AccessToken):
+    @classmethod
+    def for_user(cls, user):
+        """
+        ユーザー情報からアクセストークンを生成する。
+        """
+        token = cls()
+        # ユーザーIDをトークンにセット（文字列に変換）
+        token["user_id"] = str(user.pk)
+        # 有効期限は設定に従い自動的に設定する代わり、ここで明示的にセット
+        lifetime = api_settings.ACCESS_TOKEN_LIFETIME
+        token.set_exp(from_time=timezone.now(), lifetime=lifetime)
+        return token
+
+
+class CustomUserTokenViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
+    """
+    ログイン状態（認証済み）のユーザーに対して、
+    django-simplejwt を用いてアクセストークン（有効期限付き）を発行するエンドポイント。
+    """
+    permission_classes = [IsAuthenticated]
+    serializer_class = CustomUserTokenSerializer  # POST 用シリアライザー（ただし出力は create() 内で返す）
+
+    def create(self, request, *args, **kwargs):
+        user = request.user
+        # SimpleAccessToken を使ってアクセストークンを生成（staff_code などは付与しない）
+        token = SimpleAccessToken.for_user(user)
+        return Response({
+            "token": str(token),
+            "expires": token["exp"],
+            "user_id": user.pk,
+        }, status=status.HTTP_200_OK)
+
+    def list(self, request, *args, **kwargs):
+        # GET リクエストは受け付けず 405 を返す
+        return Response({"detail": "Method 'GET' not allowed."}, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
+class ApprovalViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
+    permission_classes = [AllowAny]
+    queryset = Approval.objects.all()
+    serializer_class = ApprovalSerializer
+
+    def create(self, request, *args, **kwargs):
+        token_str = request.data.get("token")
+        if not token_str:
+            return Response({"error": "tokenパラメータが必要です。"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            access_token = AccessToken(token_str)
+        except TokenError:
+            return Response({"error": "トークンが無効または期限切れです。"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # JWT に含まれる user_id を取得
+        user_id = access_token.get("user_id")
+        if not user_id:
+            return Response({"error": "トークンにユーザー情報が含まれていません。"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user = CustomUser.objects.get(pk=user_id)
+        except CustomUser.DoesNotExist:
+            return Response({"error": "ユーザーが存在しません。"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # ユーザーが持つ未使用の承認番号を取得
+        existing_approval = Approval.objects.filter(user=user, is_used=False).first()
+        if existing_approval:
+            # 未使用の承認番号がある場合は削除
+            existing_approval.delete()
+
+        # 新しい承認番号を生成する関数
+        def generate_unique_approval_number():
+            while True:
+                approval_number = f"{random.randint(0, 99999999):08d}"
+                if not Approval.objects.filter(approval_number=approval_number).exists():
+                    return approval_number
+
+        # 承認番号を生成（重複チェック）
+        approval_number = generate_unique_approval_number()
+
+        # Approval モデルに保存（CustomUser を親として外部キーで紐付け）
+        Approval.objects.create(user=user, approval_number=approval_number, is_used=False)
+
+        return Response({"approval_number": approval_number}, status=status.HTTP_201_CREATED)
