@@ -83,7 +83,7 @@ class Store(BaseModel):
         verbose_name_plural = "店舗一覧"
 
     def __str__(self):
-        return self.name
+        return f"{self.store_code}-{self.name}"
 
     def save(self, *args, **kwargs):
         """新しい店舗が追加された際に全ての商品に対する在庫を生成"""

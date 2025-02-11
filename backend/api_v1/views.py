@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status
+from rest_framework import viewsets, status, mixins
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from django.db import transaction
@@ -9,7 +9,7 @@ from typing import List, Dict, Tuple
 from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, ProductVariationDetail, Wallet, WalletTransaction, Staff, Approval
 from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer, ProductVariationSerializer, ProductVariationDetailSerializer, WalletChargeSerializer, WalletBalanceSerializer, CustomUserTokenSerializer, ApprovalSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView
-from django.http import HttpResponse
+from django.http import HttpResponse, HttpResponseForbidden
 from django.shortcuts import get_object_or_404
 import requests
 from .get_receipt_data import generate_receipt_text, generate_return_receipt
@@ -18,10 +18,14 @@ from collections import defaultdict
 from django.shortcuts import redirect
 from django.contrib.auth import logout
 from django.shortcuts import render
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework_simplejwt.tokens import AccessToken
 from rest_framework_simplejwt.exceptions import TokenError
 import random
 from rest_framework_simplejwt.settings import api_settings
+from rest_framework.exceptions import NotFound, PermissionDenied
+import rules
+from .rules import check_transaction_access, filter_transactions_by_user
 
 
 class ProductViewSet(viewsets.ModelViewSet):
@@ -249,58 +253,78 @@ class StockReceiveHistoryViewSet(viewsets.ReadOnlyModelViewSet):
 
 class TransactionViewSet(viewsets.ModelViewSet):
     """取引情報に関するCRUD操作を提供するViewSet"""
-    queryset = Transaction.objects.all()
     serializer_class = TransactionSerializer
 
-    def list(self, request, *args, **kwargs) -> Response:
-        """
-        取引情報の一覧を取得
+    def get_queryset(self):
+        user = self.request.user
         
-        Parameters:
-            id (int, optional): 取引ID
-            store_code (str, optional): 店舗コード
-            staff_code (str, optional): スタッフコード
-            start_date (str, optional): 開始日（YYYYMMDD形式）
-            end_date (str, optional): 終了日（YYYYMMDD形式）
-        """
-        queryset = self._get_filtered_transactions(request)
-        serializer = self.get_serializer(queryset, many=True)
+        # ユーザーのアクセス権限に基づいてクエリセットをフィルタリング
+        return filter_transactions_by_user(user, Transaction.objects.all())
+
+    def list(self, request, *args, **kwargs) -> Response:
+        """取引情報の一覧を取得"""
+        queryset = self.get_queryset()  # get_queryset を使用
+        
+        # フィルタリング処理
+        filtered_queryset = self._get_filtered_transactions(request, queryset)
+        serializer = self.get_serializer(filtered_queryset, many=True)
         return Response(serializer.data)
 
     def _parse_date_range(self, request) -> Tuple[datetime, datetime]:
         """日付範囲パラメータの解析"""
-        # 開始日・終了日の指定がない場合は当日を指定
-        default_date = datetime.now().strftime("%Y%m%d")
+        default_date = timezone.now().strftime("%Y%m%d")
         
         start_date = request.query_params.get("start_date", default_date)
         end_date = request.query_params.get("end_date", default_date)
 
         start = datetime.strptime(start_date, "%Y%m%d")
-        # 終了日の場合は日付の最後（23:59:59）までを含める
         end = datetime.strptime(end_date, "%Y%m%d") + timedelta(days=1) - timedelta(seconds=1)
 
         return start, end
 
-    def _get_filtered_transactions(self, request) -> QuerySet[Transaction]:
+    def _get_filtered_transactions(self, request, queryset) -> QuerySet[Transaction]:
         """指定された条件で取引を検索"""
         transaction_id = request.query_params.get("id")
         store_code = request.query_params.get("store_code")
         staff_code = request.query_params.get("staff_code")
-        status = request.query_params.get("status")
+        status_param = request.query_params.get("status")
         start_date, end_date = self._parse_date_range(request)
 
-        filters = {"date__range": [start_date, end_date]}
-        
-        if transaction_id:
-            filters["id"] = transaction_id
-        if store_code:
-            filters["store_code__store_code"] = store_code
-        if staff_code:
-            filters["staff_code__staff_code"] = staff_code
-        if status is None:
-            filters["status"] = "sale"
+        # フィルタ用の辞書を初期化
+        filters = {}
 
-        return self.queryset.filter(**filters)
+        if transaction_id:
+            filters["id"] = transaction_id  # 取引IDが指定された場合はフィルタに追加
+            
+        # 日付範囲を適用（取引IDが指定されていない場合）
+        if not transaction_id:
+            filters["date__range"] = [start_date, end_date]
+
+        # スーパーユーザーの場合でも全てのフィルタを適用する
+        if store_code:
+            filters["store_code"] = store_code
+        if staff_code:
+            filters["staff_code"] = staff_code
+        
+        # status_param が 'all' でない場合はフィルタを適用
+        if status_param and status_param.lower() != 'all':
+            filters["status"] = status_param  # デフォルトの状態を設定
+
+        # クエリセットの生成
+        filtered_queryset = queryset.filter(**filters).order_by('-id')  # id の降順で並べ替え
+
+        # 取引IDが指定された場合のチェック
+        if transaction_id:
+            transaction = Transaction.objects.filter(id=transaction_id).first()
+
+            # 取引が存在しない場合
+            if not transaction:
+                raise NotFound("指定された取引は存在しません。")
+
+            # ルールを適用して表示権限を確認
+            check_transaction_access(request.user, transaction)
+
+        return filtered_queryset
 
 
 class TestViewSet(viewsets.ViewSet):
@@ -370,29 +394,27 @@ class CustomTokenObtainPairView(TokenObtainPairView):
 
 @login_required
 def generate_receipt_view(request, transaction_id, receipt_type):
-    try:
-        # Transactionオブジェクトの取得
-        transaction = get_object_or_404(Transaction, id=transaction_id)
+    transaction = get_object_or_404(Transaction, id=transaction_id)
 
-        # レシートの種類に応じてテキスト生成関数を切り替える
-        if receipt_type == 'sale':
-            receipt_text = generate_receipt_text(transaction)
-        elif receipt_type == 'return':
-            receipt_text = generate_return_receipt(transaction)
-        else:
-            return HttpResponse("無効な取引種別", content_type="text/plain")
+    # アクセス権をチェック
+    if not rules.test_rule('view_transaction', request.user, transaction):
+        return HttpResponseForbidden("この取引にアクセスする権限がありません。")
 
-        # レシートデータをPOSTリクエストで送信
-        response = requests.post("http://receipt:6573/generate", data={"text": receipt_text})
-        if response.status_code == 200:
-            # HTMLコンテンツを取得してそのままレスポンスとして返す
-            html_content = response.text
-            return HttpResponse(html_content, content_type="text/html; charset=utf-8")
-        else:
-            return HttpResponse("レシートデータの取得に失敗しました", content_type="text/plain")
+    # レシート種別に応じたテキスト生成
+    if receipt_type == 'sale':
+        receipt_text = generate_receipt_text(transaction)
+    elif receipt_type == 'return':
+        receipt_text = generate_return_receipt(transaction)
+    else:
+        return HttpResponse("無効な取引種別", content_type="text/plain")
 
-    except Transaction.DoesNotExist:
-        return HttpResponse("取引が見つかりません", content_type="text/plain")
+    # レシートデータを外部サービスにPOST送信
+    response = requests.post("http://receipt:6573/generate", data={"text": receipt_text})
+    if response.status_code == 200:
+        html_content = response.text
+        return HttpResponse(html_content, content_type="text/html; charset=utf-8")
+    else:
+        return HttpResponse("レシートデータの取得に失敗しました", content_type="text/plain")
 
 
 def login_view(request):

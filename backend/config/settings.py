@@ -33,6 +33,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "rules.apps.AutodiscoverRulesConfig",
 
     # アプリ
     "api_v1",
@@ -165,6 +166,7 @@ SIMPLE_JWT = {
 # social-auth-app-djangoの設定
 AUTHENTICATION_BACKENDS = (
     'social_core.backends.google.GoogleOAuth2',
+    'rules.permissions.ObjectPermissionBackend',
     'django.contrib.auth.backends.ModelBackend',  # Djangoの標準認証バックエンド
 )
 

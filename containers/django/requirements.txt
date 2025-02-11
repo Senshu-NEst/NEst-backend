@@ -8,6 +8,7 @@ djangorestframework_simplejwt
 django-debug-toolbar
 django-import-export
 social-auth-app-django
+rules
 
 #djangorestframework-api-key
 #sqids==0.4.1

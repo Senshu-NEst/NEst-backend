@@ -2,7 +2,7 @@ from django.contrib import admin
 from import_export import resources, fields
 from import_export.admin import ImportExportModelAdmin
 from django import forms
-from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction
+from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval
 from django.utils import timezone
 from rest_framework_simplejwt.token_blacklist.admin import (
     BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin,
@@ -11,6 +11,8 @@ from rest_framework_simplejwt.token_blacklist.admin import (
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 from django.urls import reverse
 from django.utils.html import format_html
+import rules
+from .rules import check_transaction_access, filter_transactions_by_user
 
 
 class NegativeStockFilter(admin.SimpleListFilter):
@@ -138,6 +140,17 @@ class TransactionAdmin(admin.ModelAdmin):
     def receipt_button(self, obj):
         return format_html('<a class="button" href="{}">レシート</a>', reverse('generate_receipt_view', args=[obj.id, 'sale']))
     receipt_button.short_description = 'レシートを表示'
+
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        # ユーザーのアクセス権限に基づいてクエリセットをフィルタリング
+        return filter_transactions_by_user(request.user, qs)
+
+    #def has_view_permission(self, request, obj=None):
+    #    if obj is not None:
+    #        check_transaction_access(request.user, obj)
+    #        return True
+    #    return super().has_view_permission(request, obj)
 
 
 class WalletTransactionInline(admin.TabularInline):
