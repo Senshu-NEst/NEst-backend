@@ -396,14 +396,16 @@ class TransactionSerializer(serializers.ModelSerializer):
         total_payments = sum(payment['amount'] for payment in payments_data)
 
         with transaction.atomic():
-            # ウォレット支払いのバリデーション
-            wallet = user.wallet
-            wallet_payments = [p for p in payments_data if p['payment_method'] == 'wallet']
-            if wallet_payments:
-                total_wallet_payment = sum(p['amount'] for p in wallet_payments)
-                if total_wallet_payment > wallet.balance:
-                    shortage = total_wallet_payment - wallet.balance
-                    raise serializers.ValidationError(f"ウォレット残高不足。{int(shortage)}円分不足しています。")
+            # トレーニングモードでない場合のみ、ウォレットからの減算および残高チェックを行う
+            wallet_payments = []
+            if status != "training":
+                wallet = user.wallet
+                wallet_payments = [p for p in payments_data if p['payment_method'] == 'wallet']
+                if wallet_payments:
+                    total_wallet_payment = sum(p['amount'] for p in wallet_payments)
+                    if total_wallet_payment > wallet.balance:
+                        shortage = total_wallet_payment - wallet.balance
+                        raise serializers.ValidationError(f"ウォレット残高不足。{int(shortage)}円分不足しています。")
 
             transaction_instance = Transaction.objects.create(
                 date=timezone.now(),
@@ -422,11 +424,17 @@ class TransactionSerializer(serializers.ModelSerializer):
                 **validated_data
             )
 
-            if wallet_payments:
+            # トレーニングモードでない場合のみ、ウォレットから減算してウォレット利用履歴を記録する
+            if status != "training" and wallet_payments:
                 wallet.withdraw(total_wallet_payment, transaction=transaction_instance)
 
             self._create_transaction_details(transaction_instance, sale_products_data, status, store_code)
             self._create_payments(transaction_instance, payments_data)
+
+            # トレーニングモードでない場合は、承認番号の使用済みフラグを更新する
+            if status != "training":
+                approval.is_used = True
+                approval.save()
 
         return transaction_instance
 
