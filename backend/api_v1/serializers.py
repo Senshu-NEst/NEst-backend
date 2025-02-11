@@ -264,7 +264,7 @@ class TransactionSerializer(serializers.ModelSerializer):
         permissions = permission_checker.get_permissions()
         if "register" not in permissions:
             raise serializers.ValidationError("このスタッフは販売を行う権限がありません。")
-        if staff.affiliate_store.store_code != store_code:
+        if staff.affiliate_store.store_code != store_code.store_code:
             if "global" not in permissions:
                 raise serializers.ValidationError("このスタッフは自店のみ処理可能です。")
         return permissions
@@ -290,16 +290,16 @@ class TransactionSerializer(serializers.ModelSerializer):
             total_quantity += quantity
             discount_amount += discount * quantity
 
-        total_tax10 = total_amount_tax10 * 10 / 110
-        total_tax8 = total_amount_tax8 * 8 / 108
+        total_tax10 = int(total_amount_tax10 * 10 / 110)
+        total_tax8 = int(total_amount_tax8 * 8 / 108)
         total_tax = total_tax10 + total_tax8
         total_amount = total_amount_tax10 + total_amount_tax8
 
         return {
             'total_quantity': total_quantity,
-            'total_tax10': int(total_tax10),
-            'total_tax8': int(total_tax8),
-            'tax_amount': round(total_tax),
+            'total_tax10': total_tax10,
+            'total_tax8': total_tax8,
+            'tax_amount': total_tax,
             'discount_amount': discount_amount,
             'total_amount': total_amount
         }
