@@ -399,6 +399,11 @@ def login_view(request):
     return render(request, 'login.html')
 
 
+def logout_view(request):
+    logout(request)  # ユーザーをログアウト
+    return render(request, 'logout.html')
+
+
 def google_login_redirect(request):
     if request.user.is_authenticated:
         logout(request)

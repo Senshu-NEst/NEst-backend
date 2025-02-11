@@ -173,7 +173,7 @@ SOCIAL_AUTH_GOOGLE_OAUTH2_SECRET = os.environ.get("SOCIAL_AUTH_GOOGLE_OAUTH2_SEC
 
 # リダイレクトURL
 LOGIN_REDIRECT_URL = '/profile/'
-LOGOUT_REDIRECT_URL = '/login/'
+LOGOUT_REDIRECT_URL = '/logout/'
 
 # social-auth-app-djangoの設定
 SOCIAL_AUTH_USER_MODEL = 'api_v1.CustomUser'

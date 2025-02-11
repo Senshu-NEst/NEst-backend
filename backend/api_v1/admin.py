@@ -182,7 +182,7 @@ class CustomUserAdminForm(forms.ModelForm):
 
     class Meta:
         model = CustomUser
-        fields = ('email', 'password', 'user_type', 'is_staff', 'is_superuser')
+        fields = ('email', 'password', 'user_type', 'is_staff', 'is_superuser', "groups",)
 
 
 @admin.register(CustomUser)
@@ -334,3 +334,4 @@ admin.site.register(OutstandingToken, OutstandingTokenAdmin)
 admin.site.site_header = "商品管理システム"
 admin.site.index_title = "管理画面"
 admin.site.site_title = "管理者"
+admin.site.site_url = "/api/"
