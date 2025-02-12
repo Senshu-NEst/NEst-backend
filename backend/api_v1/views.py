@@ -1,30 +1,33 @@
+# pythonライブラリ
+import random
+import requests
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple
+# Djangoのライブラリ
+from django.http import HttpResponse, HttpResponseForbidden
+from django.shortcuts import get_object_or_404, redirect, render
+from django.contrib.auth import logout
+from django.contrib.auth.decorators import login_required
+from django.utils import timezone
+from django.db import transaction
+from django.db.models.query import QuerySet
+import rules
+# DRFライブラリ
 from rest_framework import viewsets, status, mixins
 from rest_framework.response import Response
 from rest_framework.decorators import action
-from django.db import transaction
-from django.utils import timezone
-from django.db.models.query import QuerySet
-from datetime import datetime, timedelta
-from typing import List, Dict, Tuple
-from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, ProductVariationDetail, Wallet, WalletTransaction, Staff, Approval
-from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer, ProductVariationSerializer, ProductVariationDetailSerializer, WalletChargeSerializer, WalletBalanceSerializer, CustomUserTokenSerializer, ApprovalSerializer
-from rest_framework_simplejwt.views import TokenObtainPairView
-from django.http import HttpResponse, HttpResponseForbidden
-from django.shortcuts import get_object_or_404
-import requests
-from .get_receipt_data import generate_receipt_text, generate_return_receipt
-from django.contrib.auth.decorators import login_required
-from collections import defaultdict
-from django.shortcuts import redirect
-from django.contrib.auth import logout
-from django.shortcuts import render
 from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.exceptions import NotFound, PermissionDenied
+from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework_simplejwt.tokens import AccessToken
 from rest_framework_simplejwt.exceptions import TokenError
-import random
 from rest_framework_simplejwt.settings import api_settings
-from rest_framework.exceptions import NotFound, PermissionDenied
-import rules
+# モデル
+from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, ProductVariationDetail, Wallet, WalletTransaction, Staff, Approval
+# シリアライザー
+from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer, ProductVariationSerializer, ProductVariationDetailSerializer, WalletChargeSerializer, WalletBalanceSerializer, CustomUserTokenSerializer, ApprovalSerializer
+# 自作モジュール
+from .get_receipt_data import generate_receipt_text, generate_return_receipt
 from .rules import check_transaction_access, filter_transactions_by_user
 
 
@@ -252,7 +255,14 @@ class StockReceiveHistoryViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class TransactionViewSet(viewsets.ModelViewSet):
-    """取引情報に関するCRUD操作を提供するViewSet"""
+    """取引情報に関するCRUD操作を提供するViewSet
+        Parameters:
+            id (int, optional): 取引ID
+            store_code (str, optional): 店舗コード
+            staff_code (str, optional): スタッフコード
+            start_date (str, optional): 開始日（YYYYMMDD形式）
+            end_date (str, optional): 終了日（YYYYMMDD形式）
+        """
     serializer_class = TransactionSerializer
 
     def get_queryset(self):
@@ -311,7 +321,8 @@ class TransactionViewSet(viewsets.ModelViewSet):
             filters["status"] = status_param  # デフォルトの状態を設定
 
         # クエリセットの生成
-        filtered_queryset = queryset.filter(**filters).order_by('-id')  # id の降順で並べ替え
+        filtered_queryset = queryset.filter(**filters)
+        # filtered_queryset = queryset.filter(**filters).order_by('-id')  # id の降順で並べ替え
 
         # 取引IDが指定された場合のチェック
         if transaction_id:
@@ -416,15 +427,12 @@ def generate_receipt_view(request, transaction_id, receipt_type):
     else:
         return HttpResponse("レシートデータの取得に失敗しました", content_type="text/plain")
 
-
 def login_view(request):
     return render(request, 'login.html')
-
 
 def logout_view(request):
     logout(request)  # ユーザーをログアウト
     return render(request, 'logout.html')
-
 
 def google_login_redirect(request):
     if request.user.is_authenticated:
@@ -432,7 +440,6 @@ def google_login_redirect(request):
 
     # Googleのログインを開始
     return redirect('social:begin', 'google-oauth2')
-
 
 @login_required
 def profile_view(request):

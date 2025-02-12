@@ -431,7 +431,7 @@ class ProductSerializer(serializers.ModelSerializer):
     """商品情報のシリアライザー"""
     class Meta:
         model = Product
-        fields = ['jan', 'name', 'price', 'tax', 'status']
+        fields = ['jan', 'name', 'price', 'tax', 'status', 'disable_change_price', 'disable_change_tax']
 
 
 class ProductVariationDetailSerializer(serializers.ModelSerializer):
@@ -558,11 +558,13 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         token["staff_code"] = getattr(user, "staff_code", None)
         return token
 
+
 class CustomUserTokenSerializer(serializers.Serializer):
     """カスタムユーザー用のトークンシリアライザー（custom-token エンドポイント用）"""
     # こちらは出力用のシンプルなシリアライザー。入力値は特になし。
     refresh = serializers.CharField(required=False)
     access = serializers.CharField(required=False)
+
 
 class ApprovalSerializer(serializers.ModelSerializer):
     """承認番号モデル用のシリアライザー"""

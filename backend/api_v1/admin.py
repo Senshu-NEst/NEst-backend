@@ -1,17 +1,13 @@
 from django.contrib import admin
-from import_export import resources, fields
+from import_export import resources
 from import_export.admin import ImportExportModelAdmin
 from django import forms
 from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval
 from django.utils import timezone
-from rest_framework_simplejwt.token_blacklist.admin import (
-    BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin,
-    OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
-)
+from rest_framework_simplejwt.token_blacklist.admin import BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin, OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 from django.urls import reverse
 from django.utils.html import format_html
-import rules
 from .rules import check_transaction_access, filter_transactions_by_user
 
 
@@ -203,6 +199,7 @@ class CustomUserAdmin(admin.ModelAdmin):
     form = CustomUserAdminForm
     list_display = ("pk", "email", "user_type", "is_staff", "is_superuser")
     search_fields = ("email",)
+    readonly_fields = ("last_login", "is_superuser")
     list_filter = ("user_type", "is_staff", "is_superuser")
 
     def get_form(self, request, obj=None, **kwargs):
@@ -301,6 +298,7 @@ class ApprovalAdmin(admin.ModelAdmin):
     search_fields = ("user__email",)
     list_filter = ("user", "created_at")
 
+
 # ブラックリストトークンの管理
 class BlacklistedTokenAdmin(DefaultBlacklistedTokenAdmin):
     actions = ["delete_expired_blacklisted_tokens"]
@@ -310,7 +308,6 @@ class BlacklistedTokenAdmin(DefaultBlacklistedTokenAdmin):
         count = expired_tokens.count()
         expired_tokens.delete()
         self.message_user(request, f"{count} の期限切れのブラックリストトークンを削除しました。")
-
     delete_expired_blacklisted_tokens.short_description = "期限切れのブラックリストトークンを削除"
 
 

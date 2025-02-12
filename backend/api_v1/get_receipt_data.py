@@ -1,6 +1,7 @@
 from django.utils import timezone
 from .models import WalletTransaction, Transaction, Payment
 
+
 def get_wallet_info(transaction_id):
     
     # 取引IDに基づいてウォレットトランザクションを取得
@@ -31,6 +32,7 @@ def get_wallet_info(transaction_id):
         "amount": amount
     }
 
+
 def generate_receipt_text(transaction):
     staff_code = transaction.staff_code.staff_code
     staff_name = transaction.staff_code.name
@@ -55,7 +57,7 @@ def generate_receipt_text(transaction):
 
     for product in sale_products:
         jan_last_3_digits = product.jan.jan[-3:]
-        is_reduced_tax = "*" if product.tax == 8 else "~"
+        is_reduced_tax = "*" if product.tax == 8 else "ﾋ" if product.tax == 0 else "~"
 
         if product.quantity == 1:
             if product.discount > 0:
