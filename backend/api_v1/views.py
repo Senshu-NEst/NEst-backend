@@ -1,7 +1,7 @@
 # pythonライブラリ
 import random
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time, date
 from typing import List, Dict, Tuple
 # Djangoのライブラリ
 from django.http import HttpResponse, HttpResponseForbidden
@@ -208,7 +208,7 @@ class StockReceiveHistoryViewSet(viewsets.ReadOnlyModelViewSet):
         return start, end
 
     def _get_filtered_histories(
-        self, 
+        self,
         store_code: str = None,
         staff_code: str = None,
         start_date: datetime = None,
@@ -255,87 +255,175 @@ class StockReceiveHistoryViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class TransactionViewSet(viewsets.ModelViewSet):
-    """取引情報に関するCRUD操作を提供するViewSet
-        Parameters:
-            id (int, optional): 取引ID
-            store_code (str, optional): 店舗コード
-            staff_code (str, optional): スタッフコード
-            start_date (str, optional): 開始日（YYYYMMDD形式）
-            end_date (str, optional): 終了日（YYYYMMDD形式）
-        """
+    """【指定可能なクエリパラメータ】
+        - id (int, optional): 取引ID。指定された場合、特定の取引を検索します。
+        - store_code (str, optional): 店舗コード。取引の店舗コードで絞り込みます。
+        - staff_code (str, optional): スタッフコード。取引の担当スタッフで絞り込みます。
+        - terminal_id (str, optional): 端末ID。取引が行われた端末で絞り込みます。
+        - start_date (str, optional): 開始日（YYYYMMDD形式）。デフォルトは当日の日付。
+        - end_date (str, optional): 終了日（YYYYMMDD形式）。デフォルトは当日の日付。
+        - status (str, optional): 取引状態。 'all' 以外の場合、状態による絞り込みを行います。デフォルトはsale。
+    【注意点】
+        - ユーザーの所属店舗・権限に基づき、アクセス可能な取引のみが表示されます。
+        - パラメータの指定がない場合、デフォルトで当日の日付範囲かつ status="sale" の取引のみが表示されます。
+        - クエリパラメータは URL のクエリ文字列として渡してください。
+    """
     serializer_class = TransactionSerializer
 
     def get_queryset(self):
         user = self.request.user
-        
-        # ユーザーのアクセス権限に基づいてクエリセットをフィルタリング
         return filter_transactions_by_user(user, Transaction.objects.all())
 
     def list(self, request, *args, **kwargs) -> Response:
-        """取引情報の一覧を取得"""
-        queryset = self.get_queryset()  # get_queryset を使用
-        
-        # フィルタリング処理
+        queryset = self.get_queryset()
         filtered_queryset = self._get_filtered_transactions(request, queryset)
         serializer = self.get_serializer(filtered_queryset, many=True)
         return Response(serializer.data)
 
-    def _parse_date_range(self, request) -> Tuple[datetime, datetime]:
-        """日付範囲パラメータの解析"""
-        default_date = timezone.now().strftime("%Y%m%d")
+    def _parse_date_range(self, request) -> tuple:
+        """日付範囲を解析する
+        【仕様】
+        - 両方指定されている場合：start_date～end_dateの範囲
+        - start_date のみ指定された場合：start_date以降（終了日は 9999/12/31 23:59:59 とする）
+        - end_date のみ指定された場合：end_date以前（開始日は 1900/01/01 00:00:00 とする）
+        - いずれも指定されない場合：当日の範囲（00:00:00 ～ 23:59:59）
+        """
+        start_date_str = self.request.query_params.get("start_date", None)
+        end_date_str = self.request.query_params.get("end_date", None)
         
-        start_date = request.query_params.get("start_date", default_date)
-        end_date = request.query_params.get("end_date", default_date)
-
-        start = datetime.strptime(start_date, "%Y%m%d")
-        end = datetime.strptime(end_date, "%Y%m%d") + timedelta(days=1) - timedelta(seconds=1)
-
+        if start_date_str and end_date_str:
+            start = datetime.strptime(start_date_str, "%Y%m%d")
+            end = datetime.strptime(end_date_str, "%Y%m%d") + timedelta(days=1) - timedelta(seconds=1)
+        elif start_date_str:
+            start = datetime.strptime(start_date_str, "%Y%m%d")
+            end = datetime(9999, 12, 31, 23, 59, 59)
+        elif end_date_str:
+            start = datetime(1900, 1, 1, 0, 0, 0)
+            end = datetime.strptime(end_date_str, "%Y%m%d") + timedelta(days=1) - timedelta(seconds=1)
+        else:
+            today = date.today()
+            start = datetime.combine(today, time.min)
+            end = datetime.combine(today, time.max)
         return start, end
 
-    def _get_filtered_transactions(self, request, queryset) -> QuerySet[Transaction]:
-        """指定された条件で取引を検索"""
+    def _get_filtered_transactions(self, request, queryset) -> 'QuerySet[Transaction]':
         transaction_id = request.query_params.get("id")
         store_code = request.query_params.get("store_code")
         staff_code = request.query_params.get("staff_code")
+        terminal_id = request.query_params.get("terminal_id")
         status_param = request.query_params.get("status")
         start_date, end_date = self._parse_date_range(request)
 
-        # フィルタ用の辞書を初期化
         filters = {}
-
         if transaction_id:
-            filters["id"] = transaction_id  # 取引IDが指定された場合はフィルタに追加
-            
-        # 日付範囲を適用（取引IDが指定されていない場合）
-        if not transaction_id:
+            filters["id"] = transaction_id
+        else:
             filters["date__range"] = [start_date, end_date]
-
-        # スーパーユーザーの場合でも全てのフィルタを適用する
+        
         if store_code:
             filters["store_code"] = store_code
         if staff_code:
             filters["staff_code"] = staff_code
-        
-        # status_param が 'all' でない場合はフィルタを適用
-        if status_param and status_param.lower() != 'all':
-            filters["status"] = status_param  # デフォルトの状態を設定
+        if terminal_id:
+            filters["terminal_id"] = terminal_id
 
-        # クエリセットの生成
+        # status が未指定の場合は常に "sale" を適用
+        if not status_param:
+            filters["status"] = "sale"
+        elif status_param.lower() != 'all':
+            filters["status"] = status_param
+
         filtered_queryset = queryset.filter(**filters)
-        # filtered_queryset = queryset.filter(**filters).order_by('-id')  # id の降順で並べ替え
-
-        # 取引IDが指定された場合のチェック
         if transaction_id:
             transaction = Transaction.objects.filter(id=transaction_id).first()
-
-            # 取引が存在しない場合
             if not transaction:
                 raise NotFound("指定された取引は存在しません。")
-
-            # ルールを適用して表示権限を確認
             check_transaction_access(request.user, transaction)
-
         return filtered_queryset
+
+
+class ReturnTransactionViewSet(viewsets.ModelViewSet):
+    """【指定可能なクエリパラメータ】
+        - id (int, optional): 返品取引ID。特定の返品取引を検索します。
+        - origin_id (int, optional): 元取引のID。元取引IDにより、該当する返品取引を絞り込みます。
+        - store_code (str, optional): 店舗コード。元取引の店舗コードで絞り込みます。
+        - staff_code (str, optional): 返品担当スタッフコード。返品取引の担当スタッフで絞り込みます。
+        - terminal_id (str, optional): 端末ID。返品取引の端末IDで絞り込みます。
+        - start_date (str, optional): 開始日（YYYYMMDD形式）。デフォルトは当日の日付。
+        - end_date (str, optional): 終了日（YYYYMMDD形式）。デフォルトは当日の日付。
+    【注意点】
+        - ユーザーの所属店舗・権限に基づき、アクセス可能な取引のみが表示されます。
+        - 元取引の閲覧権限がない場合、返品取引も閲覧できません。
+    """
+    queryset = ReturnTransaction.objects.all()
+    serializer_class = ReturnTransactionSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        return filter_transactions_by_user(user, ReturnTransaction.objects.all())
+
+    def list(self, request, *args, **kwargs) -> Response:
+        queryset = self.get_queryset()
+        filtered_queryset = self._get_filtered_return_transactions(request, queryset)
+        serializer = self.get_serializer(filtered_queryset, many=True)
+        return Response(serializer.data)
+
+    def _parse_date_range(self, request) -> tuple:
+        start_date_str = request.query_params.get("start_date", None)
+        end_date_str = request.query_params.get("end_date", None)
+        
+        if start_date_str and end_date_str:
+            start = datetime.strptime(start_date_str, "%Y%m%d")
+            end = datetime.strptime(end_date_str, "%Y%m%d") + timedelta(days=1) - timedelta(seconds=1)
+        elif start_date_str:
+            start = datetime.strptime(start_date_str, "%Y%m%d")
+            end = datetime(9999, 12, 31, 23, 59, 59)
+        elif end_date_str:
+            start = datetime(1900, 1, 1, 0, 0, 0)
+            end = datetime.strptime(end_date_str, "%Y%m%d") + timedelta(days=1) - timedelta(seconds=1)
+        else:
+            today = date.today()
+            start = datetime.combine(today, time.min)
+            end = datetime.combine(today, time.max)
+        return start, end
+
+    def _get_filtered_return_transactions(self, request, queryset) -> 'QuerySet[ReturnTransaction]':
+        return_id = request.query_params.get("id")
+        origin_id = request.query_params.get("origin_id")
+        store_code = request.query_params.get("store_code")
+        staff_code = request.query_params.get("staff_code")
+        terminal_id = request.query_params.get("terminal_id")
+        start_date, end_date = self._parse_date_range(request)
+
+        filters = {}
+        if return_id:
+            filters["id"] = return_id
+        else:
+            filters["return_date__range"] = [start_date, end_date]
+        if origin_id:
+            filters["origin_transaction__id"] = origin_id
+        if store_code:
+            filters["origin_transaction__store_code"] = store_code
+        if staff_code:
+            filters["staff_code__staff_code"] = staff_code
+        if terminal_id:
+            filters["terminal_id"] = terminal_id
+
+        filtered_queryset = queryset.filter(**filters)
+        if return_id:
+            return_transaction = queryset.filter(id=return_id).first()
+            if not return_transaction:
+                raise NotFound("指定された返品取引は存在しません。")
+            check_transaction_access(request.user, return_transaction.origin_transaction)
+        return filtered_queryset
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return_transaction = serializer.save()
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
 
 class TestViewSet(viewsets.ViewSet):
@@ -530,16 +618,3 @@ class ApprovalViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
         Approval.objects.create(user=user, approval_number=approval_number, is_used=False)
 
         return Response({"approval_number": approval_number}, status=status.HTTP_201_CREATED)
-
-
-class ReturnTransactionViewSet(viewsets.ModelViewSet):
-    queryset = ReturnTransaction.objects.all()
-    serializer_class = ReturnTransactionSerializer
-    permission_classes = [IsAuthenticated]
-
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
-        headers = self.get_success_headers(serializer.data)
-        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
