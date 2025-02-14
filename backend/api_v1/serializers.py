@@ -520,22 +520,20 @@ class StockReceiveSerializer(serializers.Serializer):
     items = StockReceiveItemSerializer(many=True)
 
     def validate(self, data):
-        staff_code = data["staff_code"]
-        permission_checker = UserPermissionChecker(staff_code)
-        permissions = permission_checker.get_permissions()
-
-        # 入荷権限のチェック
-        if "stock_receive" not in permissions:
-            raise serializers.ValidationError("入荷権限がありません。")
-
-        # 入荷店舗とスタッフの所属店舗が異なる場合、global権限をチェック
-        store_code = data["store_code"]
-        staff = Staff.objects.get(staff_code=staff_code)
-        if staff.affiliate_store.store_code != store_code:
-            if "global" not in permissions:
-                raise serializers.ValidationError("このスタッフは他店舗の在庫を操作できません。")
-
+        staff_code = data.get("staff_code")
+        store_code = data.get("store_code")
+        try:
+            BaseTransactionSerializer._check_permissions(self, staff_code, store_code, required_permissions=["stock_receive"])
+        except serializers.ValidationError as e:
+            error_message = e.detail if isinstance(e.detail, str) else ', '.join(e.detail)
+            raise serializers.ValidationError({"staff": error_message})
         return data
+
+
+class StockReceiveHistoryItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StockReceiveHistoryItem
+        fields = ["additional_stock", "received_at", "staff_code"]
 
 
 class WalletChargeSerializer(serializers.Serializer):
@@ -576,12 +574,6 @@ class WalletBalanceSerializer(serializers.Serializer):
         if not CustomUser.objects.filter(id=value).exists():
             raise serializers.ValidationError("指定されたユーザーは存在しません。")
         return value
-
-
-class StockReceiveHistoryItemSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = StockReceiveHistoryItem
-        fields = ["additional_stock", "received_at", "staff_code"]
 
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
