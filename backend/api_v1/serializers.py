@@ -356,17 +356,41 @@ class TransactionSerializer(BaseTransactionSerializer):
             )
 
     def _create_transaction_details(self, transaction_instance, sale_products_data, status, store_code):
+        product_map = {}
+
+        # 商品を集約
         for sale_product_data in sale_products_data:
-            product, effective_price = self._process_product(store_code, sale_product_data, status)
+            jan = sale_product_data["jan"]
+            tax = sale_product_data.get("tax")
             discount = sale_product_data.get("discount", 0)
             quantity = sale_product_data.get("quantity", 1)
-            applied_tax_rate = sale_product_data.get("tax")
+
+            # 複合キーを作成
+            product_key = (jan, tax, discount)
+
+            if product_key not in product_map:
+                product_map[product_key] = {
+                    "quantity": 0,
+                    "data": sale_product_data  # 元のデータを保持
+                }
+            product_map[product_key]["quantity"] += quantity
+
+        # 合計した商品情報を基にトランザクション詳細を作成
+        for product_key, product_info in product_map.items():
+            jan, tax, discount = product_key
+            quantity = product_info["quantity"]
+            
+            # 商品情報を取得する処理を一度だけ行う
+            product = self._get_product(jan)
+            store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
+            effective_price = store_price.get_price() if store_price else product.price
+
             TransactionDetail.objects.create(
                 transaction=transaction_instance,
                 jan=product,
                 name=product.name,
                 price=effective_price,
-                tax=applied_tax_rate,
+                tax=tax,
                 discount=discount,
                 quantity=quantity
             )
