@@ -2,7 +2,7 @@ from rest_framework import serializers
 from django.utils import timezone
 from django.db import transaction
 from rest_framework.fields import empty
-from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, WalletTransaction, Wallet, Approval, Store
+from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, WalletTransaction, Wallet, Approval, Store, ReturnTransaction, ReturnDetail, ReturnPayment
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 
@@ -30,6 +30,7 @@ class UserPermissionChecker:
 
             # 権限の追加
             permission_fields = [
+                ("void_permission", "void"),
                 ("register_permission", "register"),
                 ("global_permission", "global"),
                 ("change_price_permission", "change_price"),
@@ -53,6 +54,33 @@ class PaymentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Payment
         fields = ['payment_method', 'amount']
+
+
+class BaseTransactionSerializer(serializers.ModelSerializer):
+    def _check_permissions(self, staff_code, store_code, required_permissions=None):
+        if not staff_code:
+            raise serializers.ValidationError("スタッフコードが指定されていません。")
+        try:
+            staff = Staff.objects.get(staff_code=staff_code)
+        except Staff.DoesNotExist:
+            raise serializers.ValidationError("指定されたスタッフが存在しません。")
+
+        permission_checker = UserPermissionChecker(staff_code)
+        permissions = permission_checker.get_permissions()
+
+        # store_codeがオブジェクトの場合は、store_codeを取り出す
+        if isinstance(store_code, Store):
+            store_code = store_code.store_code
+
+        if staff.affiliate_store.store_code != store_code:
+            if "global" not in permissions:
+                raise serializers.ValidationError("このスタッフは自店のみ処理可能です。")
+        # 必要なパーミッションの存在確認
+        if required_permissions:
+            missing_permissions = [perm for perm in required_permissions if perm not in permissions]
+            if missing_permissions:
+                raise serializers.ValidationError(f"このスタッフは次の権限が不足しています: {', '.join(missing_permissions)}")
+        return permissions
 
 
 class TaxRateManager:
@@ -142,7 +170,7 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
         return data
 
 
-class TransactionSerializer(serializers.ModelSerializer):
+class TransactionSerializer(BaseTransactionSerializer):
     sale_products = TransactionDetailSerializer(many=True)
     payments = PaymentSerializer(many=True)
     date = serializers.DateTimeField(required=False)
@@ -172,16 +200,15 @@ class TransactionSerializer(serializers.ModelSerializer):
     def validate(self, data):
         errors = {}
 
-
-        # ② スタッフコードのチェックおよび権限チェック
+        # スタッフコードのチェックおよび権限チェック
         staff_code = data.get("staff_code")
         try:
-            permissions = self._check_permissions(staff_code, data.get("store_code"))
+            permissions = self._check_permissions(staff_code, data.get("store_code"), required_permissions=["register"])
         except serializers.ValidationError as e:
             errors["staff"] = e.detail
             permissions = None
 
-        # ③ 承認番号のチェック
+        # 承認番号のチェック
         approval_errors = {}
         approval_number = data.get("approval_number")
         if not approval_number:
@@ -200,13 +227,13 @@ class TransactionSerializer(serializers.ModelSerializer):
         if approval_errors:
             errors.update(approval_errors)
 
-        # ④ 各商品の値引きチェック（各商品ごとにエラーを集約）
+        # 各商品の値引きチェック（各商品ごとにエラーを集約）
         sale_products_data = data.get("sale_products", [])
         discount_errors = self._aggregate_discount_errors(sale_products_data, data.get("store_code"), permissions)
         if discount_errors:
             errors["sale_products_discount"] = discount_errors
 
-        # ⑤ 支払い金額のチェック
+        # 支払い金額のチェック
         payments_data = data.get("payments", [])
         try:
             totals = self._calculate_totals(sale_products_data, data.get("store_code"))
@@ -251,23 +278,6 @@ class TransactionSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(f"JAN:{jan} 不正な割引額が入力されました。")
         if discount < 0:
             raise serializers.ValidationError(f"JAN:{jan} 割引額は0以上である必要があります。")
-
-    # スタッフ権限のチェック（存在確認・所属店舗のチェック）
-    def _check_permissions(self, staff_code, store_code):
-        if not staff_code:
-            raise serializers.ValidationError("スタッフコードが指定されていません。")
-        try:
-            staff = Staff.objects.get(staff_code=staff_code)
-        except Staff.DoesNotExist:
-            raise serializers.ValidationError("指定されたスタッフが存在しません。")
-        permission_checker = UserPermissionChecker(staff_code)
-        permissions = permission_checker.get_permissions()
-        if "register" not in permissions:
-            raise serializers.ValidationError("このスタッフは販売を行う権限がありません。")
-        if staff.affiliate_store.store_code != store_code.store_code:
-            if "global" not in permissions:
-                raise serializers.ValidationError("このスタッフは自店のみ処理可能です。")
-        return permissions
 
     def _calculate_totals(self, sale_products_data, store_code):
         total_quantity = 0
@@ -571,3 +581,119 @@ class ApprovalSerializer(serializers.ModelSerializer):
     class Meta:
         model = Approval
         fields = ['id', 'user', 'approval_number', 'created_at']
+
+
+class ReturnDetailSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ReturnDetail
+        fields = ['jan', 'name', 'price', 'tax', 'discount', 'quantity']
+
+
+class ReturnPaymentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ReturnPayment
+        fields = ['payment_method', 'amount']
+
+
+class ReturnTransactionSerializer(BaseTransactionSerializer):
+    return_type = serializers.CharField()
+    resson = serializers.CharField(source='reason')
+    payments = ReturnPaymentSerializer(many=True, write_only=True)
+    return_payments = ReturnPaymentSerializer(many=True, read_only=True)
+    date = serializers.DateTimeField(source='created_at', read_only=True)
+    store_code = serializers.CharField(source='origin_transaction.store_code.store_code', read_only=True)
+    terminal_id = serializers.CharField(source='origin_transaction.terminal_id', read_only=True)
+    return_products = ReturnDetailSerializer(many=True, source='return_details', read_only=True)
+
+    class Meta:
+        model = ReturnTransaction
+        fields = ['id', 'origin_transaction', 'date', 'return_type', 'store_code', 'staff_code', 'terminal_id', 'resson', 'restock', 'payments', 'return_payments', 'return_products']
+        extra_kwargs = {
+            'origin_transaction': {'required': True},
+            'staff_code': {'required': True},
+            'terminal_id': {'required': True},
+            'restock': {'required': True},
+        }
+
+    def validate(self, data):
+        errors = {}
+
+        origin_transaction = data.get('origin_transaction')
+        if not origin_transaction:
+            errors['origin_transaction'] = "元取引IDが必要です。"
+        else:
+            # 既に返品済みかチェック
+            if origin_transaction.status != 'sale':
+                errors['origin_transaction'] = "返品対象外取引です。"
+
+        # スタッフの権限チェック
+        staff_code = data.get("staff_code")
+        try:
+            self._check_permissions(staff_code, store_code=origin_transaction.store_code, required_permissions=["register", "void"])
+        except serializers.ValidationError as e:
+            errors["staff"] = e.detail
+
+        # 支払い（返金）金額のチェック
+        payments = data.get('payments', [])
+        sum_payments = sum(item.get('amount', 0) for item in payments)
+        if origin_transaction and sum_payments != origin_transaction.total_amount:
+            errors['payments'] = "返金金額の合計が元取引の合計金額と一致しません。"
+
+        if errors:
+            raise serializers.ValidationError(errors)
+        return data
+
+    @transaction.atomic  # createをトランザクションで保護
+    def create(self, validated_data):
+        payments_data = validated_data.pop('payments', [])
+        origin_transaction = validated_data.get('origin_transaction')
+
+        # 返品時は、元取引のstatusを "return" に変更
+        origin_transaction.status = 'return'
+        origin_transaction.save()
+
+        # ReturnTransaction の作成
+        return_transaction = ReturnTransaction.objects.create(**validated_data)
+
+        # 自動的に返品明細を生成：元取引の取引明細をコピーする
+        for detail in origin_transaction.sale_products.all():
+            ReturnDetail.objects.create(
+                return_transaction=return_transaction,
+                jan=detail.jan,
+                name=detail.name,
+                price=detail.price,
+                tax=detail.tax,
+                discount=detail.discount,
+                quantity=detail.quantity
+            )
+
+        # 返金支払の作成およびウォレット返金処理
+        for payment_data in payments_data:
+            ReturnPayment.objects.create(return_transaction=return_transaction, **payment_data)
+
+            if payment_data.get('payment_method') == 'wallet':
+                wallet = origin_transaction.user.wallet
+                refund_amount = abs(payment_data['amount'])
+
+                # ウォレットへの返金処理
+                wallet.balance += refund_amount
+                wallet.save()
+
+                # WalletTransaction に返金履歴を記録
+                WalletTransaction.objects.create(
+                    wallet=wallet,
+                    amount=refund_amount,
+                    balance=wallet.balance,
+                    transaction_type='refund',
+                    transaction=origin_transaction,
+                    return_transaction=return_transaction
+                )
+
+        # 在庫の戻し処理
+        if validated_data.get('restock', False):
+            for detail in return_transaction.return_details.all():
+                stock_entry = Stock.objects.get(store_code=origin_transaction.store_code, jan=detail.jan)
+                stock_entry.stock += detail.quantity
+                stock_entry.save()
+
+        return return_transaction

@@ -2,7 +2,7 @@ from django.contrib import admin
 from import_export import resources
 from import_export.admin import ImportExportModelAdmin
 from django import forms
-from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval
+from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval, ReturnTransaction, ReturnDetail, ReturnPayment
 from django.utils import timezone
 from rest_framework_simplejwt.token_blacklist.admin import BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin, OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
@@ -298,6 +298,37 @@ class ApprovalAdmin(admin.ModelAdmin):
     search_fields = ("user__email",)
     list_filter = ("user", "created_at")
 
+
+# ReturnDetail インラインクラス
+class ReturnDetailInline(admin.TabularInline):  # または StackedInline
+    model = ReturnDetail
+    extra = 0  # 空のフォームを表示しない
+    readonly_fields = ("jan", "name", "price", "tax", "discount", "quantity")  # 返品内容は変更不可
+    can_delete = False  # インライン上で削除できないように設定
+
+# Payment インラインクラス
+class ReturnPaymentInline(admin.TabularInline):  # または StackedInline
+    model = ReturnPayment
+    extra = 0
+    readonly_fields = ("return_transaction", "payment_method", "amount")  # 必要に応じて読み取り専用フィールドを指定
+    can_delete = False  # 支払い内容の削除を防ぐ
+
+# ReturnTransactionAdmin カスタマイズ
+@admin.register(ReturnTransaction)
+class ReturnTransactionAdmin(admin.ModelAdmin):
+    list_display = ("id", "origin_transaction", "return_date", "staff_code", "reason")
+    search_fields = ("id", "origin_sale_id", "staff_code")
+    list_filter = ("return_date",)
+    readonly_fields = ("id", "origin_transaction", "return_date", "staff_code", "reason")  # 必要に応じて追加
+    inlines = [ReturnDetailInline, ReturnPaymentInline]  # インラインで関連データを表示
+
+    def has_add_permission(self, request):
+        """新規作成を許可しない"""
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        """削除を許可しない"""
+        return False
 
 # ブラックリストトークンの管理
 class BlacklistedTokenAdmin(DefaultBlacklistedTokenAdmin):

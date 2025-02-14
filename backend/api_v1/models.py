@@ -1,4 +1,3 @@
-import random
 import ulid
 from django.db import models, transaction
 from django.contrib.auth.models import BaseUserManager, AbstractBaseUser, PermissionsMixin
@@ -200,6 +199,7 @@ class Transaction(BaseModel):
         SALE = "sale", "販売"
         VOID = "void", "返品"
         TRAINING = "training", "トレーニング"
+        RETURN = "return", "返品"
 
     id = models.AutoField(primary_key=True, verbose_name="取引番号")
     status = models.CharField(max_length=50, choices=Status.choices, default=Status.SALE, verbose_name="取引状態")
@@ -307,19 +307,29 @@ class WalletTransaction(BaseModel):
     TRANSACTION_TYPE_CHOICES = (
         ('credit', '入金'),
         ('debit', '出金'),
+        ('refund', '返金'),
     )
     wallet = models.ForeignKey(Wallet, on_delete=models.CASCADE, related_name='wallettransactions')
     amount = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="金額")
     balance = models.IntegerField(verbose_name="残高")
     transaction_type = models.CharField(max_length=10, choices=TRANSACTION_TYPE_CHOICES, verbose_name="取引タイプ")
-    transaction = models.ForeignKey('Transaction', on_delete=models.CASCADE, related_name='wallet_transactions', null=True, blank=True)
+    transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name='wallet_transactions', null=True, blank=True, verbose_name="取引")
+    return_transaction = models.ForeignKey('ReturnTransaction', on_delete=models.SET_NULL, null=True, blank=True, related_name='wallet_transactions', verbose_name="返品取引")
 
     class Meta:
         verbose_name = "取引"
         verbose_name_plural = "ウォレット履歴"
 
     def __str__(self):
-        return f"{self.transaction_type.capitalize()} of {self.amount} in wallet of {self.wallet.user.email} on {self.created_at}"
+        return f"{self.transaction_type.capitalize()} of {self.amount} (残高: {self.balance})"
+
+    def process_refund(self):
+        """
+        返金の場合は、ウォレット残高に返金額を加算する。
+        """
+        if self.transaction_type == 'refund':
+            self.wallet.balance += self.amount
+            self.wallet.save()
 
 
 class CustomUserManager(BaseUserManager):
@@ -446,3 +456,72 @@ class Approval(BaseModel):
 
     def __str__(self):
         return f"Approval {self.approval_number} for {self.user.email}"
+
+
+class ReturnTransaction(BaseModel):
+    """
+    返品取引モデル
+    ・元の取引（Transaction）に対する返品情報を保持する。
+    ・返品理由、返品日時に加え、返品時の端末ID（terminal_id）や返品担当スタッフコード（staff_code）、返品種別（type）を記録できる。
+    """
+    RETURN_TYPE_CHOICES = (
+        ('all', '全返品'),
+        # 将来的に部分返品など拡張可能
+    )
+
+    return_type = models.CharField(max_length=10, choices=RETURN_TYPE_CHOICES, default='all', verbose_name="返品種別")
+    origin_transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name='return_transactions', verbose_name="元取引")
+    return_date = models.DateTimeField(auto_now_add=True, verbose_name="返品日時")
+    reason = models.TextField(verbose_name="返品理由")
+    restock = models.BooleanField(default=True, verbose_name="在庫に戻すか")
+    terminal_id = models.CharField(max_length=50, blank=True, null=True, verbose_name="返品端末番号")
+    staff_code = models.ForeignKey(Staff, to_field='staff_code', on_delete=models.CASCADE, blank=True, null=True, verbose_name="返品担当スタッフコード")
+
+    class Meta:
+        verbose_name = "返品取引"
+        verbose_name_plural = "返品取引一覧"
+
+    def __str__(self):
+        return f"返品取引 {self.id}（取消取引：{self.origin_transaction.id}）"
+
+
+class ReturnDetail(BaseModel):
+    """
+    返品明細モデル
+    ・元の取引明細（TransactionDetail）の内容をそのまま記録する。  
+      TransactionDetailと同じ項目を保持することで、返品時に元の取引内容を正確に記録できる。
+    """
+    return_transaction = models.ForeignKey(ReturnTransaction, on_delete=models.CASCADE, related_name='return_details', verbose_name="返品取引")
+    jan = models.ForeignKey(Product, on_delete=models.CASCADE, verbose_name="JANコード")
+    name = models.CharField(max_length=255, verbose_name="商品名")
+    price = models.IntegerField(verbose_name="商品価格")
+    tax = models.DecimalField(max_digits=3, decimal_places=1, verbose_name="消費税率")
+    discount = models.IntegerField(verbose_name="値引金額")
+    quantity = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="購入点数")
+
+    class Meta:
+        verbose_name = "返品明細"
+        verbose_name_plural = "返品明細一覧"
+
+    def __str__(self):
+        return f"{self.return_transaction} - {self.jan}"
+
+
+class ReturnPayment(BaseModel):
+    """
+    返金支払モデル
+    ・返品時に複数の支払い方法で返金処理を行うための明細レコード。
+    ・元の Payment.PAYMENT_METHOD_CHOICES を利用（必要に応じて拡張可）
+    """
+    REFUND_PAYMENT_METHOD_CHOICES = Payment.PAYMENT_METHOD_CHOICES
+
+    return_transaction = models.ForeignKey (ReturnTransaction, on_delete=models.CASCADE, related_name='return_payments', verbose_name="返品返金支払")
+    payment_method = models.CharField(max_length=50, choices=REFUND_PAYMENT_METHOD_CHOICES, verbose_name="返金支払方法")
+    amount = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="返金金額")
+
+    class Meta:
+        verbose_name = "返金支払"
+        verbose_name_plural = "返金支払一覧"
+
+    def __str__(self):
+        return f"{self.payment_method} - {self.amount}"

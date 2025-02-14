@@ -23,9 +23,9 @@ from rest_framework_simplejwt.tokens import AccessToken
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.settings import api_settings
 # モデル
-from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, ProductVariationDetail, Wallet, WalletTransaction, Staff, Approval
+from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, ProductVariationDetail, Wallet, WalletTransaction, Staff, Approval, ReturnTransaction
 # シリアライザー
-from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer, ProductVariationSerializer, ProductVariationDetailSerializer, WalletChargeSerializer, WalletBalanceSerializer, CustomUserTokenSerializer, ApprovalSerializer
+from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer, ProductVariationSerializer, ProductVariationDetailSerializer, WalletChargeSerializer, WalletBalanceSerializer, CustomUserTokenSerializer, ApprovalSerializer, ReturnTransactionSerializer
 # 自作モジュール
 from .get_receipt_data import generate_receipt_text, generate_return_receipt
 from .rules import check_transaction_access, filter_transactions_by_user
@@ -530,3 +530,16 @@ class ApprovalViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
         Approval.objects.create(user=user, approval_number=approval_number, is_used=False)
 
         return Response({"approval_number": approval_number}, status=status.HTTP_201_CREATED)
+
+
+class ReturnTransactionViewSet(viewsets.ModelViewSet):
+    queryset = ReturnTransaction.objects.all()
+    serializer_class = ReturnTransactionSerializer
+    permission_classes = [IsAuthenticated]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
