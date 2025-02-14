@@ -299,21 +299,20 @@ class ApprovalAdmin(admin.ModelAdmin):
     list_filter = ("user", "created_at")
 
 
-# ReturnDetail インラインクラス
 class ReturnDetailInline(admin.TabularInline):  # または StackedInline
     model = ReturnDetail
     extra = 0  # 空のフォームを表示しない
     readonly_fields = ("jan", "name", "price", "tax", "discount", "quantity")  # 返品内容は変更不可
     can_delete = False  # インライン上で削除できないように設定
 
-# Payment インラインクラス
+
 class ReturnPaymentInline(admin.TabularInline):  # または StackedInline
     model = ReturnPayment
     extra = 0
     readonly_fields = ("return_transaction", "payment_method", "amount")  # 必要に応じて読み取り専用フィールドを指定
     can_delete = False  # 支払い内容の削除を防ぐ
 
-# ReturnTransactionAdmin カスタマイズ
+
 @admin.register(ReturnTransaction)
 class ReturnTransactionAdmin(admin.ModelAdmin):
     list_display = ("id", "origin_transaction", "return_date", "staff_code", "reason")
@@ -322,6 +321,11 @@ class ReturnTransactionAdmin(admin.ModelAdmin):
     readonly_fields = ("id", "origin_transaction", "return_date", "staff_code", "reason")  # 必要に応じて追加
     inlines = [ReturnDetailInline, ReturnPaymentInline]  # インラインで関連データを表示
 
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        # ユーザーのアクセス権限に基づいてクエリセットをフィルタリング
+        return filter_transactions_by_user(request.user, qs)
+
     def has_add_permission(self, request):
         """新規作成を許可しない"""
         return False
@@ -329,6 +333,7 @@ class ReturnTransactionAdmin(admin.ModelAdmin):
     def has_delete_permission(self, request, obj=None):
         """削除を許可しない"""
         return False
+
 
 # ブラックリストトークンの管理
 class BlacklistedTokenAdmin(DefaultBlacklistedTokenAdmin):
