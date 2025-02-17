@@ -119,6 +119,11 @@ class StockReceiveHistoryAdmin(admin.ModelAdmin):
     list_filter = ("received_at", "store_code", "staff_code__name")
     inlines = [StockReceiveHistoryItemInline]
 
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        # ユーザーのアクセス権限に基づいてクエリセットをフィルタリング
+        return filter_transactions_by_user(request.user, qs)
+
 
 @admin.register(Transaction)
 class TransactionAdmin(admin.ModelAdmin):

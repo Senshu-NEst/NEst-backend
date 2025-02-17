@@ -253,6 +253,10 @@ class StockReceiveHistoryViewSet(viewsets.ReadOnlyModelViewSet):
             })
         return response_data
 
+    def get_queryset(self):
+        user = self.request.user
+        return filter_transactions_by_user(user, Transaction.objects.all())
+
 
 class TransactionViewSet(viewsets.ModelViewSet):
     """【指定可能なクエリパラメータ】
