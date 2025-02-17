@@ -44,12 +44,14 @@ INSTALLED_APPS = [
     "debug_toolbar",
     "import_export",
     "social_django",
+    "corsheaders",
 ]
 
 # ミドルウェア
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
+    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
@@ -190,3 +192,6 @@ SOCIAL_AUTH_PIPELINE = (
     'social_core.pipeline.social_auth.associate_user',
     'social_core.pipeline.social_auth.load_extra_data',
 )
+
+# !!!! 開発用の設定！！本番環境では適切なORIGINを定義すること !!!!
+CORS_ALLOW_ALL_ORIGINS = True
