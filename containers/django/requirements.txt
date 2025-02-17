@@ -2,6 +2,8 @@ Django
 psycopg2-binary
 gunicorn
 ulid-py
+qrcode
+pillow # QRコード生成用
 requests
 djangorestframework
 djangorestframework_simplejwt

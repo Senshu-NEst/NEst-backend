@@ -1,6 +1,9 @@
 # pythonライブラリ
 import random
 import requests
+import qrcode
+import io
+import base64
 from datetime import datetime, timedelta, time, date
 from typing import List, Dict, Tuple
 # Djangoのライブラリ
@@ -15,7 +18,8 @@ import rules
 # DRFライブラリ
 from rest_framework import viewsets, status, mixins
 from rest_framework.response import Response
-from rest_framework.decorators import action
+from rest_framework.decorators import action, api_view
+from rest_framework.authtoken.models import Token
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework_simplejwt.views import TokenObtainPairView
@@ -533,10 +537,37 @@ def google_login_redirect(request):
     # Googleのログインを開始
     return redirect('social:begin', 'google-oauth2')
 
+
 @login_required
 def profile_view(request):
-    user = request.user  # 現在のユーザー情報を取得
-    return render(request, 'api_v1/profile.html', {'user': user})
+    user = request.user
+    # トークンを生成する
+    token = SimpleAccessToken.for_user(user)
+    # 有効期限を計算
+    expires_timestamp = token["exp"]  # UNIXtime
+    expires_datetime = timezone.datetime.fromtimestamp(expires_timestamp)
+    expires_formatted = expires_datetime.strftime("%Y-%m-%d %H:%M:%S")
+
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=8,
+        border=4,
+    )
+    qr.add_data(str(token))
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+
+    buffered = io.BytesIO()
+    img.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+
+    return render(request, 'api_v1/profile.html', {
+        'user': user,
+        'token': str(token),
+        'expires': expires_formatted,
+        'qr_code': img_str,
+    })
 
 
 class SimpleAccessToken(AccessToken):

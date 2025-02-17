@@ -7,6 +7,65 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>プロフィール</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            padding: 0;
+            background-color: #f4f4f4;
+        }
+
+        h1 {
+            color: #333;
+        }
+
+        ul {
+            list-style-type: none;
+            padding: 0;
+        }
+
+        li {
+            background: #fff;
+            margin: 5px 0;
+            padding: 10px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+        }
+
+        a {
+            display: inline-block;
+            margin-top: 20px;
+            padding: 10px 15px;
+            background: #007bff;
+            color: white;
+            text-decoration: none;
+            border-radius: 5px;
+        }
+
+        a:hover {
+            background: #0056b3;
+        }
+
+        .qr-code {
+            width: 150px; /* 幅を150pxに設定 */
+            height: auto; /* 高さは自動調整 */
+            margin-bottom: 5px; /* QRコードとボタンの間にスペースを追加 */
+        }
+
+        .copy-button, .update-button {
+            margin-top: 10px;
+            padding: 10px 15px;
+            background: #28a745;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+
+        .copy-button:hover, .update-button:hover {
+            background: #218838;
+        }
+    </style>
 </head>
 
 <body>
@@ -18,6 +77,12 @@
         <li><strong>ユーザータイプ:</strong> {{ user.user_type }}</li>
         <li><strong>アカウントの状態:</strong> {{ user.is_active|yesno:"有効,無効" }}</li>
     </ul>
+
+    <h2>トークンのQRコード</h2>
+    <img class="qr-code" id="qrCodeImage" src="data:image/png;base64,{{ qr_code }}" alt="Token QR Code" />
+    <p><strong>トークンの有効期限:</strong> {{ expires }}</p>
+    <button class="copy-button" id="copyTokenButton" data-token="{{ token }}">トークンをコピー</button>
+    <button class="update-button" id="updateTokenButton" onclick="location.reload();">バーコードを更新</button>
 
     <h2>ソーシャルアカウント情報</h2>
     {% if user.social_auth.exists %}
@@ -32,6 +97,13 @@
     {% endif %}
 
     <a href="{% url 'logout' %}">ログアウト</a>
+
+    <script>
+        document.getElementById('copyTokenButton').addEventListener('click', function() {
+            const token = this.getAttribute('data-token');
+            navigator.clipboard.writeText(token);
+        });
+    </script>
 </body>
 
 </html>
