@@ -158,7 +158,7 @@ SIMPLE_JWT = {
     "ALGORITHM": "HS256",  # 使用するアルゴリズム
     "SIGNING_KEY": SECRET_KEY,  # 署名に使用するキー(djangoデフォルトのキーを使用)
     "AUTH_HEADER_TYPES": ("JWT",),  # 認証ヘッダーのタイプ
-    "USER_ID_FIELD": "staff_code",  # staff_codeをuser_idとして指定
+    "USER_ID_FIELD": "id",
     "AUTH_TOKEN_CLASSES": ("rest_framework_simplejwt.tokens.AccessToken",),  # 使用するトークンクラス
     "TOKEN_TYPE_CLAIM": "token_type",  # トークンタイプのの説明
 }
