@@ -467,10 +467,10 @@ class ReturnTransaction(BaseModel):
     """
     RETURN_TYPE_CHOICES = (
         ('all', '全返品'),
-        # 将来的に部分返品など拡張可能
+        ('partial', '一部返品')
     )
 
-    return_type = models.CharField(max_length=10, choices=RETURN_TYPE_CHOICES, default='all', verbose_name="返品種別")
+    return_type = models.CharField(max_length=10, choices=RETURN_TYPE_CHOICES, verbose_name="返品種別")
     origin_transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name='return_transactions', verbose_name="元取引")
     return_date = models.DateTimeField(auto_now_add=True, verbose_name="返品日時")
     reason = models.TextField(verbose_name="返品理由")
