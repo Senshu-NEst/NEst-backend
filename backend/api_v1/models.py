@@ -471,15 +471,15 @@ class ReturnTransaction(BaseModel):
         ('all', '全返品'),
         ('partial', '一部返品')
     )
-
+    modify_id = models.ForeignKey(Transaction, on_delete=models.CASCADE, blank=True, null=True, verbose_name="再売取引")
     return_type = models.CharField(max_length=10, choices=RETURN_TYPE_CHOICES, verbose_name="返品種別")
     origin_transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name='return_transactions', verbose_name="元取引")
     return_date = models.DateTimeField(auto_now_add=True, verbose_name="返品日時")
     reason = models.TextField(verbose_name="返品理由")
-    restock = models.BooleanField(default=True, verbose_name="在庫に戻すか")
+    restock = models.BooleanField(default=True, verbose_name="在庫戻し")
     terminal_id = models.CharField(max_length=50, blank=True, null=True, verbose_name="返品端末番号")
     store_code = models.ForeignKey(Store, on_delete=models.CASCADE, verbose_name="返品店番号")
-    staff_code = models.ForeignKey(Staff, to_field='staff_code', on_delete=models.CASCADE, blank=True, null=True, verbose_name="返品担当スタッフコード")
+    staff_code = models.ForeignKey(Staff, to_field='staff_code', on_delete=models.CASCADE, verbose_name="返品担当")
 
     class Meta:
         verbose_name = "返品取引"
@@ -493,7 +493,7 @@ class ReturnDetail(BaseModel):
     """
     返品明細モデル
     ・元の取引明細（TransactionDetail）の内容をそのまま記録する。  
-      TransactionDetailと同じ項目を保持することで、返品時に元の取引内容を正確に記録できる。
+    TransactionDetailと同じ項目を保持することで、返品時に元の取引内容を正確に記録できる。
     """
     return_transaction = models.ForeignKey(ReturnTransaction, on_delete=models.CASCADE, related_name='return_details', verbose_name="返品取引")
     jan = models.ForeignKey(Product, on_delete=models.CASCADE, verbose_name="JANコード")
