@@ -686,35 +686,46 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         except serializers.ValidationError as e:
             errors["staff"] = e.detail
 
+        # return_type のバリデーション（モデルの選択肢に限定）
+        if data.get('return_type') not in dict(ReturnTransaction.RETURN_TYPE_CHOICES):
+            errors['return_type'] = "不正なreturn_type"
+
+        # partial返品の場合、追加・削除商品のいずれかが必須
         if data.get('return_type') == 'partial':
-            if not data.get('additional_items'):
-                errors['additional_items'] = "一部返品の場合、追加商品の明細が必要です。"
-            if not data.get('delete_items'):
-                errors['delete_items'] = "一部返品の場合、削除商品の明細が必要です。"
+            additional = data.get('additional_items', [])
+            delete = data.get('delete_items', [])
+            if not additional and not delete:
+                errors['additional_items'] = "一部返品の場合、追加商品の明細または削除商品の明細のいずれかは必要です。"
+            # 項目の基本構造の検証
+            self._validate_item_details(data)
 
-        # 項目の基本構造の検証
-        self._validate_item_details(data)
+            # 追加・削除商品の合計金額を共通処理で算出（値引きを考慮）
+            additional_total, delete_total, net_amount = self._compute_additional_delete_totals(
+                data.get('additional_items', []), data.get('delete_items', []), origin
+            )
+            payments = data.get('payments', [])
+            payments_sum = sum(float(p.get('amount', 0)) for p in payments)
 
-        # 追加・削除商品の合計金額を共通処理で算出
-        additional_total, delete_total, net_amount = self._compute_additional_delete_totals(
-            data.get('additional_items', []), data.get('delete_items', []), origin
-        )
-        payments = data.get('payments', [])
-        payments_sum = sum(float(p.get('amount', 0)) for p in payments)
-
-        # 各ケースでの支払い検証（処理方法は変更しない）
-        if net_amount > 0:
+            # 各ケースでの支払い検証（変更せず）
+            if net_amount > 0:
             # 追加領収発生：既収金は (元取引合計 + 削除商品合計) とみなし、追加領収は (追加合計 - 既収金)
-            expected_additional = additional_total - delete_total
-            if abs(payments_sum - expected_additional) > 0.01:
-                errors['payments'] = f"追加領収金の合計が不正です。必要値: {expected_additional}, 入力値: {payments_sum}"
-        elif net_amount < 0:
-            expected_refund = net_amount  # net_amount は負の値
-            if abs(payments_sum - expected_refund) > 0.01:
-                errors['payments'] = f"返金金額の合計が不正です。必要値: {expected_refund}, 入力値: {payments_sum}"
+                expected_additional = additional_total - delete_total
+                if abs(payments_sum - expected_additional) > 0.01:
+                    errors['payments'] = f"追加領収金の合計が不正です。必要値: {expected_additional}, 入力値: {payments_sum}"
+            elif net_amount < 0:
+                expected_refund = net_amount  # net_amount は負の値
+                if abs(payments_sum - expected_refund) > 0.01:
+                    errors['payments'] = f"返金金額の合計が不正です。必要値: {expected_refund}, 入力値: {payments_sum}"
+            else:
+                if abs(payments_sum) > 0.01:
+                    errors['payments'] = f"返金も追加領収も発生しないはずですが、支払い合計: {payments_sum}"
+
         else:
-            if abs(payments_sum) > 0.01:
-                errors['payments'] = f"返金も追加領収も発生しないはずですが、支払い合計: {payments_sum}"
+            # 全返品の場合、返金金額は元取引合計と一致する必要がある
+            payments = data.get('payments', [])
+            sum_payments = sum(float(item.get('amount', 0)) for item in payments)
+            if origin and sum_payments != origin.total_amount:
+                errors['payments'] = "返金金額の合計が元取引の合計金額と一致しません。"
 
         if errors:
             raise serializers.ValidationError(errors)
@@ -740,14 +751,16 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
 
     def _compute_additional_delete_totals(self, additional_items, delete_items, origin):
         """
-        追加商品と削除商品の合計金額およびその差(net_amount)を算出する。
+        追加商品と削除商品の合計金額（値引き考慮）およびその差(net_amount)を算出する。
+        追加商品の実質価格 = (price - discount) * quantity
+        削除商品の実質価格は、元取引の販売明細から取得（price - discount）
         """
         additional_total = sum(
-            float(Product.objects.filter(jan=item.get('jan')).first().price) * int(item.get('quantity', 1))
+            (float(Product.objects.filter(jan=item.get('jan')).first().price) - float(item.get('discount', 0))) * int(item.get('quantity', 1))
             for item in additional_items if Product.objects.filter(jan=item.get('jan')).exists()
         )
         delete_total = sum(
-            detail.price * int(item.get('quantity', 1))
+            (detail.price - detail.discount) * int(item.get('quantity', 1))
             for item in delete_items
             for detail in origin.sale_products.all()
             if detail.jan.jan == item.get('jan')
@@ -757,7 +770,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
-        ret_type = validated_data.pop('return_type')
+        return_type = validated_data.pop('return_type')
         origin = validated_data['origin_transaction']
         # 返品対象の元取引はステータスを "return" に更新
         origin.status = 'return'
@@ -769,7 +782,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         ret_trans = ReturnTransaction.objects.create(
             origin_transaction=origin,
             staff_code=validated_data.get('staff_code'),
-            return_type=ret_type,
+            return_type=return_type,
             reason=validated_data.get('reason'),
             restock=validated_data.get('restock'),
             store_code=store_instance,
@@ -781,10 +794,13 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         if validated_data.get('restock', False):
             self._restock_inventory(ret_trans, origin)
 
-        if ret_type == 'all':
+        if return_type == 'all':
             self._copy_sale_products(origin, ret_trans)
-        elif ret_type == 'partial':
-            self._process_partial_return(validated_data, ret_trans, origin)
+        elif return_type == 'partial':
+            new_trans = self._process_partial_return(validated_data, ret_trans, origin)
+            # 修正会計の取引IDを modify_id として記録
+            ret_trans.modify_id = new_trans
+            ret_trans.save()
 
         return ret_trans
 
@@ -836,7 +852,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         additional = validated_data.pop('additional_items', [])
         delete = validated_data.pop('delete_items', [])
 
-        # 削除商品の明細を返品詳細として記録
+        # 削除商品の明細を返品詳細として記録（値引きを考慮）
         for item in delete:
             jan = item.get('jan')
             qty = item.get('quantity')
@@ -852,10 +868,9 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
                     quantity=qty
                 )
 
-        # 修正会計（新規取引）の作成
+        # 修正会計（新規取引）の作成（承認番号不要）
         new_trans = self._create_new_transaction(origin, additional, delete, self.initial_data.get('payments', []))
-        print("New Transaction Created:")
-        print(new_trans)
+        return new_trans
 
     def _create_new_transaction(self, origin, additional, delete, payments_input):
         """
@@ -869,7 +884,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         sale_dict = {d.jan.jan: d for d in origin.sale_products.all()}
         delete_counts = {item.get('jan'): int(item.get('quantity', 0)) for item in delete}
 
-        # 元取引の明細から、削除分を引く
+        # 元取引の販売明細から、削除分を差し引いた残りを組み立てる
         for jan, detail in sale_dict.items():
             remaining_qty = detail.quantity - delete_counts.get(jan, 0)
             if remaining_qty > 0:
@@ -898,7 +913,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
                 'quantity': qty
             })
 
-        # 追加商品と削除商品の合計金額の計算（共通化）
+        # 追加商品と削除商品の合計金額（値引き考慮）の計算（共通化）
         add_total, del_total, _ = self._compute_additional_delete_totals(additional, delete, origin)
 
         # 引継支払の計算（処理方法は変更せず）
