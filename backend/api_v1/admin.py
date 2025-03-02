@@ -129,7 +129,7 @@ class StockReceiveHistoryAdmin(admin.ModelAdmin):
 class TransactionAdmin(admin.ModelAdmin):
     list_display = ("id", "date", "store_code", "staff_code", "status", "total_amount", "receipt_button")
     fieldsets = [
-        ('取引情報', {'fields': ("status", "date", ("store_code", "staff_code", "user", "terminal_id"))}),
+        ('取引情報', {'fields': ("status", "relation_return_id", "date", ("store_code", "staff_code", "user", "terminal_id"))}),
         ('消費税', {'fields': (("total_tax10", "total_tax8"), "tax_amount")}),
         ('金額情報', {'fields': ("discount_amount", ("deposit", "change"), ("total_quantity", "total_amount"))}),
     ]
@@ -320,11 +320,20 @@ class ReturnPaymentInline(admin.TabularInline):  # または StackedInline
 
 @admin.register(ReturnTransaction)
 class ReturnTransactionAdmin(admin.ModelAdmin):
-    list_display = ("id", "origin_transaction", "return_date", "staff_code", "reason")
-    search_fields = ("id", "origin_sale_id", "staff_code")
-    list_filter = ("return_date",)
+    list_display = ("pk", "return_type", "origin_transaction_links", "return_date", "staff_code")
+    fields = (("id", "return_type"), "return_date", ("origin_transaction",  "modify_id"), "store_code", "terminal_id", "staff_code", "reason", "restock",)
+    list_display_links = ("pk", "origin_transaction_links",)
+    search_fields = ("pk", "origin_sale_id", "staff_code")
+    list_filter = ("return_type", "return_date",)
     readonly_fields = ("id", "origin_transaction", "return_date", "staff_code", "reason")  # 必要に応じて追加
     inlines = [ReturnDetailInline, ReturnPaymentInline]  # インラインで関連データを表示
+
+    def origin_transaction_links(self, obj):
+        """外部キーのリンクを生成するメソッド"""
+        url = reverse('admin:api_v1_transaction_change', args=[obj.origin_transaction.id])
+        return format_html('<a href="{}">{}</a>', url, obj.origin_transaction)
+
+    origin_transaction_links.short_description = 'Origin Transaction'  # 列のヘッダー名を設定
 
     def get_queryset(self, request):
         qs = super().get_queryset(request)

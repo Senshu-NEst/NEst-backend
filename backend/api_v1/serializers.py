@@ -56,6 +56,18 @@ class PaymentSerializer(serializers.ModelSerializer):
         fields = ['payment_method', 'amount']
 
 
+class ReturnDetailSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ReturnDetail
+        fields = ['jan', 'name', 'price', 'tax', 'discount', 'quantity']
+
+
+class ReturnPaymentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ReturnPayment
+        fields = ['payment_method', 'amount']
+
+
 class BaseTransactionSerializer(serializers.ModelSerializer):
     def _check_permissions(self, staff_code, store_code, required_permissions=None):
         if not staff_code:
@@ -139,26 +151,44 @@ class NonStopListSerializer(serializers.ListSerializer):
 
 
 class TransactionDetailSerializer(serializers.ModelSerializer):
+    # 元取引から引き継いだ商品の場合は True にする（通常は False）
+    original_product = serializers.BooleanField(required=False, default=False)
     tax = serializers.IntegerField(required=False)
     discount = serializers.IntegerField(required=False, default=0)
     quantity = serializers.IntegerField(min_value=1)
 
     class Meta:
         model = TransactionDetail
-        fields = ["jan", "name", "price", "tax", "discount", "quantity"]
-        # name, price はシステム側で設定されるので read_only
+        fields = ["jan", "name", "price", "tax", "discount", "quantity", "original_product"]
+        # 通常はシステム側で設定されるので read_only とする
         read_only_fields = ["name", "price"]
         list_serializer_class = NonStopListSerializer
 
+    def get_fields(self):
+        fields = super().get_fields()
+        # 返品（修正取引）の場合、元取引からの値を保持するため name, price を入力可能にする
+        if self.context.get("return_context", False):
+            fields["name"].read_only = False
+            fields["price"].read_only = False
+        return fields
+
     def validate(self, data):
-        # ※ここでは、商品存在チェックおよび税率の検証のみを実施し、
-        #   値引きのチェック（権限や実効価格との比較）は TransactionSerializer 側に統一する
         # --- 商品の存在確認 ---
         jan = data.get('jan')
         try:
             product = Product.objects.get(jan=jan)
         except Product.DoesNotExist:
             raise serializers.ValidationError({"jan": f"JANコード {jan} は登録されていません。"})
+        
+        # 元取引から引き継いだ商品の場合は、price, tax は必須とする
+        if data.get("original_product", False):
+            if data.get("price") is None:
+                raise serializers.ValidationError({"price": "元取引から引き継いだ商品のpriceは必須です。"})
+            if data.get("tax") is None:
+                raise serializers.ValidationError({"tax": "元取引から引き継いだ商品のtaxは必須です。"})
+            data["discount"] = data.get("discount") or 0
+            return data
+
         # --- 税率のバリデーション ---
         # クライアント側から tax が指定されていなければ、商品の税率を使用
         specified_tax_rate = data.get('tax')
@@ -167,38 +197,54 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
         except serializers.ValidationError as e:
             raise serializers.ValidationError({"tax": e.detail if hasattr(e, "detail") else str(e)})
         data['tax'] = applied_tax_rate
+        data["discount"] = data.get("discount") or 0
         return data
 
 
 class TransactionSerializer(BaseTransactionSerializer):
+    # 外部から不足分を補完するため、original_transaction をオプション入力とする
+    original_transaction = serializers.PrimaryKeyRelatedField(
+        queryset=Transaction.objects.all(), write_only=True, required=False
+    )
     sale_products = TransactionDetailSerializer(many=True)
     payments = PaymentSerializer(many=True)
     date = serializers.DateTimeField(required=False)
-    approval_number = serializers.CharField(required=True, write_only=True)
+    # 承認番号は外部入力がない場合もあるので required=False
+    approval_number = serializers.CharField(required=False, write_only=True)
 
     class Meta:
         model = Transaction
-        fields = ["id", "status", "date", "store_code", "terminal_id", "staff_code", "approval_number", "user", "total_tax10", "total_tax8", "tax_amount", "discount_amount", "total_amount", "deposit", "change", "total_quantity", "payments", "sale_products"]
+        fields = ["id", "status", "date", "store_code", "terminal_id", "staff_code", "approval_number", "user", "total_tax10", "total_tax8", "tax_amount", "discount_amount", "total_amount", "deposit", "change", "total_quantity", "payments", "sale_products", "original_transaction"]
         read_only_fields = ["id", "user", "total_quantity", "total_tax10", "total_tax8", "tax_amount", "total_amount", "change", "discount_amount", "deposit"]
 
-    def validate_status(self, value):
-        valid_statuses = ["sale", "training"]
-        if value not in valid_statuses:
-            raise serializers.ValidationError("無効なstatusが指定されました。")
-        return value
-
-    def validate_sale_products(self, value):
-        if not value:
-            raise serializers.ValidationError("少なくとも1つの商品を指定してください。")
-        return value
-
-    def validate_payments(self, value):
-        if not value:
-            raise serializers.ValidationError("支払方法を登録してください。")
-        return value
+    def __init__(self, *args, **kwargs):
+        """
+        コンテキストに 'external_data': True がある場合、read_only_fields も外部から上書きできるようにする。
+        """
+        super().__init__(*args, **kwargs)
+        if self.context.get("external_data", False):
+            for field_name in self.Meta.read_only_fields:
+                if field_name in self.fields:
+                    self.fields[field_name].read_only = False
 
     def validate(self, data):
         errors = {}
+
+        status = data.get("status")
+        valid_statuses = ["sale", "training"]
+        if self.context.get("external_data", False):
+            valid_statuses.append("resale")
+            if status not in valid_statuses:
+                errors["status"] = "無効なstatusが指定されました。"
+
+        sale_products = data.get("sale_products")
+        print(sale_products)
+        if not sale_products or len(sale_products) == 0:
+            errors["sale_products"] = "少なくとも1つの商品を指定してください。"
+
+        payments = data.get("payments")
+        if not payments or len(payments) == 0:
+            errors["payments"] = "支払方法を指定してください。"
 
         # スタッフコードのチェックおよび権限チェック
         staff_code = data.get("staff_code")
@@ -208,48 +254,61 @@ class TransactionSerializer(BaseTransactionSerializer):
             errors["staff"] = e.detail
             permissions = None
 
-        # 承認番号のチェック
-        approval_errors = {}
-        approval_number = data.get("approval_number")
-        if not approval_number:
-            approval_errors["approval_number"] = "承認番号が入力されていません。"
-        else:
-            # 形式チェック：8桁の数字であるか
-            if not (len(approval_number) == 8 and approval_number.isdigit()):
-                approval_errors["approval_number"] = "承認番号の形式に誤りがあります。数字8桁を入力してください。"
+        # 承認番号のチェック（external_data=Falseの場合）
+        if not self.context.get("external_data", False):
+            approval_number = data.get("approval_number")
+            if not approval_number:
+                errors["approval_number"] = "承認番号が入力されていません。"
             else:
-                try:
-                    approval = Approval.objects.get(approval_number=approval_number)
-                    if approval.is_used:
-                        approval_errors["approval_number"] = "承認番号は既に使用済みです。"
-                except Approval.DoesNotExist:
-                    approval_errors["approval_number"] = "承認番号が存在しません。"
-        if approval_errors:
-            errors.update(approval_errors)
+                # 形式チェック：8桁の数字かどうか
+                if not (len(approval_number) == 8 and approval_number.isdigit()):
+                    errors["approval_number"] = "承認番号の形式に誤りがあります。数字8桁を入力してください。"
+                else:
+                    try:
+                        approval = Approval.objects.get(approval_number=approval_number)
+                        if status != "training" and approval.is_used:
+                            errors["approval_number"] = "この承認番号は使用済みです。"
+                        else:
+                            # 正常な場合、承認情報をdataに付与してcreate側で利用する
+                            data["user"] = approval.user
+                            data["_approval_instance"] = approval
+                    except Approval.DoesNotExist:
+                        errors["approval_number"] = "承認番号が存在しません。"
 
         # 各商品の値引きチェック（各商品ごとにエラーを集約）
-        sale_products_data = data.get("sale_products", [])
-        discount_errors = self._aggregate_discount_errors(sale_products_data, data.get("store_code"), permissions)
+        discount_errors = self._aggregate_discount_errors(sale_products, data.get("store_code"), permissions)
         if discount_errors:
             errors["sale_products_discount"] = discount_errors
 
-        # 支払い金額のチェック
-        payments_data = data.get("payments", [])
+        # 支払い金額と商品合計金額のチェック
         try:
-            totals = self._calculate_totals(sale_products_data, data.get("store_code"))
+            totals = self._calculate_totals(sale_products, data.get("store_code"))
         except serializers.ValidationError as e:
             errors["sale_products_totals"] = e.detail
             totals = None
 
         if totals is not None:
-            total_payments = sum(payment['amount'] for payment in payments_data)
+            total_payments = sum(payment['amount'] for payment in payments)
             try:
-                self._validate_payments(total_payments, totals['total_amount'], payments_data)
+                self._validate_payments(total_payments, totals['total_amount'], payments)
             except serializers.ValidationError as e:
                 errors["payments"] = e.detail
 
+            # トレーニング以外の場合はウォレット残高のチェック（withdrawはcreate側で実施）
+            if status != "training":
+                user = data.get("user")
+                wallet_payments = [p for p in payments if p['payment_method'] == 'wallet']
+                if wallet_payments and user:
+                    total_wallet_payment = sum(p['amount'] for p in wallet_payments)
+                    if total_wallet_payment > user.wallet.balance:
+                        shortage = total_wallet_payment - user.wallet.balance
+                        errors["wallet"] = f"ウォレット残高不足。{int(shortage)}円分不足しています。"
+
         if errors:
             raise serializers.ValidationError(errors)
+
+        # 補助情報として計算結果をdataに付与
+        data["_totals"] = totals
         return data
 
     def _aggregate_discount_errors(self, sale_products_data, store_code, permissions):
@@ -280,25 +339,37 @@ class TransactionSerializer(BaseTransactionSerializer):
             raise serializers.ValidationError(f"JAN:{jan} 割引額は0以上である必要があります。")
 
     def _calculate_totals(self, sale_products_data, store_code):
+        """
+        売上明細（sale_products）の合計金額、税額、割引額、数量を計算します。
+        元取引から引き継いだ商品（original_product=True）の場合は、入力された price, tax, discount を使用し、
+        新規追加商品の場合は店舗価格（または商品マスタの価格）と入力された tax（なければ商品マスタの税率）を使用します。
+        """
         total_quantity = 0
         total_amount_tax10 = 0
         total_amount_tax8 = 0
-        discount_amount = 0
+        total_discount_amount = 0
 
-        for sale_product_data in sale_products_data:
-            product = self._get_product(sale_product_data["jan"])
-            store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
-            effective_price = store_price.get_price() if store_price else product.price
-            discount = sale_product_data.get("discount", 0)
-            quantity = sale_product_data.get("quantity", 1)
-            subtotal_with_tax = (effective_price - discount) * quantity
-            applied_tax_rate = sale_product_data.get("tax")
-            if applied_tax_rate == 10:
-                total_amount_tax10 += subtotal_with_tax
+        for sale_product in sale_products_data:
+            product = self._get_product(sale_product["jan"])
+            if sale_product.get("original_product", False):
+                effective_price = sale_product.get("price")
+                applied_tax_rate = sale_product.get("tax")
             else:
-                total_amount_tax8 += subtotal_with_tax
+                store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
+                effective_price = store_price.get_price() if store_price else product.price
+                applied_tax_rate = sale_product.get("tax", product.tax)
+
+            discount = sale_product.get("discount") or 0
+            quantity = sale_product.get("quantity") or 1
+            subtotal = (effective_price - discount) * quantity
+
+            if applied_tax_rate == 10:
+                total_amount_tax10 += subtotal
+            else:
+                total_amount_tax8 += subtotal
+
             total_quantity += quantity
-            discount_amount += discount * quantity
+            total_discount_amount += discount * quantity
 
         total_tax10 = int(total_amount_tax10 * 10 / 110)
         total_tax8 = int(total_amount_tax8 * 8 / 108)
@@ -310,7 +381,7 @@ class TransactionSerializer(BaseTransactionSerializer):
             'total_tax10': total_tax10,
             'total_tax8': total_tax8,
             'tax_amount': total_tax,
-            'discount_amount': discount_amount,
+            'discount_amount': total_discount_amount,
             'total_amount': total_amount
         }
 
@@ -318,7 +389,7 @@ class TransactionSerializer(BaseTransactionSerializer):
         if total_payments < total_amount:
             raise serializers.ValidationError("支払いの合計金額が取引の合計金額を下回っています。")
         total_cashless_amount = sum(
-            payment['amount'] for payment in payments_data if payment['payment_method'] != 'cash'
+            payment['amount'] for payment in payments_data if payment['payment_method'] not in ['cash', 'carryover']
         )
         if total_cashless_amount > total_amount:
             raise serializers.ValidationError("現金以外の支払方法の総計が合計金額を超えています。")
@@ -348,117 +419,425 @@ class TransactionSerializer(BaseTransactionSerializer):
             )
 
     def _create_payments(self, transaction_instance, payments_data):
+        payment_instances = []
         for payment_data in payments_data:
-            Payment.objects.create(
+            payment_instance = Payment.objects.create(
                 transaction=transaction_instance,
                 payment_method=payment_data['payment_method'],
                 amount=payment_data['amount']
             )
+            payment_instances.append(payment_instance)
+        # payments フィールドに関連付け
+        transaction_instance.payments.set(payment_instances)
 
     def _create_transaction_details(self, transaction_instance, sale_products_data, status, store_code):
-        product_map = {}
+        aggregated_details = {}
+        for sale_product in sale_products_data:
+            product_jan = sale_product.get("jan")
+            tax_rate = sale_product.get("tax")
+            discount_value = sale_product.get("discount", 0)
+            quantity_value = sale_product.get("quantity", 1)
+            is_original = sale_product.get("original_product", False)
+            key = (product_jan, tax_rate, discount_value, is_original)
+            if key not in aggregated_details:
+                aggregated_details[key] = {"quantity": 0, "detail_data": sale_product}
+            aggregated_details[key]["quantity"] += quantity_value
 
-        # 商品を集約
-        for sale_product_data in sale_products_data:
-            jan = sale_product_data["jan"]
-            tax = sale_product_data.get("tax")
-            discount = sale_product_data.get("discount", 0)
-            quantity = sale_product_data.get("quantity", 1)
-
-            # 複合キーを作成
-            product_key = (jan, tax, discount)
-
-            if product_key not in product_map:
-                product_map[product_key] = {
-                    "quantity": 0,
-                    "data": sale_product_data  # 元のデータを保持
-                }
-            product_map[product_key]["quantity"] += quantity
-
-        # 合計した商品情報を基にトランザクション詳細を作成
-        for product_key, product_info in product_map.items():
-            jan, tax, discount = product_key
-            quantity = product_info["quantity"]
-            
-            # 商品情報を取得する処理を一度だけ行う
-            product = self._get_product(jan)
-            store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
-            effective_price = store_price.get_price() if store_price else product.price
+        for key, data in aggregated_details.items():
+            product_jan, tax_rate, discount_value, is_original = key
+            aggregated_quantity = data["quantity"]
+            product = self._get_product(product_jan)
+            if is_original:
+                effective_price = data["detail_data"].get("price")
+            else:
+                store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
+                effective_price = store_price.get_price() if store_price else product.price
 
             TransactionDetail.objects.create(
                 transaction=transaction_instance,
                 jan=product,
                 name=product.name,
                 price=effective_price,
-                tax=tax,
-                discount=discount,
-                quantity=quantity
+                tax=tax_rate,
+                discount=discount_value,
+                quantity=aggregated_quantity
             )
 
+    @transaction.atomic
     def create(self, validated_data):
         sale_products_data = validated_data.pop("sale_products", [])
         payments_data = validated_data.pop("payments", [])
-        staff_code = validated_data.pop("staff_code", None)
-        store_code = validated_data.pop("store_code", None)
-        status = validated_data.get("status")
-        terminal_id = validated_data.pop("terminal_id", None)
+        original_transaction = validated_data.pop("original_transaction", None)
 
-        # 承認番号の取得（validate() でチェック済み）
-        approval_number = validated_data.pop("approval_number", None)
-        try:
-            approval = Approval.objects.get(approval_number=approval_number)
-            # トレーニングモードでない場合のみ、既に使用済みかどうかのチェックを行う
-            if status != "training" and approval.is_used:
-                raise serializers.ValidationError("承認番号は既に使用済みです。")
-            user = approval.user
-        except Approval.DoesNotExist:
-            raise serializers.ValidationError("無効または期限切れの承認番号です。")
+        # original_transaction が指定されている場合、欠落項目を補完
+        if original_transaction:
+            # 修正会計の場合は、ユーザーを元取引から取得する
+            validated_data.setdefault("user", original_transaction.user)
+            # external_data が True の場合は、ステータスを「再売」に設定
+            if self.context.get("external_data", False):
+                validated_data["status"] = "resale"
+            else:
+                validated_data.setdefault("status", original_transaction.status)
 
-        totals = self._calculate_totals(sale_products_data, store_code)
+        store_code = validated_data.get("store_code")
+        totals = validated_data.pop("_totals", None)
         total_payments = sum(payment['amount'] for payment in payments_data)
 
-        with transaction.atomic():
-            # トレーニングモードでない場合のみ、ウォレットからの減算および残高チェックを行う
-            wallet_payments = []
-            if status != "training":
-                wallet = user.wallet
-                wallet_payments = [p for p in payments_data if p['payment_method'] == 'wallet']
-                if wallet_payments:
-                    total_wallet_payment = sum(p['amount'] for p in wallet_payments)
-                    if total_wallet_payment > wallet.balance:
-                        shortage = total_wallet_payment - wallet.balance
-                        raise serializers.ValidationError(f"ウォレット残高不足。{int(shortage)}円分不足しています。")
+        # 日付は常に現在時刻で設定
+        validated_data["date"] = timezone.now()
+        validated_data.update({
+            "deposit": total_payments,
+            "change": total_payments - totals["total_amount"],
+            "total_quantity": totals["total_quantity"],
+            "total_tax10": totals["total_tax10"],
+            "total_tax8": totals["total_tax8"],
+            "tax_amount": totals["tax_amount"],
+            "discount_amount": totals["discount_amount"],
+            "total_amount": totals["total_amount"]
+        })
 
-            transaction_instance = Transaction.objects.create(
-                date=timezone.now(),
-                user=user,  # 承認番号から取得したユーザーを設定
-                terminal_id=terminal_id,
-                staff_code=staff_code,
-                store_code=store_code,
-                deposit=total_payments,
-                change=total_payments - totals['total_amount'],
-                total_quantity=totals['total_quantity'],
-                total_tax10=totals['total_tax10'],
-                total_tax8=totals['total_tax8'],
-                tax_amount=totals['tax_amount'],
-                discount_amount=totals['discount_amount'],
-                total_amount=totals['total_amount'],
-                **validated_data
-            )
+        # トレーニング以外の場合はウォレット減算処理
+        if validated_data.get("status") != "training":
+            user = validated_data.get("user")
+            wallet_payments = [p for p in payments_data if p["payment_method"] == "wallet"]
+            if wallet_payments and user:
+                total_wallet_payment = sum(p["amount"] for p in wallet_payments)
+                user.wallet.withdraw(total_wallet_payment, transaction=None)
 
-            # トレーニングモードでない場合のみ、ウォレットから減算してウォレット利用履歴を記録する
-            if status != "training" and wallet_payments:
-                wallet.withdraw(total_wallet_payment, transaction=transaction_instance)
+        transaction_instance = Transaction.objects.create(**validated_data)
+        self._create_transaction_details(
+            transaction_instance, sale_products_data, validated_data.get("status"), store_code
+        )
+        self._create_payments(transaction_instance, payments_data)
 
-            self._create_transaction_details(transaction_instance, sale_products_data, status, store_code)
-            self._create_payments(transaction_instance, payments_data)
-
-            # トレーニングモードでない場合は、承認番号の使用済みフラグを更新する
-            if status != "training":
+        # 承認番号の使用済み更新（通常取引かつトレーニング以外の場合）
+        if not self.context.get("external_data", False) and validated_data.get("status") != "training":
+            approval = validated_data.pop("_approval_instance", None)
+            if approval:
                 approval.is_used = True
                 approval.save()
 
         return transaction_instance
+
+
+
+class ReturnTransactionSerializer(BaseTransactionSerializer):
+    return_type = serializers.CharField()
+    reason = serializers.CharField()
+    # 支払いは、金額の符号で返金（負）と追加領収（正）を区別
+    payments = ReturnPaymentSerializer(many=True, write_only=True)
+    return_payments = ReturnPaymentSerializer(many=True, read_only=True)
+    date = serializers.DateTimeField(source='created_at', read_only=True)
+    # 返品時は、購入店舗と異なる可能性があるため必須
+    store_code = serializers.CharField(required=True)
+    terminal_id = serializers.CharField(required=True)
+    return_products = ReturnDetailSerializer(many=True, source='return_details', read_only=True)
+    additional_items = serializers.ListField(
+        child=serializers.DictField(child=serializers.CharField(required=True)),
+        required=False
+    )
+    delete_items = serializers.ListField(
+        child=serializers.DictField(child=serializers.CharField(required=True)),
+        required=False
+    )
+
+    class Meta:
+        model = ReturnTransaction
+        fields = ['id', 'origin_transaction', 'date', 'return_type', 'store_code', 'staff_code', 'terminal_id', 'reason', 'restock', 'payments', 'return_payments', 'return_products', 'additional_items', 'delete_items']
+        extra_kwargs = {
+            'origin_transaction': {'required': True},
+            'staff_code': {'required': True},
+            'restock': {'required': True},
+        }
+
+    def validate(self, data):
+        errors = {}
+        origin = data.get('origin_transaction')
+        if not origin:
+            errors['origin_transaction'] = "元取引IDが必要です。"
+        elif origin.status != 'sale':
+            errors['origin_transaction'] = "返品対象外取引です。"
+
+        # スタッフ権限チェック
+        staff_code = data.get("staff_code")
+        try:
+            self._check_permissions(staff_code, store_code=data.get('store_code'), required_permissions=["register", "void"])
+        except serializers.ValidationError as e:
+            errors["staff"] = e.detail
+
+        # return_type のバリデーション（モデルの選択肢に限定）
+        if data.get('return_type') not in dict(ReturnTransaction.RETURN_TYPE_CHOICES):
+            errors['return_type'] = "不正なreturn_type"
+
+        # partial返品の場合、追加・削除商品のいずれかが必須
+        if data.get('return_type') == 'partial':
+            additional = data.get('additional_items', [])
+            delete = data.get('delete_items', [])
+            if not additional and not delete:
+                errors['additional_items'] = "一部返品の場合、追加商品の明細または削除商品の明細のいずれかは必要です。"
+            # 項目の基本構造の検証
+            self._validate_item_details(data)
+
+            # 追加・削除商品の合計金額を共通処理で算出（値引きを考慮）
+            additional_total, delete_total, net_amount = self._compute_additional_delete_totals(
+                data.get('additional_items', []), data.get('delete_items', []), origin
+            )
+            payments = data.get('payments', [])
+            payments_sum = sum(float(p.get('amount', 0)) for p in payments)
+
+            # 各ケースでの支払い検証（変更せず）
+            if net_amount > 0:
+            # 追加領収発生：既収金は (元取引合計 + 削除商品合計) とみなし、追加領収は (追加合計 - 既収金)
+                expected_additional = additional_total - delete_total
+                if abs(payments_sum - expected_additional) > 0.01:
+                    errors['payments'] = f"追加領収金の合計が不正です。必要値: {expected_additional}, 入力値: {payments_sum}"
+            elif net_amount < 0:
+                expected_refund = net_amount  # net_amount は負の値
+                if abs(payments_sum - expected_refund) > 0.01:
+                    errors['payments'] = f"返金金額の合計が不正です。必要値: {expected_refund}, 入力値: {payments_sum}"
+            else:
+                if abs(payments_sum) > 0.01:
+                    errors['payments'] = f"返金も追加領収も発生しないはずですが、支払い合計: {payments_sum}"
+
+        else:
+            # 全返品の場合、返金金額は元取引合計と一致する必要がある
+            payments = data.get('payments', [])
+            sum_payments = sum(float(item.get('amount', 0)) for item in payments)
+            if origin and sum_payments != origin.total_amount:
+                errors['payments'] = "返金金額の合計が元取引の合計金額と一致しません。"
+
+        if errors:
+            raise serializers.ValidationError(errors)
+        return data
+
+    def _validate_item_details(self, data):
+        # 各グループの明細について、必須項目と型変換を実施
+        for group in ['additional_items', 'delete_items']:
+            items = data.get(group, [])
+            for item in items:
+                if 'jan' not in item or 'quantity' not in item:
+                    raise serializers.ValidationError(f"{group}にはJANコードと数量が必須です。")
+                try:
+                    item['quantity'] = int(item['quantity'])
+                except ValueError:
+                    raise serializers.ValidationError(f"{group}の数量は整数でなければなりません。")
+                for field in ['discount', 'price']:
+                    if field in item:
+                        try:
+                            item[field] = float(item[field])
+                        except ValueError:
+                            raise serializers.ValidationError(f"{group}の{field}は数値でなければなりません。")
+
+    def _compute_additional_delete_totals(self, additional_items, delete_items, origin):
+        """
+        追加商品と削除商品の合計金額（値引き考慮）およびその差(net_amount)を算出する。
+        追加商品の実質価格 = (price - discount) * quantity
+        削除商品の実質価格は、元取引の販売明細から取得（price - discount）
+        """
+        additional_total = sum(
+            (float(Product.objects.filter(jan=item.get('jan')).first().price) - float(item.get('discount', 0))) * int(item.get('quantity', 1))
+            for item in additional_items if Product.objects.filter(jan=item.get('jan')).exists()
+        )
+        delete_total = sum(
+            (detail.price - detail.discount) * int(item.get('quantity', 1))
+            for item in delete_items
+            for detail in origin.sale_products.all()
+            if detail.jan.jan == item.get('jan')
+        )
+        net_amount = additional_total - delete_total
+        return additional_total, delete_total, net_amount
+
+    @transaction.atomic
+    def create(self, validated_data):
+        return_type = validated_data.pop('return_type')
+        origin = validated_data['origin_transaction']
+        # 返品対象の元取引はステータスを "return" に更新
+        origin.status = 'return'
+        origin.save()
+
+        # store_code を Store インスタンスに変換
+        store_instance = Store.objects.get(store_code=validated_data.pop('store_code'))
+
+        ret_trans = ReturnTransaction.objects.create(
+            origin_transaction=origin,
+            staff_code=validated_data.get('staff_code'),
+            return_type=return_type,
+            reason=validated_data.get('reason'),
+            restock=validated_data.get('restock'),
+            store_code=store_instance,
+            terminal_id=validated_data['terminal_id']
+        )
+
+        self._process_payments(ret_trans, origin, validated_data.get('payments', []))
+
+        if validated_data.get('restock', False):
+            self._restock_inventory(ret_trans, origin)
+
+        if return_type == 'all':
+            self._copy_sale_products(origin, ret_trans)
+        elif return_type == 'partial':
+            new_trans = self._process_partial_return(validated_data, ret_trans, origin)
+            # 修正会計の取引IDを modify_id として記録
+            ret_trans.modify_id = new_trans
+            ret_trans.save()
+
+        return ret_trans
+
+    def _process_payments(self, ret_trans, origin, payments_data):
+        # 支払い情報のうち、金額が負の場合は返金処理を実施
+        for pay in payments_data:
+            amount = float(pay.get('amount', 0))
+            if amount < 0:
+                refund_amt = abs(amount)
+                ReturnPayment.objects.create(
+                    return_transaction=ret_trans,
+                    payment_method=pay.get('payment_method'),
+                    amount=refund_amt
+                )
+                if pay.get('payment_method') == 'wallet':
+                    wallet = origin.user.wallet
+                    wallet.balance += refund_amt
+                    wallet.save()
+                    WalletTransaction.objects.create(
+                        wallet=wallet,
+                        amount=refund_amt,
+                        balance=wallet.balance,
+                        transaction_type='refund',
+                        transaction=origin,
+                        return_transaction=ret_trans
+                    )
+
+    def _restock_inventory(self, ret_trans, origin):
+        for detail in ret_trans.return_details.all():
+            try:
+                print(f"Restocking item: {detail.jan} for store: {origin.store_code}")
+                stock_entry = Stock.objects.get(store_code=origin.store_code, jan=detail.jan)
+                stock_entry.stock += detail.quantity
+                stock_entry.save()
+                print(f"Updated stock for {detail.jan}: {stock_entry.stock}")
+            except Stock.DoesNotExist:
+                print(f"Stock not found for JAN: {detail.jan} in store: {origin.store_code}")
+                raise serializers.ValidationError(f"JANコード {detail.jan} の在庫が見つかりません。")
+
+    def _copy_sale_products(self, origin, ret_trans):
+        # 全返品の場合、元取引の全販売明細をそのままコピーする
+        for detail in origin.sale_products.all():
+            ReturnDetail.objects.create(
+                return_transaction=ret_trans,
+                jan=detail.jan,
+                name=detail.name,
+                price=detail.price,
+                tax=detail.tax,
+                discount=detail.discount,
+                quantity=detail.quantity
+            )
+
+    def _process_partial_return(self, validated_data, ret_trans, origin):
+        additional = validated_data.pop('additional_items', [])
+        delete = validated_data.pop('delete_items', [])
+
+        # 削除商品の明細を返品詳細として記録（値引きを考慮）
+        for item in delete:
+            jan = item.get('jan')
+            qty = item.get('quantity')
+            detail = next((d for d in origin.sale_products.all() if d.jan.jan == jan), None)
+            if detail:
+                ReturnDetail.objects.create(
+                    return_transaction=ret_trans,
+                    jan=detail.jan,
+                    name=detail.name,
+                    price=detail.price,
+                    tax=detail.tax,
+                    discount=detail.discount,
+                    quantity=qty
+                )
+
+        # 修正会計（新規取引）の作成（承認番号不要）
+        new_trans = self._create_new_transaction(origin, additional, delete, self.initial_data.get('payments', []))
+        
+        # 関連付けの設定: 修正取引から返品取引への参照を設定
+        print(new_trans)
+        if new_trans:
+            new_trans.relation_return_id = ret_trans
+            origin.relation_return_id = ret_trans
+            origin.save()
+            new_trans.save()
+            
+        return new_trans
+
+    def _create_new_transaction(self, original_transaction, additional_items, deleted_items, payment_inputs):
+        """
+        修正取引（resale）の新規作成処理です。
+        元取引の販売明細から、削除数量を差し引いた残りと、追加商品の明細を統合し、正しい金額で新規取引を作成します。
+        支払いは "carryover" を用いて元取引の正の支払いを引き継ぎます。
+        """
+        remaining_sale_products = []
+        original_details = {detail.jan.jan: detail for detail in original_transaction.sale_products.all()}
+        deleted_quantities = {item.get('jan'): int(item.get('quantity', 0)) for item in deleted_items}
+
+        # 元取引の明細から削除分を引いた残りを作成
+        for jan, sale_detail in original_details.items():
+            remaining_qty = sale_detail.quantity - deleted_quantities.get(jan, 0)
+            if remaining_qty > 0:
+                remaining_sale_products.append({
+                    'jan': jan,
+                    'name': sale_detail.name,
+                    'price': sale_detail.price,  # 元取引の価格を保持
+                    'tax': int(sale_detail.tax),  # 元取引の税率を保持
+                    'discount': sale_detail.discount,  # 元取引の割引を保持
+                    'quantity': remaining_qty,
+                    'original_product': True
+                })
+
+        # 追加商品の明細を追加
+        for item in additional_items:
+            jan = item.get('jan')
+            qty = int(item.get('quantity'))
+            product = Product.objects.filter(jan=jan).first()
+            if not product:
+                raise KeyError(f"JANコード {jan} の商品が存在しません。")
+            remaining_sale_products.append({
+                'jan': jan,
+                'name': product.name,
+                'price': product.price,
+                'tax': int(product.tax),
+                'discount': item.get('discount', 0),
+                'quantity': qty,
+                'original_product': False
+            })
+
+        additional_total, deleted_total, _ = self._compute_additional_delete_totals(additional_items, deleted_items, original_transaction)
+
+        if additional_total - deleted_total > 0:
+            carryover_payment = {'payment_method': "carryover", 'amount': original_transaction.total_amount}
+            positive_payments = [p for p in payment_inputs if float(p['amount']) > 0]
+            additional_payment = {
+                'payment_method': positive_payments[0]['payment_method'] if positive_payments else "default_method",
+                'amount': positive_payments[0]['amount'] if positive_payments else 0
+            }
+            combined_payments = [carryover_payment, additional_payment]
+        elif additional_total - deleted_total < 0:
+            carryover_amount = original_transaction.total_amount + additional_total - deleted_total
+            carryover_payment = {'payment_method': "carryover", 'amount': carryover_amount}
+            combined_payments = [carryover_payment]
+        else:
+            carryover_payment = {'payment_method': "carryover", 'amount': original_transaction.total_amount}
+            combined_payments = [carryover_payment]
+
+        new_transaction_data = {
+            'original_transaction': original_transaction.id,
+            'sale_products': remaining_sale_products,
+            'store_code': self.initial_data.get('store_code'),
+            'terminal_id': self.initial_data.get('terminal_id'),
+            'staff_code': self.initial_data.get('staff_code'),
+            'payments': combined_payments,
+            'status': 'resale'
+        }
+        serializer = TransactionSerializer(
+            data=new_transaction_data, context={'external_data': True, 'return_context': True}
+        )
+        serializer.is_valid(raise_exception=True)
+        return serializer.save()
 
 
 class ProductSerializer(serializers.ModelSerializer):
@@ -494,13 +873,14 @@ class ProductVariationSerializer(serializers.ModelSerializer):
 
 
 class StockSerializer(serializers.ModelSerializer):
-    standard_price = serializers.IntegerField(source='jan.price')  # 商品の標準価格
-    store_price = serializers.SerializerMethodField()  # 店舗価格
-    tax = serializers.IntegerField(source='jan.tax')  # 税率を追加
+    standard_price = serializers.IntegerField(source='jan.price')
+    store_price = serializers.SerializerMethodField()
+    tax = serializers.IntegerField(source='jan.tax')
+    name = serializers.CharField(source='jan.name', read_only=True)
 
     class Meta:
         model = Stock
-        fields = ['store_code', 'jan', 'stock', 'standard_price', 'store_price', 'tax']
+        fields = ['store_code', 'name', 'jan', 'stock', 'standard_price', 'store_price', 'tax']
 # TODO:なぜmodels側のget_priceだけでは価格が取得できないのか調査する
 # （現在のコードだとstore_priceが存在しない時のフォールバック処理を二回行なっていることになっている）
 
@@ -581,7 +961,6 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     @classmethod
     def get_token(cls, user):
         token = super().get_token(user)
-        token["staff_code"] = getattr(user, "staff_code", None)
         return token
 
 
@@ -597,119 +976,3 @@ class ApprovalSerializer(serializers.ModelSerializer):
     class Meta:
         model = Approval
         fields = ['id', 'user', 'approval_number', 'created_at']
-
-
-class ReturnDetailSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = ReturnDetail
-        fields = ['jan', 'name', 'price', 'tax', 'discount', 'quantity']
-
-
-class ReturnPaymentSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = ReturnPayment
-        fields = ['payment_method', 'amount']
-
-
-class ReturnTransactionSerializer(BaseTransactionSerializer):
-    return_type = serializers.CharField()
-    resson = serializers.CharField(source='reason')
-    payments = ReturnPaymentSerializer(many=True, write_only=True)
-    return_payments = ReturnPaymentSerializer(many=True, read_only=True)
-    date = serializers.DateTimeField(source='created_at', read_only=True)
-    store_code = serializers.CharField(source='origin_transaction.store_code.store_code', read_only=True)
-    terminal_id = serializers.CharField(source='origin_transaction.terminal_id', read_only=True)
-    return_products = ReturnDetailSerializer(many=True, source='return_details', read_only=True)
-
-    class Meta:
-        model = ReturnTransaction
-        fields = ['id', 'origin_transaction', 'date', 'return_type', 'store_code', 'staff_code', 'terminal_id', 'resson', 'restock', 'payments', 'return_payments', 'return_products']
-        extra_kwargs = {
-            'origin_transaction': {'required': True},
-            'staff_code': {'required': True},
-            'terminal_id': {'required': True},
-            'restock': {'required': True},
-        }
-
-    def validate(self, data):
-        errors = {}
-
-        origin_transaction = data.get('origin_transaction')
-        if not origin_transaction:
-            errors['origin_transaction'] = "元取引IDが必要です。"
-        else:
-            # 既に返品済みかチェック
-            if origin_transaction.status != 'sale':
-                errors['origin_transaction'] = "返品対象外取引です。"
-
-        # スタッフの権限チェック
-        staff_code = data.get("staff_code")
-        try:
-            self._check_permissions(staff_code, store_code=origin_transaction.store_code, required_permissions=["register", "void"])
-        except serializers.ValidationError as e:
-            errors["staff"] = e.detail
-
-        # 支払い（返金）金額のチェック
-        payments = data.get('payments', [])
-        sum_payments = sum(item.get('amount', 0) for item in payments)
-        if origin_transaction and sum_payments != origin_transaction.total_amount:
-            errors['payments'] = "返金金額の合計が元取引の合計金額と一致しません。"
-
-        if errors:
-            raise serializers.ValidationError(errors)
-        return data
-
-    @transaction.atomic  # createをトランザクションで保護
-    def create(self, validated_data):
-        payments_data = validated_data.pop('payments', [])
-        origin_transaction = validated_data.get('origin_transaction')
-
-        # 返品時は、元取引のstatusを "return" に変更
-        origin_transaction.status = 'return'
-        origin_transaction.save()
-
-        # ReturnTransaction の作成
-        return_transaction = ReturnTransaction.objects.create(**validated_data)
-
-        # 自動的に返品明細を生成：元取引の取引明細をコピーする
-        for detail in origin_transaction.sale_products.all():
-            ReturnDetail.objects.create(
-                return_transaction=return_transaction,
-                jan=detail.jan,
-                name=detail.name,
-                price=detail.price,
-                tax=detail.tax,
-                discount=detail.discount,
-                quantity=detail.quantity
-            )
-
-        # 返金支払の作成およびウォレット返金処理
-        for payment_data in payments_data:
-            ReturnPayment.objects.create(return_transaction=return_transaction, **payment_data)
-
-            if payment_data.get('payment_method') == 'wallet':
-                wallet = origin_transaction.user.wallet
-                refund_amount = abs(payment_data['amount'])
-
-                # ウォレットへの返金処理
-                wallet.balance += refund_amount
-                wallet.save()
-
-                # WalletTransaction に返金履歴を記録
-                WalletTransaction.objects.create(
-                    wallet=wallet,
-                    amount=refund_amount,
-                    balance=wallet.balance,
-                    transaction_type='refund',
-                    transaction=origin_transaction,
-                    return_transaction=return_transaction
-                )
-
-        # 在庫の戻し処理
-        if validated_data.get('restock', False):
-            for detail in return_transaction.return_details.all():
-                stock_entry = Stock.objects.get(store_code=origin_transaction.store_code, jan=detail.jan)
-                stock_entry.stock += detail.quantity
-                stock_entry.save()
-
-        return return_transaction

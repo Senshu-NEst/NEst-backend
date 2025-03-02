@@ -197,11 +197,13 @@ class Transaction(BaseModel):
     """取引モデル"""
     class Status(models.TextChoices):
         SALE = "sale", "販売"
-        VOID = "void", "返品"
+        VOID = "void", "取消"
         TRAINING = "training", "トレーニング"
         RETURN = "return", "返品"
+        RESALE = "resale", "再売"
 
     id = models.AutoField(primary_key=True, verbose_name="取引番号")
+    relation_return_id = models.ForeignKey('ReturnTransaction', on_delete=models.CASCADE, blank=True, null=True, verbose_name="返品関係id")
     status = models.CharField(max_length=50, choices=Status.choices, default=Status.SALE, verbose_name="取引状態")
     date = models.DateTimeField(verbose_name="購入日時")
     store_code = models.ForeignKey(Store, on_delete=models.CASCADE, verbose_name="店番号")
@@ -253,6 +255,7 @@ class Payment(BaseModel):
         ("wallet", "ウォレット"),
         ("voucher", "金券"),
         ("QRcode", "QRコード決済"),
+        ("carryover", "引継支払"),
     ]
     transaction = models.ForeignKey('Transaction', related_name='payments', on_delete=models.CASCADE, verbose_name="取引")
     payment_method = models.CharField(max_length=50, choices=PAYMENT_METHOD_CHOICES, verbose_name="支払方法")
@@ -467,16 +470,17 @@ class ReturnTransaction(BaseModel):
     """
     RETURN_TYPE_CHOICES = (
         ('all', '全返品'),
-        # 将来的に部分返品など拡張可能
+        ('partial', '一部返品')
     )
-
-    return_type = models.CharField(max_length=10, choices=RETURN_TYPE_CHOICES, default='all', verbose_name="返品種別")
+    modify_id = models.ForeignKey(Transaction, on_delete=models.CASCADE, blank=True, null=True, verbose_name="再売取引")
+    return_type = models.CharField(max_length=10, choices=RETURN_TYPE_CHOICES, verbose_name="返品種別")
     origin_transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name='return_transactions', verbose_name="元取引")
     return_date = models.DateTimeField(auto_now_add=True, verbose_name="返品日時")
     reason = models.TextField(verbose_name="返品理由")
-    restock = models.BooleanField(default=True, verbose_name="在庫に戻すか")
+    restock = models.BooleanField(default=True, verbose_name="在庫戻し")
     terminal_id = models.CharField(max_length=50, blank=True, null=True, verbose_name="返品端末番号")
-    staff_code = models.ForeignKey(Staff, to_field='staff_code', on_delete=models.CASCADE, blank=True, null=True, verbose_name="返品担当スタッフコード")
+    store_code = models.ForeignKey(Store, on_delete=models.CASCADE, verbose_name="返品店番号")
+    staff_code = models.ForeignKey(Staff, to_field='staff_code', on_delete=models.CASCADE, verbose_name="返品担当")
 
     class Meta:
         verbose_name = "返品取引"
@@ -490,7 +494,7 @@ class ReturnDetail(BaseModel):
     """
     返品明細モデル
     ・元の取引明細（TransactionDetail）の内容をそのまま記録する。  
-      TransactionDetailと同じ項目を保持することで、返品時に元の取引内容を正確に記録できる。
+    TransactionDetailと同じ項目を保持することで、返品時に元の取引内容を正確に記録できる。
     """
     return_transaction = models.ForeignKey(ReturnTransaction, on_delete=models.CASCADE, related_name='return_details', verbose_name="返品取引")
     jan = models.ForeignKey(Product, on_delete=models.CASCADE, verbose_name="JANコード")
@@ -518,7 +522,7 @@ class ReturnPayment(BaseModel):
 
     return_transaction = models.ForeignKey (ReturnTransaction, on_delete=models.CASCADE, related_name='return_payments', verbose_name="返品返金支払")
     payment_method = models.CharField(max_length=50, choices=REFUND_PAYMENT_METHOD_CHOICES, verbose_name="返金支払方法")
-    amount = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="返金金額")
+    amount = models.IntegerField(verbose_name="返金金額")
 
     class Meta:
         verbose_name = "返金支払"
