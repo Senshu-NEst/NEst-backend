@@ -203,6 +203,7 @@ class Transaction(BaseModel):
         RESALE = "resale", "再売"
 
     id = models.AutoField(primary_key=True, verbose_name="取引番号")
+    relation_return_id = models.ForeignKey('ReturnTransaction', on_delete=models.CASCADE, blank=True, null=True, verbose_name="返品関係id")
     status = models.CharField(max_length=50, choices=Status.choices, default=Status.SALE, verbose_name="取引状態")
     date = models.DateTimeField(verbose_name="購入日時")
     store_code = models.ForeignKey(Store, on_delete=models.CASCADE, verbose_name="店番号")
