@@ -230,12 +230,14 @@ class TransactionSerializer(BaseTransactionSerializer):
     def validate(self, data):
         errors = {}
 
+        # ステータスのチェック：ReturnTransactionの場合は "resale" のみ、通常は "sale" と "training" のみ許可する
         status = data.get("status")
-        valid_statuses = ["sale", "training"]
-        if self.context.get("external_data", False):
-            valid_statuses.append("resale")
-            if status not in valid_statuses:
-                errors["status"] = "無効なstatusが指定されました。"
+        if self.context.get("return_context", False):
+            allowed_statuses = ["resale"]
+        else:
+            allowed_statuses = ["sale", "training"]
+        if status not in allowed_statuses:
+            errors["status"] = "無効なstatusが指定されました。"
 
         sale_products = data.get("sale_products")
         print(sale_products)
@@ -245,6 +247,9 @@ class TransactionSerializer(BaseTransactionSerializer):
         payments = data.get("payments")
         if not payments or len(payments) == 0:
             errors["payments"] = "支払方法を指定してください。"
+
+        if status != "resale" and any(item['payment_method'] == 'carryover' for item in payments):
+            errors["payments"] = "引継支払は再売以外で使用できません。"
 
         # スタッフコードのチェックおよび権限チェック
         staff_code = data.get("staff_code")
@@ -271,7 +276,6 @@ class TransactionSerializer(BaseTransactionSerializer):
                         else:
                             # 正常な場合、承認情報をdataに付与してcreate側で利用する
                             data["user"] = approval.user
-                            data["_approval_instance"] = approval
                     except Approval.DoesNotExist:
                         errors["approval_number"] = "承認番号が存在しません。"
 
@@ -465,9 +469,17 @@ class TransactionSerializer(BaseTransactionSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
+        original_transaction = validated_data.pop("original_transaction", None)
         sale_products_data = validated_data.pop("sale_products", [])
         payments_data = validated_data.pop("payments", [])
-        original_transaction = validated_data.pop("original_transaction", None)
+        user = validated_data.pop("user", [])
+        staff_code = validated_data.pop("staff_code", None)
+        store_code = validated_data.pop("store_code", None)
+        status = validated_data.get("status")
+        terminal_id = validated_data.pop("terminal_id", None)
+        totals = validated_data.pop("_totals", None)
+        total_payments = sum(payment['amount'] for payment in payments_data)
+        approval = Approval.objects.get(approval_number=validated_data.pop("approval_number", None))
 
         # original_transaction が指定されている場合、欠落項目を補完
         if original_transaction:
@@ -479,13 +491,15 @@ class TransactionSerializer(BaseTransactionSerializer):
             else:
                 validated_data.setdefault("status", original_transaction.status)
 
-        store_code = validated_data.get("store_code")
-        totals = validated_data.pop("_totals", None)
-        total_payments = sum(payment['amount'] for payment in payments_data)
-
-        # 日付は常に現在時刻で設定
+        # 承認番号は内部処理用のため、コミット時に含めない
+        validated_data.pop("approval_number", None)
         validated_data["date"] = timezone.now()
         validated_data.update({
+            "status": status,
+            "user": user,
+            "terminal_id": terminal_id,
+            "staff_code": staff_code,
+            "store_code": store_code,
             "deposit": total_payments,
             "change": total_payments - totals["total_amount"],
             "total_quantity": totals["total_quantity"],
@@ -495,30 +509,25 @@ class TransactionSerializer(BaseTransactionSerializer):
             "discount_amount": totals["discount_amount"],
             "total_amount": totals["total_amount"]
         })
-
-        # トレーニング以外の場合はウォレット減算処理
-        if validated_data.get("status") != "training":
-            user = validated_data.get("user")
-            wallet_payments = [p for p in payments_data if p["payment_method"] == "wallet"]
-            if wallet_payments and user:
-                total_wallet_payment = sum(p["amount"] for p in wallet_payments)
-                user.wallet.withdraw(total_wallet_payment, transaction=None)
-
         transaction_instance = Transaction.objects.create(**validated_data)
         self._create_transaction_details(
             transaction_instance, sale_products_data, validated_data.get("status"), store_code
         )
         self._create_payments(transaction_instance, payments_data)
 
+        # トレーニング以外の場合はウォレット減算処理
+        if validated_data.get("status") != "training":
+            wallet_payments = [p for p in payments_data if p["payment_method"] == "wallet"]
+            if wallet_payments and user:
+                total_wallet_payment = sum(p["amount"] for p in wallet_payments)
+                user.wallet.withdraw(total_wallet_payment, transaction=transaction_instance)
+
         # 承認番号の使用済み更新（通常取引かつトレーニング以外の場合）
-        if not self.context.get("external_data", False) and validated_data.get("status") != "training":
-            approval = validated_data.pop("_approval_instance", None)
-            if approval:
-                approval.is_used = True
-                approval.save()
+        if validated_data.get("status") == "sale":
+            approval.is_used = True
+            approval.save()
 
         return transaction_instance
-
 
 
 class ReturnTransactionSerializer(BaseTransactionSerializer):
