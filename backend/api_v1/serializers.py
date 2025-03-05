@@ -605,10 +605,18 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
 
             # 各ケースでの支払い検証（変更せず）
             if net_amount > 0:
-            # 追加領収発生：既収金は (元取引合計 + 削除商品合計) とみなし、追加領収は (追加合計 - 既収金)
+                # 追加領収発生：既収金は (元取引合計 + 削除商品合計) とみなし、追加領収は (追加合計 - 既収金)
                 expected_additional = additional_total - delete_total
-                if abs(payments_sum - expected_additional) > 0.01:
-                    errors['payments'] = f"追加領収金の合計が不正です。必要値: {expected_additional}, 入力値: {payments_sum}"
+                # 現金の支払い合計を算出
+                cash_payments_total = sum(float(p.get('amount', 0)) for p in payments if p.get('payment_method') == 'cash')
+                if cash_payments_total > 0:
+                    # 現金が含まれる場合は、expected_additional 以上であればOK
+                    if payments_sum < expected_additional - 0.01:
+                        errors['payments'] = f"追加領収金が不足しています。必要最低値: {expected_additional}, 入力値: {payments_sum}"
+                else:
+                    # 現金が含まれない場合は、厳密な一致を要求
+                    if abs(payments_sum - expected_additional) > 0.01:
+                        errors['payments'] = f"追加領収金の合計が不正です。必要値: {expected_additional}, 入力値: {payments_sum}"
             elif net_amount < 0:
                 expected_refund = net_amount  # net_amount は負の値
                 if abs(payments_sum - expected_refund) > 0.01:
