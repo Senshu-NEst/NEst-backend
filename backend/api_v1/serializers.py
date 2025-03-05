@@ -472,24 +472,27 @@ class TransactionSerializer(BaseTransactionSerializer):
         original_transaction = validated_data.pop("original_transaction", None)
         sale_products_data = validated_data.pop("sale_products", [])
         payments_data = validated_data.pop("payments", [])
-        user = validated_data.pop("user", [])
         staff_code = validated_data.pop("staff_code", None)
         store_code = validated_data.pop("store_code", None)
         status = validated_data.get("status")
         terminal_id = validated_data.pop("terminal_id", None)
         totals = validated_data.pop("_totals", None)
+        
+        # 金券ルールに基づいた釣り銭計算
+        change_amount = self._calculate_change(payments_data, totals["total_amount"])
         total_payments = sum(payment['amount'] for payment in payments_data)
-        approval = Approval.objects.get(approval_number=validated_data.pop("approval_number", None))
 
         # original_transaction が指定されている場合、欠落項目を補完
         if original_transaction:
             # 修正会計の場合は、ユーザーを元取引から取得する
-            validated_data.setdefault("user", original_transaction.user)
+            user = original_transaction.user
             # external_data が True の場合は、ステータスを「再売」に設定
             if self.context.get("external_data", False):
                 validated_data["status"] = "resale"
             else:
                 validated_data.setdefault("status", original_transaction.status)
+        else:
+            user = validated_data.pop("user", [])
 
         # 承認番号は内部処理用のため、コミット時に含めない
         validated_data.pop("approval_number", None)
@@ -501,7 +504,7 @@ class TransactionSerializer(BaseTransactionSerializer):
             "staff_code": staff_code,
             "store_code": store_code,
             "deposit": total_payments,
-            "change": total_payments - totals["total_amount"],
+            "change": change_amount,  # 特殊な釣り銭計算結果を使用
             "total_quantity": totals["total_quantity"],
             "total_tax10": totals["total_tax10"],
             "total_tax8": totals["total_tax8"],
@@ -524,8 +527,14 @@ class TransactionSerializer(BaseTransactionSerializer):
 
         # 承認番号の使用済み更新（通常取引かつトレーニング以外の場合）
         if validated_data.get("status") == "sale":
-            approval.is_used = True
-            approval.save()
+            approval_number = validated_data.pop("approval_number", None)
+            if approval_number:
+                try:
+                    approval = Approval.objects.get(approval_number=approval_number)
+                    approval.is_used = True
+                    approval.save()
+                except Approval.DoesNotExist:
+                    pass
 
         return transaction_instance
 
