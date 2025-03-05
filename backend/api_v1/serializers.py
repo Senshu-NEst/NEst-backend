@@ -230,7 +230,7 @@ class TransactionSerializer(BaseTransactionSerializer):
     def validate(self, data):
         errors = {}
 
-        # ステータスのチェック：ReturnTransactionの場合は "resale" のみ、通常は "sale" と "training" のみ許可する
+    # ステータスのチェック：ReturnTransactionの場合は "resale" のみ、通常は "sale" と "training" のみ許可する
         status = data.get("status")
         if self.context.get("return_context", False):
             allowed_statuses = ["resale"]
@@ -240,7 +240,6 @@ class TransactionSerializer(BaseTransactionSerializer):
             errors["status"] = "無効なstatusが指定されました。"
 
         sale_products = data.get("sale_products")
-        print(sale_products)
         if not sale_products or len(sale_products) == 0:
             errors["sale_products"] = "少なくとも1つの商品を指定してください。"
 
@@ -265,7 +264,6 @@ class TransactionSerializer(BaseTransactionSerializer):
             if not approval_number:
                 errors["approval_number"] = "承認番号が入力されていません。"
             else:
-                # 形式チェック：8桁の数字かどうか
                 if not (len(approval_number) == 8 and approval_number.isdigit()):
                     errors["approval_number"] = "承認番号の形式に誤りがあります。数字8桁を入力してください。"
                 else:
@@ -274,7 +272,6 @@ class TransactionSerializer(BaseTransactionSerializer):
                         if status != "training" and approval.is_used:
                             errors["approval_number"] = "この承認番号は使用済みです。"
                         else:
-                            # 正常な場合、承認情報をdataに付与してcreate側で利用する
                             data["user"] = approval.user
                     except Approval.DoesNotExist:
                         errors["approval_number"] = "承認番号が存在しません。"
@@ -291,14 +288,56 @@ class TransactionSerializer(BaseTransactionSerializer):
             errors["sale_products_totals"] = e.detail
             totals = None
 
+        # 支払い金額のバリデーション（商品券は釣り銭が発行できないため、必要分のみ適用）
         if totals is not None:
-            total_payments = sum(payment['amount'] for payment in payments)
-            try:
-                self._validate_payments(total_payments, totals['total_amount'], payments)
-            except serializers.ValidationError as e:
-                errors["payments"] = e.detail
+            total_amount = totals['total_amount']
+            payment_totals = {
+                'cash': 0,
+                'voucher': 0,
+                'other': 0,    # 現金・金券以外（carryover は除外）
+            }
+            for payment in payments:
+                method = payment.get('payment_method')
+                amount = payment.get('amount', 0)
+                if method == 'cash':
+                    payment_totals['cash'] += amount
+                elif method == 'voucher':
+                    payment_totals['voucher'] += amount
+                elif method != 'carryover':
+                    payment_totals['other'] += amount
 
-            # トレーニング以外の場合はウォレット残高のチェック（withdrawはcreate側で実施）
+            provided_total = payment_totals['cash'] + payment_totals['voucher'] + payment_totals['other']
+            if provided_total < total_amount:
+                errors["payments"] = "支払いの合計金額が取引の合計金額を下回っています。"
+            # 金券と現金の合計が合計金額を超えていないかのチェック
+            cash_and_voucher_total = payment_totals['cash'] + payment_totals['voucher']
+            if cash_and_voucher_total > total_amount and payment_totals['other'] > 0:
+                errors["payments"] = "現金と金券を除く支払方法の総計が合計金額を超えています(金券充足)。"
+            # 現金と金券を除く支払方法の総計が合計金額を超えているかのチェック
+            if payment_totals['other'] > total_amount:
+                errors["payments"] = "現金と金券を除く支払方法の総計が合計金額を超えています(キャッシュレス超過)。"
+
+            # 支払い適用順序：金券 → その他 → 現金
+            remaining = total_amount
+
+            # 商品券（＝金券）は、必要な分のみ使用（超過分は change に含まれない）
+            used_voucher = min(payment_totals['voucher'], remaining)
+            remaining -= used_voucher
+
+            # エラー: 金券が提供されているのに全く使用されていない場合
+            if payment_totals['voucher'] > 0 and used_voucher == 0:
+                errors["payments"] = "金券での支払いが行われていません。"
+
+            used_other = min(payment_totals['other'], remaining)
+            remaining -= used_other
+
+            used_cash = min(payment_totals['cash'], remaining)
+            remaining -= used_cash
+
+            if remaining > 0:
+                errors["payments"] = "支払いの合計金額が取引の合計金額を下回っています。"
+
+            # トレーニング以外の場合はウォレット残高のチェック（withdraw は create 側で実施）
             if status != "training":
                 user = data.get("user")
                 wallet_payments = [p for p in payments if p['payment_method'] == 'wallet']
@@ -308,12 +347,49 @@ class TransactionSerializer(BaseTransactionSerializer):
                         shortage = total_wallet_payment - user.wallet.balance
                         errors["wallet"] = f"ウォレット残高不足。{int(shortage)}円分不足しています。"
 
+        # -------------------------------
         if errors:
             raise serializers.ValidationError(errors)
 
-        # 補助情報として計算結果をdataに付与
+        # 補助情報として計算結果を data に付与
         data["_totals"] = totals
         return data
+
+    def _calculate_change(self, payments_data, total_amount):
+        """
+        釣り銭を計算する。金券は額面以上使用し、釣りは出ないルールを適用。
+        """
+        payment_totals = {
+            'cash': 0,
+            'voucher': 0,
+            'other': 0,
+        }
+        
+        for payment in payments_data:
+            method = payment['payment_method']
+            amount = payment['amount']
+            
+            if method == 'cash':
+                payment_totals['cash'] += amount
+            elif method == 'voucher':
+                payment_totals['voucher'] += amount
+            elif method != 'carryover':
+                payment_totals['other'] += amount
+        
+        # キャッシュレス支払い（金券を除く）後の残額
+        remaining_amount = total_amount - payment_totals['other']
+        
+        # 金券があれば、その金額を差し引く
+        if payment_totals['voucher'] > 0:
+            # 金券で支払う額（金券は額面以上使用で釣り銭なし）
+            voucher_payment = min(payment_totals['voucher'], remaining_amount)
+            remaining_amount -= voucher_payment
+        
+        # 現金での支払い
+        cash_payment = min(payment_totals['cash'], remaining_amount)
+        cash_change = payment_totals['cash'] - cash_payment
+        
+        return cash_change
 
     def _aggregate_discount_errors(self, sale_products_data, store_code, permissions):
         discount_error_list = []
@@ -388,15 +464,6 @@ class TransactionSerializer(BaseTransactionSerializer):
             'discount_amount': total_discount_amount,
             'total_amount': total_amount
         }
-
-    def _validate_payments(self, total_payments, total_amount, payments_data):
-        if total_payments < total_amount:
-            raise serializers.ValidationError("支払いの合計金額が取引の合計金額を下回っています。")
-        total_cashless_amount = sum(
-            payment['amount'] for payment in payments_data if payment['payment_method'] not in ['cash', 'carryover']
-        )
-        if total_cashless_amount > total_amount:
-            raise serializers.ValidationError("現金以外の支払方法の総計が合計金額を超えています。")
 
     def _process_product(self, store_code, sale_product_data, status):
         product = self._get_product(sale_product_data["jan"])
