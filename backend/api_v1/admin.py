@@ -2,7 +2,7 @@ from django.contrib import admin
 from import_export import resources
 from import_export.admin import ImportExportModelAdmin
 from django import forms
-from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval, ReturnTransaction, ReturnDetail, ReturnPayment
+from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval, ReturnTransaction, ReturnDetail, ReturnPayment, Department
 from django.utils import timezone
 from rest_framework_simplejwt.token_blacklist.admin import BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin, OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
@@ -359,6 +359,51 @@ class BlacklistedTokenAdmin(DefaultBlacklistedTokenAdmin):
         expired_tokens.delete()
         self.message_user(request, f"{count} の期限切れのブラックリストトークンを削除しました。")
     delete_expired_blacklisted_tokens.short_description = "期限切れのブラックリストトークンを削除"
+
+
+class DepartmentAdminForm(forms.ModelForm):
+    class Meta:
+        model = Department
+        fields = '__all__'
+    
+    def __init__(self, *args, **kwargs):
+        super(DepartmentAdminForm, self).__init__(*args, **kwargs)
+        # level の値を取得して上位部門の queryset を絞る
+        if self.instance and self.instance.pk:
+            level = self.instance.level
+        else:
+            # POST データから level を取得（編集時以外）
+            level = self.data.get('level')
+        
+        if level == 'middle':
+            # 中分類の場合：親は大分類のみ
+            self.fields['parent'].queryset = Department.objects.filter(level='big')
+        elif level == 'small':
+            # 小分類の場合：親は中分類のみ
+            self.fields['parent'].queryset = Department.objects.filter(level='middle')
+        else:
+            # 大分類の場合は上位部門不要
+            self.fields['parent'].queryset = Department.objects.none()
+            self.fields['parent'].required = False
+
+
+@admin.register(Department)
+class DepartmentAdmin(admin.ModelAdmin):
+    form = DepartmentAdminForm
+    list_display = ('department_code', 'name', 'level', 'parent', 'tax_rate', 'tax_rate_mod_flag', 'discount_flag', 'accounting_flag')
+    list_filter = ('level', 'tax_rate', 'discount_flag', 'accounting_flag')
+    search_fields = ('code', 'name',)
+    ordering = ('level', 'parent__code', 'code')
+    fieldsets = (
+        (None, {
+            'fields': ('level', 'parent', 'code', 'name'),
+            'description': "※大分類の場合は、上位部門は不要です。中・小分類の場合は必ず上位部門を選択してください。"
+        }),
+        ('標準仕様設定', {
+            'fields': ('tax_rate', 'tax_rate_mod_flag', 'discount_flag', 'accounting_flag'),
+            'description': "標準消費税率は『上位部門引継』、0%、8%、10%から選択してください。税率が8%の場合のみ税率変更フラグが有効となります。各フラグは『上位部門引継』『許可』『禁止』から選択（デフォルトは『上位部門引継』）します。大分類では『上位部門引継』は選択できません。"
+        }),
+    )
 
 
 # 有効なトークンの管理

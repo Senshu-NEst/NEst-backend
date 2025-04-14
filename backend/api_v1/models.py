@@ -20,18 +20,19 @@ class BaseModel(models.Model):
         super().save(*args, **kwargs)
 
 
+TAX_CHOICES = (
+    (0.0, "0% - 免税"),
+    (8.0, "8% - 軽減"),
+    (10.0, "10% - 通常"),
+)
+
+
 class Product(BaseModel):
     """商品モデル"""
     class Status(models.TextChoices):
         IN_DEAL = "in_deal", "取引中"
         SPOT = "spot", "スポット"
         DISCON = "discon", "終売"
-
-    TAX_CHOICES = (
-        (0.0, "0% - 免税"),
-        (8.0, "8% - 軽減"),
-        (10.0, "10% - 通常"),
-    )
 
     jan = models.CharField(max_length=13, primary_key=True, verbose_name="JANコード")
     name = models.CharField(max_length=255, verbose_name="商品名")
@@ -530,3 +531,107 @@ class ReturnPayment(BaseModel):
 
     def __str__(self):
         return f"{self.payment_method} - {self.amount}"
+
+
+class Department(BaseModel):
+    """
+    部門管理モデル
+    ・分類レベルは "big"（大分類）、"middle"（中分類）、"small"（小分類）から選択する。
+    ・大分類の場合、parent は不要（必ず None）。中分類は親として大分類、小分類は親として中分類を選択する必要があり、
+    それぞれバリデーションでチェックする。
+    ・プロパティ department_code により、階層に応じた連結コード（例："15631"）を返す。
+    ・標準消費税率は、"上位部門引継"、"0%"、"8%"、"10%" の中から選択できる。
+    ・税率変更フラグ、値引フラグ、部門会計フラグは、「上位部門引継」「許可」「禁止」の３択（デフォルトは「上位部門引継」）となるが、
+    大分類の場合は「上位部門引継」を選択できない（選択するとエラー）。
+    """
+    LEVEL_CHOICES = (
+        ('big', '大分類'),
+        ('middle', '中分類'),
+        ('small', '小分類'),
+    )
+    DEPART_TAX_CHOICES = (
+        ('inherit', '上位部門引継'),
+        ('0', '0%'),
+        ('8', '8%'),
+        ('10', '10%'),
+    )
+
+    FLAG_CHOICES = (
+        ('inherit', '上位部門引継'),
+        ('allow', '許可'),
+        ('deny', '禁止'),
+    )
+    level = models.CharField(max_length=6, choices=LEVEL_CHOICES, verbose_name="分類レベル")
+    code = models.CharField(max_length=2, verbose_name="分類コード")
+    name = models.CharField(max_length=100, verbose_name="分類名称")
+    parent = models.ForeignKey(
+        'self',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='sub_departments',
+        verbose_name="上位部門"
+    )
+    tax_rate = models.CharField(
+        max_length=7, choices=DEPART_TAX_CHOICES, default='inherit', verbose_name="標準消費税率"
+    )
+    tax_rate_mod_flag = models.CharField(
+        max_length=7, choices=FLAG_CHOICES, default='inherit', verbose_name="税率変更フラグ"
+    )
+    discount_flag = models.CharField(
+        max_length=7, choices=FLAG_CHOICES, default='inherit', verbose_name="値引フラグ"
+    )
+    accounting_flag = models.CharField(
+        max_length=7, choices=FLAG_CHOICES, default='inherit', verbose_name="部門会計フラグ"
+    )
+    
+    class Meta:
+        verbose_name = "部門"
+        verbose_name_plural = "部門一覧"
+        unique_together = (('parent', 'code'),)
+    
+    def __str__(self):
+        return f"{self.department_code} - {self.name}"
+    
+    def get_department_code(self):
+        """
+        連結した部門コードを返す
+        ・大分類の場合：そのまま code を返す
+        ・中分類の場合：親（大分類）の code と自分の code を連結
+        ・小分類の場合：親の親（大分類）の code、親（中分類）の code、自分の code を連結
+        """
+        if self.level == 'big':
+            return self.code
+        elif self.level == 'middle' and self.parent:
+            return f"{self.parent.code}{self.code}"
+        elif self.level == 'small' and self.parent and self.parent.parent:
+            return f"{self.parent.parent.code}{self.parent.code}{self.code}"
+        return self.code  # 万が一のフォールバック
+
+    department_code = property(get_department_code)
+    
+    def clean(self):
+        # 上位部門の必須性と階層チェック
+        if self.level in ['middle', 'small'] and not self.parent:
+            raise ValidationError("中分類・小分類の場合、上位部門の選択は必須です。")
+        if self.level == 'big' and self.parent is not None:
+            raise ValidationError("大分類の場合、上位部門は設定できません。")
+        if self.level == 'middle':
+            if self.parent.level != 'big':
+                raise ValidationError("中分類の上位部門は大分類である必要があります。")
+        if self.level == 'small':
+            if self.parent.level != 'middle':
+                raise ValidationError("小分類の上位部門は中分類である必要があります。")
+        
+        # 大分類の場合、標準仕様の各フラグは「上位部門引継」は選択できない
+        if self.level == 'big':
+            if self.tax_rate == 'inherit':
+                raise ValidationError("大分類の場合、標準消費税率は『上位部門引継』を選択できません。")
+            if self.tax_rate_mod_flag == 'inherit':
+                raise ValidationError("大分類の場合、税率変更フラグは『上位部門引継』を選択できません。")
+            if self.discount_flag == 'inherit':
+                raise ValidationError("大分類の場合、値引フラグは『上位部門引継』を選択できません。")
+            if self.accounting_flag == 'inherit':
+                raise ValidationError("大分類の場合、部門会計フラグは『上位部門引継』を選択できません。")
+        
+        super().clean()
