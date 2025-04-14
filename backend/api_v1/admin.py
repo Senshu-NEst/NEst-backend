@@ -67,11 +67,16 @@ class VariationDetailInline(admin.TabularInline):
 @admin.register(Product)
 class ProductAdmin(ImportExportModelAdmin):
     resource_class = ProductResource
-    list_display = ("jan", "name", "price", "tax", "status")
-    fields = ("jan", "name", ("price", "tax"), "status", ("disable_change_tax", "disable_change_price"))
+    list_display = ("jan", "department_code__name", "name", "price", "tax", "status")
+    fields = ("jan","department_code", "name", ("price", "tax"), "status", ("disable_change_tax", "disable_change_price"))
     search_fields = ("name", "jan")
     list_filter = ("status", "tax")
     inlines = [StockInline]
+    
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name == "department_code":
+            kwargs["queryset"] = Department.objects.filter(level='small')  # 小分類のみ
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
 
 @admin.register(ProductVariation)

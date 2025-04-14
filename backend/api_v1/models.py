@@ -41,6 +41,16 @@ class Product(BaseModel):
     status = models.CharField(max_length=50, choices=Status.choices, default=Status.IN_DEAL, verbose_name="取引状態")
     disable_change_tax = models.BooleanField(default=False, verbose_name="POSでの税率変更を禁止")
     disable_change_price = models.BooleanField(default=False, verbose_name="POSでの価格変更を禁止")
+    
+    # 部門コードの追加
+    department_code = models.ForeignKey(
+        'Department',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        limit_choices_to={'level': 'small'},  # 小分類のみを選択肢にする
+        verbose_name="部門コード"
+    )
 
     class Meta:
         verbose_name = "商品"
@@ -231,7 +241,7 @@ class Transaction(BaseModel):
 class TransactionDetail(BaseModel):
     """取引商品モデル(中間テーブル)"""
     transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name="sale_products", verbose_name="取引番号")
-    jan = models.ForeignKey(Product, on_delete=models.CASCADE, verbose_name="JANコード")
+    jan = models.CharField(max_length=13, verbose_name="JANコード")  # 部門打ちのため外部キー制約を解除
     name = models.CharField(max_length=255, verbose_name="商品名")
     price = models.IntegerField(verbose_name="商品価格")
     tax = models.DecimalField(max_digits=3, decimal_places=1, verbose_name="消費税率")
@@ -555,7 +565,6 @@ class Department(BaseModel):
         ('8', '8%'),
         ('10', '10%'),
     )
-
     FLAG_CHOICES = (
         ('inherit', '上位部門引継'),
         ('allow', '許可'),
@@ -591,25 +600,52 @@ class Department(BaseModel):
         unique_together = (('parent', 'code'),)
     
     def __str__(self):
-        return f"{self.department_code} - {self.name}"
-    
+        if self.level == 'big':
+            return f'{self.department_code} - {self.name}'
+        elif self.level == 'middle':
+            return f'{self.department_code} - {self.name}'
+        elif self.level == 'small' and self.parent:
+            return f'{self.department_code} - {self.parent.parent.name}_{self.parent.name}_{self.name}'
+        return self.name
+
     def get_department_code(self):
-        """
-        連結した部門コードを返す
-        ・大分類の場合：そのまま code を返す
-        ・中分類の場合：親（大分類）の code と自分の code を連結
-        ・小分類の場合：親の親（大分類）の code、親（中分類）の code、自分の code を連結
-        """
+        """連結した部門コードを返す"""
         if self.level == 'big':
             return self.code
         elif self.level == 'middle' and self.parent:
             return f"{self.parent.code}{self.code}"
         elif self.level == 'small' and self.parent and self.parent.parent:
             return f"{self.parent.parent.code}{self.parent.code}{self.code}"
-        return self.code  # 万が一のフォールバック
+        return self.code
 
     department_code = property(get_department_code)
-    
+
+    def _get_flag_value(self, flag_field):
+        """
+        指定されたフラグフィールドの値を取得する。
+        上位部門引継が指定されている場合は、親のフラグ値を再帰的に取得する。
+        """
+        flag_value = getattr(self, flag_field)
+        if flag_value == 'inherit' and self.parent:
+            return self.parent._get_flag_value(flag_field)  # 親のフラグ値を取得する
+        return flag_value
+
+    def get_tax_rate(self):
+        """税率を取得する。"""
+        return self._get_flag_value('tax_rate')
+
+    def get_tax_rate_mod_flag(self):
+        """税率変更フラグを取得する。"""
+        return self._get_flag_value('tax_rate_mod_flag')
+
+    def get_discount_flag(self):
+        """値引フラグを取得する。"""
+        return self._get_flag_value('discount_flag')
+
+    def get_accounting_flag(self):
+        """部門会計フラグを取得する。"""
+        return self._get_flag_value('accounting_flag')
+
     def clean(self):
         # 上位部門の必須性と階層チェック
         if self.level in ['middle', 'small'] and not self.parent:
@@ -633,5 +669,5 @@ class Department(BaseModel):
                 raise ValidationError("大分類の場合、値引フラグは『上位部門引継』を選択できません。")
             if self.accounting_flag == 'inherit':
                 raise ValidationError("大分類の場合、部門会計フラグは『上位部門引継』を選択できません。")
-        
+
         super().clean()
