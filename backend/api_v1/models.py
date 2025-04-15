@@ -481,10 +481,11 @@ class ReturnTransaction(BaseModel):
     """
     RETURN_TYPE_CHOICES = (
         ('all', '全返品'),
-        ('partial', '一部返品')
+        ('partial', '一部返品'),
+        ('payment_change', '支払変更')
     )
     modify_id = models.ForeignKey(Transaction, on_delete=models.CASCADE, blank=True, null=True, verbose_name="再売取引")
-    return_type = models.CharField(max_length=10, choices=RETURN_TYPE_CHOICES, verbose_name="返品種別")
+    return_type = models.CharField(max_length=15, choices=RETURN_TYPE_CHOICES, verbose_name="返品種別")
     origin_transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name='return_transactions', verbose_name="元取引")
     return_date = models.DateTimeField(auto_now_add=True, verbose_name="返品日時")
     reason = models.TextField(verbose_name="返品理由")
@@ -508,7 +509,7 @@ class ReturnDetail(BaseModel):
     TransactionDetailと同じ項目を保持することで、返品時に元の取引内容を正確に記録できる。
     """
     return_transaction = models.ForeignKey(ReturnTransaction, on_delete=models.CASCADE, related_name='return_details', verbose_name="返品取引")
-    jan = models.ForeignKey(Product, on_delete=models.CASCADE, verbose_name="JANコード")
+    jan = models.CharField(max_length=13, verbose_name="JANコード")  # 部門打ちのため外部キー制約を解除
     name = models.CharField(max_length=255, verbose_name="商品名")
     price = models.IntegerField(verbose_name="商品価格")
     tax = models.DecimalField(max_digits=3, decimal_places=1, verbose_name="消費税率")
