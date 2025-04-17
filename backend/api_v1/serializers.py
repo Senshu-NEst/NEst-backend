@@ -2,7 +2,7 @@ from rest_framework import serializers
 from django.utils import timezone
 from django.db import transaction
 from rest_framework.fields import empty
-from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, WalletTransaction, Wallet, Approval, Store, ReturnTransaction, ReturnDetail, ReturnPayment
+from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, WalletTransaction, Wallet, Approval, Store, ReturnTransaction, ReturnDetail, ReturnPayment, Department
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 
@@ -176,43 +176,35 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
         JANは"999"+該当部門の連結コードに再設定する。
         """
         jan = data.get("jan")
-        
-        # JANが文字列で8桁かつ先頭が "999" の場合は部門打ちとして処理
+        price = data.get("price")
+        quantity = data.get("quantity")
+        discount = data.get("discount", 0) or 0
+
+        # 共通バリデーション: 数量と割引
+        if quantity is None:
+            raise serializers.ValidationError({"quantity": "数量は必須項目です。"})
+        if price is not None and discount > price:
+            raise serializers.ValidationError({"discount": "不正な割引額が入力されました。"})
+
+        # 部門打ち処理
         if isinstance(jan, str) and len(jan) == 8 and jan.startswith("999"):
             data["_is_department"] = True
-            
-            # 価格と数量は必須
-            if data.get("price") is None:
-                raise serializers.ValidationError({"price": "部門打ちの場合、価格は必須項目です。"})
-            if data.get("quantity") is None:
-                raise serializers.ValidationError({"quantity": "部門打ちの場合、数量は必須項目です。"})
-            
-            # 税率の処理
-            if data.get("tax") in (None, ""):
-                data["tax"] = 8
-            else:
-                try:
-                    data["tax"] = int(data["tax"])
-                except (ValueError, TypeError):
-                    raise serializers.ValidationError({"tax": "税率は整数値で指定してください。"})
-            if data["tax"] not in (0, 8, 10):
-                raise serializers.ValidationError({"tax": "税率は0%、8%、10%のいずれかでなければなりません。"})
-            
-            data["discount"] = data.get("discount") or 0
 
-            # JANは "999"＋5桁の部門コードでなければならない
+            # price必須チェック（部門打ち時）
+            if price is None:
+                raise serializers.ValidationError({"price": "部門打ちの場合、価格は必須項目です。"})
+
+            # 部門コード分解
             dept_code = jan[3:]
             if len(dept_code) != 5:
                 raise serializers.ValidationError({
                     "jan": "部門打ちの場合、JANコードは '999' + 5桁の部門コードでなければなりません。"
                 })
-            
             big_code = dept_code[0]
             middle_code = dept_code[1:3]
             small_code = dept_code[3:]
-            
+
             try:
-                from .models import Department
                 dept = Department.objects.get(
                     level="small",
                     code=small_code,
@@ -224,56 +216,67 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
                     "jan": f"指定された部門コード {dept_code} に一致する部門が存在しません。"
                 })
 
-            # ここで部門会計フラグのチェック
+            # 会計フラグ
             if dept.get_accounting_flag() != "allow":
                 raise serializers.ValidationError({"jan": "指定された部門では部門打ちが許可されていません。"})
 
-            # 税率変更フラグのチェック
-            dept_standard_tax = dept.get_tax_rate()  # 再帰的に上位部門の税率を取得
-            if data["tax"] != int(dept_standard_tax):
-                if dept.get_tax_rate_mod_flag() != "allow":
-                    raise serializers.ValidationError({"tax": "この部門では税率変更が許可されていません。"})
+            # dept マスタの税率取得
+            dept_standard_tax = int(dept.get_tax_rate())
+            input_tax = data.get("tax")
 
-            # 値引のチェック
-            discount = data.get("discount", 0)
+            # 入力税率があれば検証
+            if input_tax in (None, ""):
+                tax_to_apply = dept_standard_tax
+            else:
+                try:
+                    input_tax = int(input_tax)
+                except (ValueError, TypeError):
+                    raise serializers.ValidationError({"tax": "税率は整数値で指定してください。"})
+                tax_to_apply = input_tax
+
+            # 税率変更フラグチェック
+            if tax_to_apply != dept_standard_tax and dept.get_tax_rate_mod_flag() != "allow":
+                raise serializers.ValidationError({"tax": "この部門では税率変更が許可されていません。"})
+
+            data["tax"] = tax_to_apply
+
+            # 値引きフラグ
             if discount > 0 and dept.get_discount_flag() != "allow":
                 raise serializers.ValidationError({"discount": "この部門では割引が許可されていません。"})
-
-            if discount > data.get("price"):
-                raise serializers.ValidationError({"discount": "不正な割引額が入力されました。"})
-            
 
             # 部門打ちの場合、商品名は部門の小分類の名称を設定する
             data["name"] = dept.name
             data["_department_name"] = dept.name
-            # JANは再設定： "999"＋部門連結コード
             data["jan"] = "999" + dept.department_code
+
             return data
-        else:
-            # 通常商品の場合の検証
-            try:
-                from .models import Product
-                product = Product.objects.get(jan=jan)
-            except Product.DoesNotExist:
-                raise serializers.ValidationError({"jan": f"JANコード {jan} は登録されていません。"})
-            
-            if data.get("original_product", False):
-                if data.get("price") is None:
-                    raise serializers.ValidationError({"price": "元取引から引き継いだ商品のpriceは必須です。"})
-                if data.get("tax") is None:
-                    raise serializers.ValidationError({"tax": "元取引から引き継いだ商品のtaxは必須です。"})
-                data["discount"] = data.get("discount") or 0
-                return data
-            
-            specified_tax_rate = data.get("tax")
-            try:
-                applied_tax_rate = TaxRateManager.get_applied_tax(product, specified_tax_rate)
-            except serializers.ValidationError as e:
-                raise serializers.ValidationError({"tax": e.detail if hasattr(e, "detail") else str(e)})
-            
-            data["tax"] = applied_tax_rate
-            data["discount"] = data.get("discount") or 0
+
+        # 通常商品処理
+        try:
+            product = Product.objects.get(jan=jan)
+        except Product.DoesNotExist:
+            raise serializers.ValidationError({"jan": f"JANコード {jan} は登録されていません。"})
+
+        # 継承商品
+        if data.get("original_product", False):
+            if price is None:
+                raise serializers.ValidationError({"price": "元取引から引き継いだ商品のpriceは必須です。"})
+            if data.get("tax") is None:
+                raise serializers.ValidationError({"tax": "元取引から引き継いだ商品のtaxは必須です。"})
+            data["tax"] = int(data.get("tax"))
+            data["discount"] = discount
             return data
+
+        # 新規商品
+        specified_tax = data.get("tax")
+        try:
+            applied_tax = TaxRateManager.get_applied_tax(product, specified_tax)
+        except serializers.ValidationError as e:
+            raise serializers.ValidationError({"tax": e.detail if hasattr(e, "detail") else str(e)})
+
+        data["tax"] = applied_tax
+        data["discount"] = discount
+        return data
 
 
 class TransactionSerializer(BaseTransactionSerializer):
@@ -305,7 +308,7 @@ class TransactionSerializer(BaseTransactionSerializer):
     def validate(self, data):
         errors = {}
 
-    # ステータスのチェック：ReturnTransactionの場合は "resale" のみ、通常は "sale" と "training" のみ許可する
+        # ステータスのチェック：ReturnTransactionの場合は "resale" のみ、通常は "sale" と "training" のみ許可する
         status = data.get("status")
         if self.context.get("return_context", False):
             allowed_statuses = ["resale"]
@@ -363,15 +366,14 @@ class TransactionSerializer(BaseTransactionSerializer):
             errors["sale_products_totals"] = e.detail
             totals = None
 
-        # 支払い金額のバリデーション（商品券は釣り銭が発行できないため、必要分のみ適用）
         if totals is not None:
             total_amount = totals['total_amount']
+            # 各支払い方法（現金、金券、キャッシュレス）毎に合計額を算出
             payment_totals = {
                 'cash': 0,
-                'voucher': 0,
-                'other': 0,    # 現金・金券以外（carryover は除外）
+                'voucher': 0,  # 金券
+                'other': 0,    # キャッシュレス（例: card, wallet, qr など）
             }
-            print(payments)
             for payment in payments:
                 method = payment.get('payment_method')
                 amount = payment.get('amount', 0)
@@ -379,41 +381,20 @@ class TransactionSerializer(BaseTransactionSerializer):
                     payment_totals['cash'] += amount
                 elif method == 'voucher':
                     payment_totals['voucher'] += amount
-                else:
+                elif method != 'carryover':  # 引継支払は除外
                     payment_totals['other'] += amount
 
-            provided_total = payment_totals['cash'] + payment_totals['voucher'] + payment_totals['other']
-            if provided_total < total_amount:
-                errors["payments"] = "支払いの合計金額が取引の合計金額を下回っています!!。"
-            # 金券と現金の合計が合計金額を超えていないかのチェック
-            cash_and_voucher_total = payment_totals['cash'] + payment_totals['voucher']
-            if cash_and_voucher_total > total_amount and payment_totals['other'] > 0:
-                errors["payments"] = "現金と金券を除く支払方法の総計が合計金額を超えています(金券充足)。"
-            # 現金と金券を除く支払方法の総計が合計金額を超えているかのチェック
-            if payment_totals['other'] > total_amount:
-                print(payment_totals['other'])
-                print(total_amount)
-                errors["payments"] = "現金と金券を除く支払方法の総計が合計金額を超えています(キャッシュレス超過)。"
+            # 金券は合計金額まで有効。超過分は無視する。
+            effective_voucher = min(payment_totals['voucher'], total_amount)
 
-            # 支払い適用順序：金券 → その他 → 現金
-            remaining = total_amount
+            # キャッシュレス決済は、金券使用後の残り金額を超えての支払いは禁止
+            if payment_totals['other'] > (total_amount - effective_voucher):
+                errors["payments"] = "キャッシュレス決済が必要額を超えています。"
 
-            # 商品券（＝金券）は、必要な分のみ使用（超過分は change に含まれない）
-            used_voucher = min(payment_totals['voucher'], remaining)
-            remaining -= used_voucher
-
-            # エラー: 金券が提供されているのに全く使用されていない場合
-            if payment_totals['voucher'] > 0 and used_voucher == 0:
-                errors["payments"] = "金券での支払いが行われていません。"
-
-            used_other = min(payment_totals['other'], remaining)
-            remaining -= used_other
-
-            used_cash = min(payment_totals['cash'], remaining)
-            remaining -= used_cash
-
-            if remaining > 0:
-                errors["payments"] = "支払いの合計金額が取引の合計金額を下回っています!。"
+            # 現金は、過不足なく支払いに利用される。（過剰な現金はお釣りとして返却される）
+            # 支払い全体の有効合計が不足している場合のみエラーとする
+            if (effective_voucher + payment_totals['other'] + payment_totals['cash']) < total_amount:
+                errors["payments"] = "支払いの合計金額が不足しています。"
 
             # トレーニング以外の場合はウォレット残高のチェック（withdraw は create 側で実施）
             if status != "training":
@@ -425,7 +406,6 @@ class TransactionSerializer(BaseTransactionSerializer):
                         shortage = total_wallet_payment - user.wallet.balance
                         errors["wallet"] = f"ウォレット残高不足。{int(shortage)}円分不足しています。"
 
-        # -------------------------------
         if errors:
             raise serializers.ValidationError(errors)
 
@@ -435,34 +415,34 @@ class TransactionSerializer(BaseTransactionSerializer):
 
     def _calculate_change(self, payments_data, total_amount):
         """
-        釣り銭を計算する。金券は額面以上使用し、釣りは出ないルールを適用。
+        釣り銭の計算：
+        - 金券 (voucher) は必要額まで使用。超過分は無視（釣り銭にはならない）
+        - キャッシュレス (other) も必要額内でのみ支払いを受け付け（釣り銭は発生しない）
+        - 現金 (cash) は、残りの金額分に対して充当。過剰分が釣り銭として返却される
         """
         payment_totals = {'cash': 0, 'voucher': 0, 'other': 0}
         for payment in payments_data:
             method = payment['payment_method']
             amount = payment['amount']
-            
             if method == 'cash':
                 payment_totals['cash'] += amount
             elif method == 'voucher':
                 payment_totals['voucher'] += amount
             elif method != 'carryover':
                 payment_totals['other'] += amount
-        
-        # キャッシュレス支払い（金券を除く）後の残額
-        remaining_amount = total_amount - payment_totals['other']
-        
-        # 金券があれば、その金額を差し引く
-        if payment_totals['voucher'] > 0:
-            # 金券で支払う額（金券は額面以上使用で釣り銭なし）
-            voucher_payment = min(payment_totals['voucher'], remaining_amount)
-            remaining_amount -= voucher_payment
-        
-        # 現金での支払い
-        cash_payment = min(payment_totals['cash'], remaining_amount)
-        cash_change = payment_totals['cash'] - cash_payment
-        
-        return cash_change
+
+        effective_voucher = min(payment_totals['voucher'], total_amount)
+        remaining = total_amount - effective_voucher
+
+        used_other = min(payment_totals['other'], remaining)
+        remaining -= used_other
+
+        # 現金で支払うべき残り額
+        required_cash = remaining
+        used_cash = min(payment_totals['cash'], required_cash)
+        change = payment_totals['cash'] - used_cash
+
+        return change
 
     def _aggregate_discount_errors(self, sale_products_data, store_code, permissions):
         discount_error_list = []
