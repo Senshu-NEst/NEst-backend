@@ -1060,15 +1060,12 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         return_type = validated_data.pop('return_type')
         original_transaction = validated_data['origin_transaction']
 
-        # 2. 元取引を「返品」ステータスに更新
+        # 2. 元取引ステータス更新
         original_transaction.status = 'return'
         original_transaction.save()
 
         # 3. 返品先店舗を取得（存在しなければ ValidationError）
-        try:
-            store_instance = Store.objects.get(store_code=validated_data.pop('store_code'))
-        except Store.DoesNotExist:
-            raise serializers.ValidationError({"store_code": "指定された店舗コードは存在しません。"})
+        store = validated_data.pop('store_code')
 
         # 4. ReturnTransaction を作成
         return_transaction = ReturnTransaction.objects.create(
@@ -1077,66 +1074,53 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
             return_type=return_type,
             reason=validated_data.get('reason'),
             restock=validated_data.get('restock'),
-            store_code=store_instance,
+            store_code=store, # バリデーションでインスタンスに変換済
             terminal_id=validated_data['terminal_id']
         )
 
         # 5. 支払いを返金／新規支払いに分け、返金分だけ処理
-        payments_input = validated_data.get('payments', [])
+        payments = validated_data.get('payments', [])
         if return_type == 'payment_change':
-            refund_payments = [p for p in payments_input if float(p['amount']) < 0]
-            new_payments = [p for p in payments_input if float(p['amount']) > 0]
-            if not new_payments:
-                raise serializers.ValidationError({"payments": "支払い変更の場合、新規支払い（正の金額）が少なくとも1件必要です。"})
-            self._process_payments(return_transaction, original_transaction, refund_payments)
+            refunds = [p for p in payments if float(p['amount']) < 0]
+            new_payments = [p for p in payments if float(p['amount']) > 0]
+            self._process_payments(return_transaction, original_transaction, refunds)
             correction_payments = new_payments
         else:
-            # 全返品／一部返品とも、入力されたすべてを処理
-            self._process_payments(return_transaction, original_transaction, payments_input)
+            self._process_payments(return_transaction, original_transaction, payments)
             correction_payments = None
 
-        # 6. 明細処理
-        if return_type in ['payment_change', 'all']:
-            # 在庫変動なしに全明細コピー
+        # 6. 明細作成
+        if return_type in ['all', 'payment_change']:
+            # 在庫変動させずにコピー
             self._copy_sale_products(original_transaction, return_transaction)
         elif return_type == 'partial':
-            # delete_items に応じた返品明細
             self._process_partial_return(validated_data, return_transaction, original_transaction)
 
-        # 7. restock=True の場合は返品先店舗に在庫を戻す（一部返品は delete_items のみ）
-        if validated_data.get('restock', False):
+        # 7. 在庫戻し（payment_change ではスキップ）
+        if return_transaction.restock and return_type != 'payment_change':
             self._restock_inventory(return_transaction)
 
         # 8. 修正取引（resale）の作成と modify_id への紐付け
-        correction_transaction = None
+        correction_payments = None
         if return_type == 'payment_change':
-            correction_transaction = self._create_new_transaction_for_payment_change(
-                original_transaction,
-                return_transaction,
-                correction_payments
+            correction_payments = self._create_new_transaction_for_payment_change(
+                original_transaction, return_transaction, correction_payments
             )
-            return_transaction.modify_id = correction_transaction
-            return_transaction.save()
         elif return_type == 'partial':
             additional_items = validated_data.get('additional_items', [])
             delete_items = validated_data.get('delete_items', [])
-            _, _, net_amount = self._compute_additional_delete_totals(
-                additional_items, delete_items, original_transaction
+            _, _, net_amount = self._compute_additional_delete_totals(additional_items, delete_items, original_transaction)
+            refund_amt = abs(net_amount) if net_amount < 0 else 0
+            carryover_amount = original_transaction.deposit - refund_amt
+            correction_payments = self._create_new_transaction(
+                original_transaction, additional_items, delete_items, [{'payment_method': 'carryover', 'amount': carryover_amount}]
             )
-            refund_amount = abs(net_amount) if net_amount < 0 else 0
-            carryover_amount = original_transaction.deposit - refund_amount
-            correction_payments = [{'payment_method': 'carryover', 'amount': carryover_amount}]
-            correction_transaction = self._create_new_transaction(
-                original_transaction,
-                additional_items,
-                delete_items,
-                correction_payments
-            )
-            return_transaction.modify_id = correction_transaction
+        if correction_payments:
+            return_transaction.modify_id = correction_payments
             return_transaction.save()
 
-        # 9. relation_return_id の紐付け（元取引・修正取引 ← 返品取引）
-        self._link_relation_return_ids(return_transaction, original_transaction, correction_transaction)
+        # 9. relation_return_id の紐付け（対象：元取引・修正取引）
+        self._link_relation_return_ids(return_transaction, original_transaction, correction_payments)
 
         return return_transaction
 
