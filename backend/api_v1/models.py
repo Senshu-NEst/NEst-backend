@@ -1,4 +1,6 @@
 import ulid
+from django.utils import timezone
+from datetime import timedelta, date
 from django.db import models, transaction
 from django.contrib.auth.models import BaseUserManager, AbstractBaseUser, PermissionsMixin
 from django.core.exceptions import ValidationError
@@ -155,6 +157,10 @@ class ProductVariation(models.Model):
     name = models.CharField(max_length=50, verbose_name="代表商品名")
     products = models.ManyToManyField(Product, through='ProductVariationDetail', related_name='variations')
 
+    class Meta:
+        verbose_name = "商品バリエーション"
+        verbose_name_plural = "商品バリエーション一覧"
+
     def save(self, *args, **kwargs):
         if not self.instore_jan:
             self.instore_jan = generate_unique_instore_jan(ProductVariation.objects.values_list('instore_jan', flat=True))
@@ -250,7 +256,7 @@ class TransactionDetail(BaseModel):
     quantity = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="購入点数")
 
     class Meta:
-        #unique_together = ("transaction", "jan", "tax", "discount")  # 1取引に同じ商品が存在しないことを保証
+        # unique_together = ("transaction", "jan", "tax", "discount")  # 1取引に同じ商品が存在しないことを保証
         constraints = [models.UniqueConstraint(fields=["transaction", "price", "jan", "tax", "discount"], name='TransactionDetail_unique_constraint')]
         verbose_name = "明細"
         verbose_name_plural = "取引詳細一覧"
@@ -506,7 +512,7 @@ class ReturnTransaction(BaseModel):
 class ReturnDetail(BaseModel):
     """
     返品明細モデル
-    ・元の取引明細（TransactionDetail）の内容をそのまま記録する。  
+    ・元の取引明細（TransactionDetail）の内容をそのまま記録する。 
     TransactionDetailと同じ項目を保持することで、返品時に元の取引内容を正確に記録できる。
     """
     return_transaction = models.ForeignKey(ReturnTransaction, on_delete=models.CASCADE, related_name='return_details', verbose_name="返品取引")
@@ -533,7 +539,7 @@ class ReturnPayment(BaseModel):
     """
     REFUND_PAYMENT_METHOD_CHOICES = Payment.PAYMENT_METHOD_CHOICES
 
-    return_transaction = models.ForeignKey (ReturnTransaction, on_delete=models.CASCADE, related_name='return_payments', verbose_name="返品返金支払")
+    return_transaction = models.ForeignKey(ReturnTransaction, on_delete=models.CASCADE, related_name='return_payments', verbose_name="返品返金支払")
     payment_method = models.CharField(max_length=50, choices=REFUND_PAYMENT_METHOD_CHOICES, verbose_name="返金支払方法")
     amount = models.IntegerField(verbose_name="返金金額")
 
@@ -673,3 +679,72 @@ class Department(BaseModel):
                 raise ValidationError("大分類の場合、部門会計フラグは『上位部門引継』を選択できません。")
 
         super().clean()
+
+
+def default_expiration_date() -> date:
+    # 今日の日付（date）ベースで +730日
+    return timezone.localdate() + timedelta(days=730)
+
+
+class POSA(BaseModel):
+    POSA_STATUS = (
+        ('created', 'POS未通過'),
+        ('salled', 'POS通過'),
+        ('activated', 'アクティベーション済'),
+        ('charged', 'チャージ済'),
+        ('BF_disabled', '無効（販売前）'),
+        ('AF_disabled', '無効（販売済）'),
+    )
+    POSA_TYPE = (
+        ('wallet_gift', 'ウォレットギフトカード'),
+    )
+
+    # --- ステータス別必須フィールド定義 ---
+    # created, BF_disabled の場合は buyer, relative_transaction 不要
+    REQUIRE_BUYER_AND_TXN = {status for status, _ in POSA_STATUS}
+    REQUIRE_BUYER_AND_TXN -= {'created', 'BF_disabled'}
+
+    # created, BF_disabled, salled の場合は user 不要
+    REQUIRE_USER = REQUIRE_BUYER_AND_TXN - {'salled'}
+    code = models.CharField(max_length=20, primary_key=True, verbose_name="POSAコード")
+    posa_type = models.CharField(max_length=20, choices=POSA_TYPE, verbose_name="POSA種別")
+    status = models.CharField(max_length=20, choices=POSA_STATUS, verbose_name="状態")
+    is_variable = models.BooleanField(default=False, verbose_name="バリアブルカード")
+    card_value = models.IntegerField(validators=[MinValueValidator(0)], null=True, blank=True, verbose_name="カード金額")
+    expiration_date = models.DateField(verbose_name="有効期限", default=default_expiration_date)
+    buyer = models.ForeignKey(CustomUser, on_delete=models.CASCADE, related_name='posa_buyer', verbose_name="購入者", null=True, blank=True)
+    relative_transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name='posa_transaction', verbose_name="取引", null=True, blank=True)
+    user = models.ForeignKey(CustomUser, on_delete=models.CASCADE, related_name='posa_user', verbose_name="使用者", null=True, blank=True)
+
+    class Meta:
+        verbose_name = "POSA"
+        verbose_name_plural = "POSA一覧"
+
+    def __str__(self):
+        return f"POSAコード: {self.code} - ステータス: {self.status} - 金額: {self.card_value}"
+
+    def clean(self):
+        super().clean()
+
+        # 1) 有効期限は date 同士で比較
+        today = timezone.localdate()
+        if self.expiration_date < today:
+            raise ValidationError({"expiration_date": "有効期限は過去の日付に設定できません。"})
+
+        # 2) buyer／relative_transaction の必須チェック
+        if self.status in self.REQUIRE_BUYER_AND_TXN:
+            if not self.buyer:
+                raise ValidationError({"buyer": "このステータスでは購入者の指定が必須です。"})
+            if not self.relative_transaction:
+                raise ValidationError({"relative_transaction": "このステータスでは取引の指定が必須です。"})
+
+        # 3) user の必須チェック
+        if self.status in self.REQUIRE_USER and not self.user:
+            raise ValidationError({"user": "このステータスでは使用者の指定が必須です。"})
+
+
+class BulkGeneratePOSACodes(POSA):
+    class Meta:
+        proxy = True
+        verbose_name = "POSA 一括発行"
+        verbose_name_plural = "POSA 一括発行"
