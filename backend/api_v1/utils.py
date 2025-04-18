@@ -1,4 +1,7 @@
 import random, string
+from django.utils import timezone
+from datetime import timedelta
+from django.apps import apps
 
 
 def calculate_checksum(numbers):
@@ -47,3 +50,28 @@ def generate_random_password(length):
     """指定された長さのランダムなパスワードを生成します。"""
     characters = string.ascii_letters + string.digits + string.punctuation
     return ''.join(random.choice(characters) for _ in range(length))
+
+
+def generate_unique_posa_code():
+    POSA = apps.get_model('api_v1', 'POSA')
+    while True:
+        code = str(random.randint(10**19, 10**20 - 1))
+        if not POSA.objects.filter(code=code).exists():
+            return code
+
+
+def bulk_generate_posa_codes(posa_type, is_variable, card_value, quantity):
+    POSA = apps.get_model('api_v1', 'POSA')
+    expiration = (timezone.now() + timedelta(days=730)).replace(
+        hour=23, minute=59, second=59, microsecond=0
+    )
+    for _ in range(quantity):
+        code = generate_unique_posa_code()
+        POSA.objects.create(
+            code=code,
+            posa_type=posa_type,
+            status='created',
+            is_variable=is_variable,
+            card_value=None if is_variable else card_value,
+            expiration_date=expiration,
+        )
