@@ -60,7 +60,8 @@ class Product(BaseModel):
         return self.jan
 
     def clean(self):
-        is_valid_jan_code(self.jan)
+        if not is_valid_jan_code(self.jan):
+            raise ValidationError({"jan": "チェックディジットエラー！"})
         self.validate_tax_rate(self.tax)
 
     def validate_tax_rate(self, tax_rate):

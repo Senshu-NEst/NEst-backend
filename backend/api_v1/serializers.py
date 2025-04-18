@@ -2,6 +2,7 @@ from rest_framework import serializers
 from django.utils import timezone
 from django.db import transaction
 from rest_framework.fields import empty
+from .views import StockReceiveHistory, StockReceiveHistoryItem
 from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, WalletTransaction, Wallet, Approval, Store, ReturnTransaction, ReturnDetail, ReturnPayment, Department
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
@@ -782,65 +783,61 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         elif originTransaction.status not in ['sale', 'resale']:
             errors['origin_transaction'] = "返品対象外取引です。"
 
-        staffCode = data.get("staff_code")
+        # スタッフ権限チェック
+        staff_code = data.get("staff_code")
         try:
-            self._check_permissions(staffCode, store_code=data.get('store_code'),
+            self._check_permissions(staff_code, store_code=data.get('store_code'),
                                     required_permissions=["register", "void"])
-        except serializers.ValidationError as permissionError:
-            errors["staff"] = permissionError.detail
+        except serializers.ValidationError as e:
+            errors["staff_code"] = e.detail
 
-        # 返却種別は "all"（全返品）、"partial"（一部返品）、"payment_change"（支払い変更）のいずれか
-        allowedReturnTypes = dict(ReturnTransaction.RETURN_TYPE_CHOICES)
-        allowedReturnTypes["payment_change"] = "支払い変更"
+        # store_code の存在チェック
+        store_code_val = data.get('store_code')
+        try:
+            store = Store.objects.get(store_code=store_code_val)
+        except Store.DoesNotExist:
+            errors['store_code'] = "指定された店舗コードは存在しません。"
+        else:
+            data['store_code'] = store
+
+        # return_type のチェック
+        allowed = dict(ReturnTransaction.RETURN_TYPE_CHOICES)
+        allowed["payment_change"] = "支払い変更"
         returnType = data.get('return_type')
-        if returnType not in allowedReturnTypes:
+        if returnType not in allowed:
             errors['return_type'] = "不正なreturn_typeです。"
 
-        paymentsList = data.get('payments', [])
-        if not paymentsList or len(paymentsList) == 0:
+        payments = data.get('payments', [])
+        if not payments:
             errors['payments'] = "支払い情報を入力してください。"
 
+        # 各ケースのバリデーション
         if returnType == "all":
-            for payment in paymentsList:
-                paymentAmount = float(payment.get("amount", 0))
-                if paymentAmount >= 0:
-                    errors.setdefault("payments", []).append(
-                        "全返品の場合、すべての支払いは返金金額（負の値）で入力してください。"
-                    )
-            totalRefund = sum(abs(float(payment.get("amount", 0))) for payment in paymentsList)
-            if originTransaction and abs(totalRefund - originTransaction.total_amount) > 0.01:
-                errors["payments"] = "返金金額の合計が元取引の合計金額と一致しません。"
+            # 全返品：すべて負数
+            bad = [p for p in payments if float(p.get("amount", 0)) >= 0]
+            if bad:
+                errors['payments'] = "全返品では返金金額をマイナスで入力する必要があります。"
+            total = sum(abs(float(p['amount'])) for p in payments)
+            if originTransaction and abs(total - originTransaction.total_amount) > 0.01:
+                errors['payments'] = "返金額合計がの合計金額と一致しません。"
         elif returnType == "payment_change":
             if data.get('additional_items') or data.get('delete_items'):
-                errors["additional_items"] = "支払い変更の場合、追加・削除商品の明細は不要です。"
-            refundPayments = [p for p in paymentsList if float(p.get("amount", 0)) < 0]
-            newPayments = [p for p in paymentsList if float(p.get("amount", 0)) > 0]
-            if not newPayments:
-                errors["payments"] = "支払い変更の場合、少なくとも1種類の新規支払い（正の値）を入力してください。"
-            # 支払い変更の場合は、支払い合計の相殺は不要
+                errors['additional_items'] = "支払い変更の場合、追加・削除商品は入力できません。"
+            new = [p for p in payments if float(p['amount']) > 0]
+            if not new:
+                errors['payments'] = "支払い変更では返金額と同額の支払い登録が必要です。"
         elif returnType == "partial":
             additionalItems = data.get('additional_items', [])
             deleteItems = data.get('delete_items', [])
             if not additionalItems and not deleteItems:
-                errors["additional_items"] = "一部返品の場合、追加または削除商品の明細が必要です。"
+                errors['additional_items'] = "一部返品では追加・削除商品のいずれかが必須です。"
             self._validate_item_details(data)
-            additionalTotal, deleteTotal, netReturnAmount = self._compute_additional_delete_totals(
-                additionalItems, deleteItems, originTransaction
-            )
-            paymentsSum = sum(float(p.get("amount", 0)) for p in paymentsList)
-            if netReturnAmount > 0:
-                if paymentsSum < netReturnAmount - 0.01:
-                    errors["payments"] = f"追加領収金が不足しています。必要最低額: {netReturnAmount}, 入力合計: {paymentsSum}"
-            elif netReturnAmount < 0:
-                if abs(paymentsSum - netReturnAmount) > 0.01:
-                    errors["payments"] = f"返金金額が不足しています。必要額: {netReturnAmount}, 入力合計: {paymentsSum}"
-            else:
-                if abs(paymentsSum) > 0.01:
-                    errors["payments"] = f"返品対象額が0円の場合、支払いは入力してはいけません。（入力合計: {paymentsSum}）"
-        else:
-            totalPayments = sum(float(p.get("amount", 0)) for p in paymentsList)
-            if originTransaction and totalPayments - originTransaction.total_amount > 0:
-                errors["payments"] = "返金金額の合計が元取引の合計金額と一致しません。"
+            additionalTotal, deleteTotal, net = self._compute_additional_delete_totals(additionalItems, deleteItems, originTransaction)
+            paymentsSum = sum(float(p['amount']) for p in payments)
+            if net > 0 and paymentsSum < net - 0.01:
+                errors['payments'] = f"追加領収不足: 必要額{net}, 入力額{paymentsSum}"
+            if net < 0 and abs(paymentsSum - net) > 0.01:
+                errors['payments'] = f"返金不足: 必要額{net}, 入力額{paymentsSum}"
 
         if errors:
             raise serializers.ValidationError(errors)
@@ -902,19 +899,40 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
 
     def _restock_inventory(self, return_transaction):
         """
-        return_transaction.store_code の店舗在庫に対して、
-        return_transaction.return_details の数量分だけ stock を戻す。
+        返品先店舗(return_transaction.store_code)に対して、
+        返品明細(return_transaction.return_details)の数量分を
+        StockReceiveHistory/StockReceiveHistoryItem を経由して戻します。
         """
-        store_to = return_transaction.store_code
+        # 1) 入荷履歴を作成（返品担当者＝入荷担当者）
+        history = StockReceiveHistory.objects.create(
+            store_code=return_transaction.store_code,
+            staff_code=return_transaction.staff_code,
+        )
+
+        # 2) 各返品明細ごとに在庫を戻す
         for detail in return_transaction.return_details.all():
+            jan_code = detail.jan  # char型のjanコードからproductインスタンスを取得
             try:
-                stock_entry = Stock.objects.get(store_code=store_to, jan=detail.jan)
+                product = detail.jan if isinstance(detail.jan, Product) else Product.objects.get(jan=jan_code)
+            except Product.DoesNotExist:
+                raise serializers.ValidationError({
+                    "restock": f"JANコード {jan_code} の商品が存在しません。"
+                })
+
+            try:
+                stock_entry = Stock.objects.get(store_code=history.store_code, jan=product)
             except Stock.DoesNotExist:
                 raise serializers.ValidationError({
-                    "restock": f"店舗 {store_to} にJANコード {detail.jan} の在庫エントリが見つかりません。"
+                    "restock": f"店舗 {history.store_code.store_code} に JANコード {product.jan} の在庫エントリが見つかりません。"
                 })
             stock_entry.stock += detail.quantity
             stock_entry.save()
+
+            StockReceiveHistoryItem.objects.create(
+                history=history,
+                jan=product,
+                additional_stock=detail.quantity
+            )
 
     def _copy_sale_products(self, originTransaction, returnTransaction):
         for detail in originTransaction.sale_products.all():
