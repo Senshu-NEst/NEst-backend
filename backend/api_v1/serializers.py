@@ -510,7 +510,6 @@ class TransactionSerializer(BaseTransactionSerializer):
                 total_amount_tax8 += subtotal
             else:
                 pass
-            print(f'total tax 8:{total_amount_tax8}')
 
             total_quantity += quantity
             total_discount_amount += discount * quantity
@@ -621,7 +620,7 @@ class TransactionSerializer(BaseTransactionSerializer):
         部門打ちの場合は_validate時に整形済みの値（_is_department, name, jan, price, tax等）を利用し、
         通常商品の場合は、Product存在チェックおよび在庫減算を行って TransactionDetail を作成します。
         """
-        # Transaction用のデータ
+        approval_number_input = validated_data.pop("approval_number", None)
         original_transaction = validated_data.pop("original_transaction", None)
         sale_products_data = validated_data.pop("sale_products", [])
         payments_data = validated_data.pop("payments", [])
@@ -631,9 +630,9 @@ class TransactionSerializer(BaseTransactionSerializer):
         terminal_id = validated_data.pop("terminal_id", None)
         totals = validated_data.pop("_totals", None)
 
-        # 釣り銭計算などは従来通り
+        # 釣り銭計算
         change_amount = self._calculate_change(payments_data, totals["total_amount"])
-        total_payments = sum(payment["amount"] for payment in payments_data)
+        total_payments = sum(p["amount"] for p in payments_data)
 
         # original_transaction が指定されている場合、欠落項目を補完
         if original_transaction:
@@ -647,7 +646,7 @@ class TransactionSerializer(BaseTransactionSerializer):
         else:
             user = validated_data.pop("user", [])
 
-        validated_data.pop("approval_number", None)
+        # トランザクション本体用データをセット
         validated_data["date"] = timezone.now()
         validated_data.update({
             "status": status,
@@ -664,7 +663,7 @@ class TransactionSerializer(BaseTransactionSerializer):
             "discount_amount": totals["discount_amount"],
             "total_amount": totals["total_amount"]
         })
-        from .models import Transaction
+        # Transactionインスタンス作成
         transaction_instance = Transaction.objects.create(**validated_data)
         
         # 各明細の登録
@@ -722,22 +721,20 @@ class TransactionSerializer(BaseTransactionSerializer):
             )
 
         # ウォレット減算(トレーニング時は減算しない)
-        if validated_data.get("status") != "training":
+        if status != "training" and user:
             wallet_payments = [p for p in payments_data if p["payment_method"] == "wallet"]
             if wallet_payments and user:
                 total_wallet_payment = sum(p["amount"] for p in wallet_payments)
                 user.wallet.withdraw(total_wallet_payment, transaction=transaction_instance)
 
         # 承認番号の使用済み更新（通常取引かつトレーニング以外の場合）
-        if validated_data.get("status") == "sale":
-            approval_number = validated_data.pop("approval_number", None)
-            if approval_number:
-                try:
-                    approval = Approval.objects.get(approval_number=approval_number)
-                    approval.is_used = True
-                    approval.save()
-                except Approval.DoesNotExist:
-                    pass
+        if status == "sale" and approval_number_input:
+            try:
+                approval = Approval.objects.get(approval_number=approval_number_input)
+            except Approval.DoesNotExist:
+                raise serializers.ValidationError({"approval_number": "承認番号の処理時に内部エラーが発生しました。"})
+            approval.is_used = True
+            approval.save()
 
         return transaction_instance
 
