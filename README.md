@@ -1,28 +1,22 @@
-## バックエンドマスターへの道
+# djangoPOSの詳細
+Docker上で稼働するDjangoとREST Flameworkを利用したID-POSレジのバックエンドシステム
+- RESTful APIを利用した柔軟なデータの入出力
+- 在庫管理（入出荷履歴）
+- 複数店舗管理
+- 店舗別の売価
+- 部門管理機能
+- 販売画面での柔軟な売変
+- JWTワンタイムキーによるセキュアなユーザー識別
+- GoogleアカウントでのSSO
+- 様々な返品方法（返品元取引を引き継いだ新規取引作成など）
+- 割り当てロールによる実行機能制御
+- ギフトカード発行管理
+- 電子レシート表示
+- 電子ウォレット機能
+<p>など様々な要件を満たす多彩な機能を搭載
 
-### 1. リポジトリをクローンする<br>
-プロジェクトを配置したいディレクトリにcdしてから以下を実施
-```console
-git clone https://github.com/Senshu-NEst/NEst-backend.git
-```
+## 詳細はDeepWikiをご覧ください<br>
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Senshu-NEst/NEst-backend)
+https://deepwiki.com/Senshu-NEst/NEst-backend
 
-### 2. docker-composeでビルドを実行<br>
-⚠️docker-composeのバージョンによってハイフン(`docker-compose`, `docker compose`)の有無が異なるので注意⚠️<br>
-```console
-docker-compose up -d --build
-```
-何度もコンテナを構築しているとコンテナに紐づくゴミファイルが溜まってビルドできない時がある。その場合は以下を実行。
-```console
-docker system prune
-```
-※不要なコンテナやimagesが一括削除される。<br>
-
-### 3. 初期設定を行う<br>
-djangoを実行しているコンテナに入り、スーパーユーザーを作成する
-```console
-docker-compose exec api bash
-python manage.py createsuperuser
-- 任意のidとpassを入力
-exit
-```
-# ENJOY YOUR BACKEND!!
+### ENJOY YOUR BACKEND!!
