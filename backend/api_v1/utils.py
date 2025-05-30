@@ -55,7 +55,8 @@ def generate_random_password(length):
 def generate_unique_posa_code():
     POSA = apps.get_model('api_v1', 'POSA')
     while True:
-        code = str(random.randint(10**19, 10**20 - 1))
+        # 先頭8桁を99902000に設定し、残りの12桁をランダムに生成
+        code = '99902000' + str(random.randint(0, 10**12 - 1)).zfill(12)
         if not POSA.objects.filter(code=code).exists():
             return code
 

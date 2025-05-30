@@ -690,7 +690,6 @@ class POSA(BaseModel):
     POSA_STATUS = (
         ('created', 'POS未通過'),
         ('salled', 'POS通過'),
-        ('activated', 'アクティベーション済'),
         ('charged', 'チャージ済'),
         ('BF_disabled', '無効（販売前）'),
         ('AF_disabled', '無効（販売済）'),

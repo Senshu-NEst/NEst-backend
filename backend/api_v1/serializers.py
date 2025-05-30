@@ -3,7 +3,7 @@ from django.utils import timezone
 from django.db import transaction
 from rest_framework.fields import empty
 from .views import StockReceiveHistory, StockReceiveHistoryItem
-from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, WalletTransaction, Wallet, Approval, Store, ReturnTransaction, ReturnDetail, ReturnPayment, Department
+from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, WalletTransaction, Wallet, Approval, Store, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 
@@ -172,7 +172,9 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
     def validate(self, data):
         """
         入力されたJANが8桁で先頭が"999"の場合は部門打ちと判断し、
+        20桁で先頭が"999"の場合はPOSA販売と判断する。
         部門打ちの場合も税率や割引チェックは通常と同様に行う（ただしProduct存在チェックや在庫処理はスキップ）。
+        POSA販売の場合は部門打ちとして処理し、追加でPOSA固有の検証を行う。
         部門打ちの場合、validate時に部門（小分類）の名称を"name"および"_department_name"に設定し、
         JANは"999"+該当部門の連結コードに再設定する。
         """
@@ -187,70 +189,204 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
         if price is not None and discount > price:
             raise serializers.ValidationError({"discount": "不正な割引額が入力されました。"})
 
-        # 部門打ち処理
+        # POSA販売処理（20桁、先頭999）
+        if isinstance(jan, str) and len(jan) == 20 and jan.startswith("999"):
+            return self._validate_posa_sale(data)
+
+        # 部門打ち処理（8桁、先頭999）
         if isinstance(jan, str) and len(jan) == 8 and jan.startswith("999"):
-            data["_is_department"] = True
+            return self._validate_department_sale(data)
 
-            # price必須チェック（部門打ち時）
+        # 通常商品処理
+        return self._validate_normal_product(data)
+
+    def _validate_posa_sale(self, data):
+        """POSA販売の検証処理"""
+        jan = data["jan"]
+        price = data.get("price")
+        quantity = data.get("quantity")
+        discount = data.get("discount", 0) or 0
+
+        # POSAコードの検証
+        try:
+            posa = POSA.objects.get(code=jan)
+        except POSA.DoesNotExist:
+            raise serializers.ValidationError({"jan": f"POSAコード {jan} は存在しません。"})
+
+        # 販売数量チェック（1点のみ）
+        if quantity != 1:
+            raise serializers.ValidationError({"quantity": "POSAの販売数量は1点のみです。"})
+
+        # 有効期限チェック（1ヶ月以上残っているか）
+        from django.utils import timezone
+        from datetime import timedelta
+        today = timezone.localdate()
+        one_month_later = today + timedelta(days=30)
+        if posa.expiration_date < one_month_later:
+            raise serializers.ValidationError({"jan": "POSAの有効期限が1ヶ月未満のため販売できません。"})
+
+        # 識別子（先頭8桁）から部門情報を取得
+        identifier = jan[:8]
+        dept_code = identifier[3:]
+        if len(dept_code) != 5:
+            raise serializers.ValidationError({
+                "jan": "POSAコードの識別子が不正です。"
+            })
+
+        big_code = dept_code[0]
+        middle_code = dept_code[1:3]
+        small_code = dept_code[3:]
+
+        try:
+            dept = Department.objects.get(
+                level="small",
+                code=small_code,
+                parent__code=middle_code,
+                parent__parent__code=big_code,
+            )
+        except Department.DoesNotExist:
+            raise serializers.ValidationError({
+                "jan": f"指定された部門コード {dept_code} に一致する部門が存在しません。"
+            })
+
+        # 会計フラグチェック
+        if dept.get_accounting_flag() != "allow":
+            raise serializers.ValidationError({"jan": "指定された部門では販売が許可されていません。"})
+        
+        # POSAカードのステータスチェック
+        if posa.status in ["BF_disabled", "AF_disabled"]:
+            raise serializers.ValidationError({"jan": "事故POSAカードです。カードを回収の上、報告を行なってください。"})
+        elif posa.status == "salled":
+            raise serializers.ValidationError({"jan": "販売済みPOSAカードです。"})
+        elif posa.status != "created":
+            raise serializers.ValidationError({"jan": "無効なPOSAカードです。"})
+
+        # 金額の処理
+        if posa.is_variable:
+            # バリアブルカードの場合は金額入力必須
             if price is None:
-                raise serializers.ValidationError({"price": "部門打ちの場合、価格は必須項目です。"})
+                raise serializers.ValidationError({"price": "バリアブルカードの場合、金額の入力が必須です。"})
+            card_value = price
+        else:
+            # 固定額カードの場合
+            if price is not None:
+                raise serializers.ValidationError({"price": "固定額カードの場合、金額を指定することはできません。"})
+            if posa.card_value is None:
+                raise serializers.ValidationError({"jan": "POSAの金額が設定されていません。"})
+            card_value = posa.card_value
 
-            # 部門コード分解
-            dept_code = jan[3:]
-            if len(dept_code) != 5:
-                raise serializers.ValidationError({
-                    "jan": "部門打ちの場合、JANコードは '999' + 5桁の部門コードでなければなりません。"
-                })
-            big_code = dept_code[0]
-            middle_code = dept_code[1:3]
-            small_code = dept_code[3:]
+        # 税率の処理（部門の税率を使用）
+        dept_standard_tax = int(dept.get_tax_rate())
+        input_tax = data.get("tax")
 
+        if input_tax in (None, ""):
+            tax_to_apply = dept_standard_tax
+        else:
             try:
-                dept = Department.objects.get(
-                    level="small",
-                    code=small_code,
-                    parent__code=middle_code,
-                    parent__parent__code=big_code,
-                )
-            except Department.DoesNotExist:
-                raise serializers.ValidationError({
-                    "jan": f"指定された部門コード {dept_code} に一致する部門が存在しません。"
-                })
+                input_tax = int(input_tax)
+            except (ValueError, TypeError):
+                raise serializers.ValidationError({"tax": "税率は整数値で指定してください。"})
+            tax_to_apply = input_tax
 
-            # 会計フラグ
-            if dept.get_accounting_flag() != "allow":
-                raise serializers.ValidationError({"jan": "指定された部門では部門打ちが許可されていません。"})
+        # 税率変更フラグチェック
+        if tax_to_apply != dept_standard_tax and dept.get_tax_rate_mod_flag() != "allow":
+            raise serializers.ValidationError({"tax": "この部門では税率変更が許可されていません。"})
 
-            # dept マスタの税率取得
-            dept_standard_tax = int(dept.get_tax_rate())
-            input_tax = data.get("tax")
+        # 値引きフラグチェック
+        if discount > 0 and dept.get_discount_flag() != "allow":
+            raise serializers.ValidationError({"discount": "この部門では割引が許可されていません。"})
 
-            # 入力税率があれば検証
-            if input_tax in (None, ""):
-                tax_to_apply = dept_standard_tax
-            else:
-                try:
-                    input_tax = int(input_tax)
-                except (ValueError, TypeError):
-                    raise serializers.ValidationError({"tax": "税率は整数値で指定してください。"})
-                tax_to_apply = input_tax
+        # POSAフラグを設定
+        data["_is_posa"] = True
+        data["_posa_instance"] = posa
+        data["_is_department"] = True  # 部門打ちとしても処理する
+        data["price"] = card_value
+        data["tax"] = tax_to_apply
+        data["discount"] = discount
 
-            # 税率変更フラグチェック
-            if tax_to_apply != dept_standard_tax and dept.get_tax_rate_mod_flag() != "allow":
-                raise serializers.ValidationError({"tax": "この部門では税率変更が許可されていません。"})
+        # 固有コード（12桁）を商品名に設定
+        posa_unique_code = jan[8:]  # 後ろ12桁
+        data["name"] = f'{dept_code}{dept.name}({posa_unique_code})'
+        data["_department_name"] = dept.name
+        data["jan"] = identifier  # JANは識別子（先頭8桁）に変更
 
-            data["tax"] = tax_to_apply
+        return data
 
-            # 値引きフラグ
-            if discount > 0 and dept.get_discount_flag() != "allow":
-                raise serializers.ValidationError({"discount": "この部門では割引が許可されていません。"})
+    def _validate_department_sale(self, data):
+        """部門打ち販売の検証処理（既存ロジックを分離）"""
+        jan = data["jan"]
+        price = data.get("price")
+        quantity = data.get("quantity")
+        discount = data.get("discount", 0) or 0
 
-            # 部門打ちの場合、商品名は部門の小分類の名称を設定する
-            data["name"] = f'{dept_code}{dept.name}'
-            data["_department_name"] = dept.name
-            data["jan"] = "999" + dept.department_code
+        data["_is_department"] = True
 
-            return data
+        # price必須チェック（部門打ち時）
+        if price is None:
+            raise serializers.ValidationError({"price": "部門打ちの場合、価格は必須項目です。"})
+
+        # 部門コード分解
+        dept_code = jan[3:]
+        if len(dept_code) != 5:
+            raise serializers.ValidationError({
+                "jan": "部門打ちの場合、JANコードは '999' + 5桁の部門コードでなければなりません。"
+            })
+        big_code = dept_code[0]
+        middle_code = dept_code[1:3]
+        small_code = dept_code[3:]
+
+        try:
+            dept = Department.objects.get(
+                level="small",
+                code=small_code,
+                parent__code=middle_code,
+                parent__parent__code=big_code,
+            )
+        except Department.DoesNotExist:
+            raise serializers.ValidationError({
+                "jan": f"指定された部門コード {dept_code} に一致する部門が存在しません。"
+            })
+
+        # 会計フラグ
+        if dept.get_accounting_flag() != "allow":
+            raise serializers.ValidationError({"jan": "指定された部門では部門打ちが許可されていません。"})
+
+        # dept マスタの税率取得
+        dept_standard_tax = int(dept.get_tax_rate())
+        input_tax = data.get("tax")
+
+        # 入力税率があれば検証
+        if input_tax in (None, ""):
+            tax_to_apply = dept_standard_tax
+        else:
+            try:
+                input_tax = int(input_tax)
+            except (ValueError, TypeError):
+                raise serializers.ValidationError({"tax": "税率は整数値で指定してください。"})
+            tax_to_apply = input_tax
+
+        # 税率変更フラグチェック
+        if tax_to_apply != dept_standard_tax and dept.get_tax_rate_mod_flag() != "allow":
+            raise serializers.ValidationError({"tax": "この部門では税率変更が許可されていません。"})
+
+        data["tax"] = tax_to_apply
+
+        # 値引きフラグ
+        if discount > 0 and dept.get_discount_flag() != "allow":
+            raise serializers.ValidationError({"discount": "この部門では割引が許可されていません。"})
+
+        # 部門打ちの場合、商品名は部門の小分類の名称を設定する
+        data["name"] = f'{dept_code}{dept.name}'
+        data["_department_name"] = dept.name
+        data["jan"] = "999" + dept.department_code
+
+        return data
+
+    def _validate_normal_product(self, data):
+        """通常商品の検証処理（既存ロジックを分離）"""
+        jan = data["jan"]
+        price = data.get("price")
+        discount = data.get("discount", 0) or 0
 
         # 通常商品処理
         try:
@@ -328,6 +464,13 @@ class TransactionSerializer(BaseTransactionSerializer):
 
         if status != "resale" and any(item['payment_method'] == 'carryover' for item in payments):
             errors["payments"] = "引継支払は再売以外で使用できません。"
+
+        # POSA販売時の支払い方法チェック
+        posa_products = [p for p in sale_products if p.get("_is_posa", False)]
+        if posa_products:
+            non_cash_payments = [p for p in payments if p['payment_method'] != 'cash']
+            if non_cash_payments:
+                errors["payments"] = "POSA販売時は現金での支払いのみ可能です。"
 
         # スタッフコードのチェックおよび権限チェック
         staff_code = data.get("staff_code")
@@ -448,7 +591,7 @@ class TransactionSerializer(BaseTransactionSerializer):
     def _aggregate_discount_errors(self, sale_products_data, store_code, permissions):
         discount_error_list = []
         for sale_product in sale_products_data:
-            # 部門打ちの場合は割引チェックをスキップ
+            # 部門打ち・POSA販売の場合は割引チェックをスキップ
             if sale_product.get("_is_department", False):
                 continue
             jan = sale_product.get("jan", "不明")
@@ -480,14 +623,16 @@ class TransactionSerializer(BaseTransactionSerializer):
         売上明細（sale_products）の合計金額、税額、割引額、数量を計算します。
         元取引から引き継いだ商品（original_product=True）の場合は、入力された price, tax, discount を使用し、
         新規追加商品の場合は店舗価格（または商品マスタの価格）と入力された tax（なければ商品マスタの税率）を使用します。
+        POSA販売の場合は、部門打ちと同様に入力値を利用します。
         """
         total_quantity = 0
         total_amount_tax10 = 0
         total_amount_tax8 = 0
+        total_amount_tax0 = 0  # 税率0の合計金額
         total_discount_amount = 0
 
         for sale_product in sale_products_data:
-            # 部門打ちの場合は、製品情報に依存せず入力値を利用する
+            # 部門打ち・POSA販売の場合は、製品情報に依存せず入力値を利用する
             if sale_product.get("_is_department", False):
                 effective_price = sale_product.get("price")
                 applied_tax_rate = sale_product.get("tax")
@@ -500,14 +645,18 @@ class TransactionSerializer(BaseTransactionSerializer):
                     store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
                     effective_price = store_price.get_price() if store_price else product.price
                     applied_tax_rate = sale_product.get("tax", product.tax)
+
             discount = sale_product.get("discount") or 0
             quantity = sale_product.get("quantity") or 1
             subtotal = (effective_price - discount) * quantity
 
+            # 税率に応じて合計金額を計算
             if applied_tax_rate == 10:
                 total_amount_tax10 += subtotal
             elif applied_tax_rate == 8:
                 total_amount_tax8 += subtotal
+            elif applied_tax_rate == 0:  # 税率0の場合の処理
+                total_amount_tax0 += subtotal
             else:
                 pass
 
@@ -517,7 +666,7 @@ class TransactionSerializer(BaseTransactionSerializer):
         total_tax10 = int(total_amount_tax10 * 10 / 110)
         total_tax8 = int(total_amount_tax8 * 8 / 108)
         total_tax = total_tax10 + total_tax8
-        total_amount = total_amount_tax10 + total_amount_tax8
+        total_amount = total_amount_tax10 + total_amount_tax8 + total_amount_tax0  # 税率0の金額も加算
 
         return {
             'total_quantity': total_quantity,
@@ -617,8 +766,9 @@ class TransactionSerializer(BaseTransactionSerializer):
 
     def create(self, validated_data):
         """
-        部門打ちの場合は_validate時に整形済みの値（_is_department, name, jan, price, tax等）を利用し、
+        部門打ち・POSA販売の場合は_validate時に整形済みの値（_is_department, name, jan, price, tax等）を利用し、
         通常商品の場合は、Product存在チェックおよび在庫減算を行って TransactionDetail を作成します。
+        POSA販売の場合は、販売後にPOSAのステータスを更新します。
         """
         approval_number_input = validated_data.pop("approval_number", None)
         original_transaction = validated_data.pop("original_transaction", None)
@@ -668,9 +818,9 @@ class TransactionSerializer(BaseTransactionSerializer):
         
         # 各明細の登録
         for sale_product in sale_products_data:
-            # 部門打ちなら_ is_departmentフラグに従う
+            # 部門打ち・POSA販売なら_ is_departmentフラグに従う
             if sale_product.get("_is_department", False):
-                # 部門打ちの場合はvalidateで整形済みの値をそのまま利用（在庫減算等はスキップ）
+                # 部門打ち・POSA販売の場合はvalidateで整形済みの値をそのまま利用（在庫減算等はスキップ）
                 TransactionDetail.objects.create(
                     transaction=transaction_instance,
                     jan=sale_product["jan"],
@@ -680,9 +830,17 @@ class TransactionSerializer(BaseTransactionSerializer):
                     discount=sale_product.get("discount", 0),
                     quantity=sale_product["quantity"]
                 )
+                
+                # POSA販売の場合は、ステータスを更新
+                if sale_product.get("_is_posa", False):
+                    posa_instance = sale_product.get("_posa_instance")
+                    if posa_instance and status != "training":
+                        posa_instance.status = "salled"
+                        posa_instance.buyer = user
+                        posa_instance.relative_transaction = transaction_instance
+                        posa_instance.save()
             else:
                 # 通常商品の場合はProduct存在チェックおよび在庫減算を実施
-                from .models import Product, StorePrice
                 try:
                     product = Product.objects.get(jan=sale_product["jan"])
                 except Product.DoesNotExist:
@@ -693,7 +851,6 @@ class TransactionSerializer(BaseTransactionSerializer):
                     store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
                     effective_price = store_price.get_price() if store_price else product.price
                     if status != "training":
-                        from .models import Stock
                         try:
                             stock = Stock.objects.get(store_code=store_code, jan=product)
                         except Stock.DoesNotExist:
