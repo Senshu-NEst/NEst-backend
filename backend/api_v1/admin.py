@@ -1,9 +1,11 @@
-from django.contrib import admin
+from django.contrib import admin, messages
 from import_export import resources
 from import_export.admin import ImportExportModelAdmin
 from django import forms
-from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval, ReturnTransaction, ReturnDetail, ReturnPayment, Department
+from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA, BulkGeneratePOSACodes
 from django.utils import timezone
+from . import utils
+from django.apps import apps
 from rest_framework_simplejwt.token_blacklist.admin import BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin, OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 from django.urls import reverse
@@ -328,7 +330,7 @@ class ReturnTransactionAdmin(admin.ModelAdmin):
     list_display = ("pk", "return_type", "origin_transaction_links", "return_date", "staff_code")
     fields = (("id", "return_type"), "return_date", ("origin_transaction",  "modify_id"), "store_code", "terminal_id", "staff_code", "reason", "restock",)
     list_display_links = ("pk", "origin_transaction_links",)
-    search_fields = ("pk", "origin_sale_id", "staff_code")
+    search_fields = ("pk",)
     list_filter = ("return_type", "return_date",)
     readonly_fields = ("id", "origin_transaction", "return_date", "staff_code", "reason")  # 必要に応じて追加
     inlines = [ReturnDetailInline, ReturnPaymentInline]  # インラインで関連データを表示
@@ -409,6 +411,138 @@ class DepartmentAdmin(admin.ModelAdmin):
             'description': "標準消費税率は『上位部門引継』、0%、8%、10%から選択してください。税率が8%の場合のみ税率変更フラグが有効となります。各フラグは『上位部門引継』『許可』『禁止』から選択（デフォルトは『上位部門引継』）します。大分類では『上位部門引継』は選択できません。"
         }),
     )
+
+
+@admin.register(POSA)
+class POSAAdmin(admin.ModelAdmin):
+    list_display = ('code', 'status', 'is_variable', 'card_value', 'expiration_date', 'buyer', 'user')
+    search_fields = ('code',)
+    list_filter = ('status', 'posa_type', 'is_variable')
+    ordering = ('expiration_date',)
+    readonly_fields = ('code', 'expiration_date')
+    
+    # アクションの追加
+    actions = ['delete_expired_posas', 'delete_activated_posas']
+    
+    def save_model(self, request, obj, form, change):
+        # 新規追加時にPOSAコードを自動生成
+        if not change:  # 新規追加時
+            obj.code = utils.generate_unique_posa_code()
+        super().save_model(request, obj, form, change)
+    
+    def formfield_for_dbfield(self, db_field, **kwargs):
+        # POSAコードフィールドのラベルを変更
+        formfield = super().formfield_for_dbfield(db_field, **kwargs)
+        if db_field.name == 'code':
+            formfield.label = "POSAコード (自動生成)"
+            formfield.help_text = "新規追加時は自動的に生成されます"
+        return formfield
+    
+    def delete_expired_posas(self, request, queryset):
+        """期限切れのPOSAを削除するアクション"""
+        today = timezone.localdate()
+        expired_posas = queryset.filter(expiration_date__lt=today)
+        count = expired_posas.count()
+        if count > 0:
+            expired_posas.delete()
+            self.message_user(request, f"{count}件の期限切れPOSAカードを削除しました。")
+        else:
+            self.message_user(request, "期限切れのPOSAカードはありませんでした。", level=messages.WARNING)
+    delete_expired_posas.short_description = "選択した期限切れPOSAを削除"
+    
+    def delete_activated_posas(self, request, queryset):
+        """利用済みのPOSAを削除するアクション"""
+        activated_posas = queryset.filter(status='charged')
+        count = activated_posas.count()
+        if count > 0:
+            activated_posas.delete()
+            self.message_user(request, f"{count}件のアクティベート済みPOSAカードを削除しました。")
+        else:
+            self.message_user(request, "アクティベート済みのPOSAカードはありませんでした。", level=messages.WARNING)
+    delete_activated_posas.short_description = "選択した利用済POSAを削除"
+
+
+class BulkGeneratePOSACodesForm(forms.ModelForm):
+    quantity = forms.IntegerField(
+        label="発行枚数",
+        min_value=1,
+        max_value=100,
+        help_text="1〜100の範囲で指定",
+        initial=1  # デフォルト値を1に設定
+    )
+
+    class Meta:
+        model = apps.get_model('api_v1', 'BulkGeneratePOSACodes')  # プロキシモデルを指定
+        fields = ["posa_type", "is_variable", "card_value", "quantity"]
+        
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # POSA種別のデフォルト値を「ウォレットギフトカード」に設定
+        if 'posa_type' in self.fields:
+            self.fields['posa_type'].initial = 'wallet_gift'
+
+
+@admin.register(apps.get_model('api_v1', 'BulkGeneratePOSACodes'))
+class BulkGeneratePOSACodesAdmin(admin.ModelAdmin):
+    form = BulkGeneratePOSACodesForm
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).none()  # 一覧は空に
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def has_view_permission(self, request, obj=None):
+        return self.has_add_permission(request)
+
+    fields = ("posa_type", "is_variable", "card_value", "quantity")
+
+    def save_model(self, request, obj, form, change):
+        # フォームから直接データを取得
+        data = form.cleaned_data
+        utils.bulk_generate_posa_codes(
+            posa_type=data["posa_type"],
+            is_variable=data["is_variable"],
+            card_value=data["card_value"],
+            quantity=data["quantity"]
+        )
+        self.message_user(request, f"POSAコードを {data['quantity']} 件発行しました。")
+        
+    def response_add(self, request, obj, post_url_continue=None):
+        """
+        Override the redirect after the 'Save' button is pressed when adding
+        """
+        # 一括発行後は POSA 一覧ページに移動する
+        from django.http import HttpResponseRedirect
+        from django.urls import reverse
+        return HttpResponseRedirect(reverse('admin:api_v1_posa_changelist'))
+
+    def get_urls(self):
+        """
+        一覧表示をスキップして直接追加画面に遷移するようにURLをカスタマイズ
+        """
+        from django.urls import path
+        from functools import update_wrapper
+        
+        def wrap(view):
+            def wrapper(*args, **kwargs):
+                return self.admin_site.admin_view(view)(*args, **kwargs)
+            wrapper.model_admin = self
+            return update_wrapper(wrapper, view)
+        
+        # 元のurlsを取得
+        urls = super().get_urls()
+        
+        # 追加画面へのURLパターンを作成
+        custom_urls = [
+            path('', wrap(self.add_view), name='api_v1_bulkgenerateposacodes_changelist'),
+        ]
+        
+        # カスタムURLを元のURLの前に追加して返す（順序が重要）
+        return custom_urls + urls
 
 
 # 有効なトークンの管理
