@@ -442,6 +442,7 @@ class TransactionSerializer(BaseTransactionSerializer):
                 if field_name in self.fields:
                     self.fields[field_name].read_only = False
 
+
     def validate(self, data):
         errors = {}
 
@@ -465,12 +466,15 @@ class TransactionSerializer(BaseTransactionSerializer):
         if status != "resale" and any(item['payment_method'] == 'carryover' for item in payments):
             errors["payments"] = "引継支払は再売以外で使用できません。"
 
-        # POSA販売時の支払い方法チェック
+        # POSA販売時の支払い方法チェック（POSAのみの購入の場合は現金のみ）
         posa_products = [p for p in sale_products if p.get("_is_posa", False)]
-        if posa_products:
+        non_posa_products = [p for p in sale_products if not p.get("_is_posa", False)]
+        
+        # POSAのみの販売の場合は現金支払いのみ許可
+        if posa_products and not non_posa_products:
             non_cash_payments = [p for p in payments if p['payment_method'] != 'cash']
             if non_cash_payments:
-                errors["payments"] = "POSA販売時は現金での支払いのみ可能です。"
+                errors["payments"] = "POSA単独販売時は現金での支払いのみ可能です。"
 
         # スタッフコードのチェックおよび権限チェック
         staff_code = data.get("staff_code")
@@ -512,6 +516,18 @@ class TransactionSerializer(BaseTransactionSerializer):
 
         if totals is not None:
             total_amount = totals['total_amount']
+            
+            # POSAと他商品混在時の支払い制限チェック
+            if posa_products and non_posa_products:
+                posa_total = sum((p.get("price", 0) - p.get("discount", 0)) * p.get("quantity", 1) 
+                            for p in posa_products)
+                non_posa_total = total_amount - posa_total
+                
+                # 現金支払い額を確認
+                cash_payment = sum(p['amount'] for p in payments if p['payment_method'] == 'cash')
+                if cash_payment < posa_total:
+                    errors["payments"] = f"POSA商品分（{posa_total}円）は現金での支払いが必要です。現金不足: {posa_total - cash_payment}円"
+            
             # 各支払い方法（現金、金券、キャッシュレス）毎に合計額を算出
             payment_totals = {
                 'cash': 0,
@@ -528,16 +544,53 @@ class TransactionSerializer(BaseTransactionSerializer):
                 else:
                     payment_totals['other'] += amount
 
-            # 金券は合計金額まで有効。超過分は無視する。
-            effective_voucher = min(payment_totals['voucher'], total_amount)
-
-            # キャッシュレス決済は、金券使用後の残り金額を超えての支払いは禁止
-            if payment_totals['other'] > (total_amount - effective_voucher):
-                errors["payments"] = "キャッシュレス決済が必要額を超えています。"
+            # POSAがある場合のキャッシュレス決済上限チェック（POSAに現金充当を考慮）
+            if posa_products:
+                posa_total = sum((p.get("price", 0) - p.get("discount", 0)) * p.get("quantity", 1) 
+                            for p in posa_products)
+                
+                # POSAに現金を充当した後の残額を計算
+                cash_for_posa = min(payment_totals['cash'], posa_total)
+                remaining_after_posa_cash = total_amount - cash_for_posa
+                
+                # 残額に対する金券の有効額
+                effective_voucher = min(payment_totals['voucher'], remaining_after_posa_cash)
+                
+                # 金券使用後の残額に対するキャッシュレス決済上限チェック
+                remaining_after_voucher = remaining_after_posa_cash - effective_voucher
+                if payment_totals['other'] > remaining_after_voucher:
+                    errors["payments"] = "キャッシュレス決済が必要額を超えています。"
+            else:
+                # POSAがない場合の従来のロジック
+                effective_voucher = min(payment_totals['voucher'], total_amount)
+                
+                # キャッシュレス決済は、金券使用後の残り金額を超えての支払いは禁止
+                if payment_totals['other'] > (total_amount - effective_voucher):
+                    errors["payments"] = "キャッシュレス決済が必要額を超えています。"
+            
+            # 金券が登録されているのに利用されていない場合のチェック
+            if payment_totals['voucher'] > 0 and effective_voucher == 0:
+                errors["payments"] = "金券が登録されていますが、支払い金額が商品合計額を超過しているため利用できません。"
 
             # 現金は、過不足なく支払いに利用される。（過剰な現金はお釣りとして返却される）
             # 支払い全体の有効合計が不足している場合のみエラーとする
-            if (effective_voucher + payment_totals['other'] + payment_totals['cash']) < total_amount:
+            # POSAがある場合とない場合で計算方法を分ける
+            if posa_products:
+                # POSAがある場合：POSAに現金充当後の計算
+                posa_total = sum((p.get("price", 0) - p.get("discount", 0)) * p.get("quantity", 1) 
+                            for p in posa_products)
+                cash_for_posa = min(payment_totals['cash'], posa_total)
+                remaining_after_posa_cash = total_amount - cash_for_posa
+                effective_voucher = min(payment_totals['voucher'], remaining_after_posa_cash)
+                remaining_cash = payment_totals['cash'] - cash_for_posa
+                
+                total_effective_payment = cash_for_posa + effective_voucher + payment_totals['other'] + remaining_cash
+            else:
+                # POSAがない場合：従来の計算
+                effective_voucher = min(payment_totals['voucher'], total_amount)
+                total_effective_payment = effective_voucher + payment_totals['other'] + payment_totals['cash']
+            
+            if total_effective_payment < total_amount:
                 errors["payments"] = "支払いの合計金額が不足しています。"
 
             # トレーニング以外の場合はウォレット残高のチェック（withdraw は create 側で実施）
@@ -557,36 +610,59 @@ class TransactionSerializer(BaseTransactionSerializer):
         data["_totals"] = totals
         return data
 
-    def _calculate_change(self, payments_data, total_amount):
+    def _calculate_change(self, payments_data, total_amount, sale_products_data):
         """
         釣り銭の計算：
-        - 金券 (voucher) は必要額まで使用。超過分は無視（釣り銭にはならない）
-        - キャッシュレス (other) も必要額内でのみ支払いを受け付け（釣り銭は発生しない）
-        - 現金 (cash) は、残りの金額分に対して充当。過剰分が釣り銭として返却される
+        - POSAは現金でしか支払えない
+        - 金券 (voucher), キャッシュレス (other) は釣り銭を発行しない（残額まで使用）
+        - 現金 (cash) の過剰分のみ釣り銭として返却
+        - 適用順序：現金でPOSA分を優先充当 → 残額に金券 → 残額にキャッシュレス → 残額に現金残り
         """
+        # 1) POSA金額を算出
+        posa_total = sum(
+            item["price"] * item["quantity"]
+            for item in sale_products_data
+            if item.get("_is_department", False) and len(item.get("jan", "")) == 8
+        )
+
+        # 2) 支払額集計
         payment_totals = {'cash': 0, 'voucher': 0, 'other': 0}
-        for payment in payments_data:
-            method = payment['payment_method']
-            amount = payment['amount']
+        for p in payments_data:
+            method = p['payment_method']
+            amt = p['amount']
             if method == 'cash':
-                payment_totals['cash'] += amount
+                payment_totals['cash'] += amt
             elif method == 'voucher':
-                payment_totals['voucher'] += amount
+                payment_totals['voucher'] += amt
             elif method != 'carryover':
-                payment_totals['other'] += amount
+                payment_totals['other'] += amt
 
-        effective_voucher = min(payment_totals['voucher'], total_amount)
-        remaining = total_amount - effective_voucher
-
-        used_other = min(payment_totals['other'], remaining)
-        remaining -= used_other
-
-        # 現金で支払うべき残り額
-        required_cash = remaining
-        used_cash = min(payment_totals['cash'], required_cash)
+        # 3) 支払い処理を順序立てて実行
+        remaining_amount = total_amount
+        used_cash = 0
+        
+        # ステップ1: POSA分を現金で優先充当
+        if posa_total > 0:
+            posa_cash_needed = min(payment_totals['cash'], posa_total)
+            used_cash += posa_cash_needed
+            remaining_amount -= posa_cash_needed
+        
+        # ステップ2: 残額に対して金券を適用（残額まで使用、釣り銭なし）
+        voucher_to_use = min(payment_totals['voucher'], remaining_amount)
+        remaining_amount -= voucher_to_use
+        
+        # ステップ3: 残額に対してキャッシュレスを適用（残額まで使用、釣り銭なし）
+        other_to_use = min(payment_totals['other'], remaining_amount)
+        remaining_amount -= other_to_use
+        
+        # ステップ4: 残額を現金の残りで支払い
+        cash_remaining = payment_totals['cash'] - used_cash
+        cash_for_remaining = min(cash_remaining, remaining_amount)
+        used_cash += cash_for_remaining
+        
+        # 5) 釣り銭は「支払った現金」−「使った現金」
         change = payment_totals['cash'] - used_cash
-
-        return change
+        return max(0, change)
 
     def _aggregate_discount_errors(self, sale_products_data, store_code, permissions):
         discount_error_list = []
@@ -781,7 +857,7 @@ class TransactionSerializer(BaseTransactionSerializer):
         totals = validated_data.pop("_totals", None)
 
         # 釣り銭計算
-        change_amount = self._calculate_change(payments_data, totals["total_amount"])
+        change_amount = self._calculate_change(payments_data, totals["total_amount"], sale_products_data)
         total_payments = sum(p["amount"] for p in payments_data)
 
         # original_transaction が指定されている場合、欠落項目を補完
