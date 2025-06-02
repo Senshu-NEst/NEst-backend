@@ -467,14 +467,17 @@ class TransactionSerializer(BaseTransactionSerializer):
             errors["payments"] = "引継支払は再売以外で使用できません。"
 
         # POSA販売時の支払い方法チェック（POSAのみの購入の場合は現金のみ）
+        # ただし、再売取引（一部返品からの修正取引）の場合はPOSAチェックをスキップ
         posa_products = [p for p in sale_products if p.get("_is_posa", False)]
         non_posa_products = [p for p in sale_products if not p.get("_is_posa", False)]
         
-        # POSAのみの販売の場合は現金支払いのみ許可
-        if posa_products and not non_posa_products:
-            non_cash_payments = [p for p in payments if p['payment_method'] != 'cash']
-            if non_cash_payments:
-                errors["payments"] = "POSA単独販売時は現金での支払いのみ可能です。"
+        # 再売取引でない場合のみPOSA制限チェックを実行
+        if not self.context.get("skip_posa_check", False):
+            # POSAのみの販売の場合は現金支払いのみ許可
+            if posa_products and not non_posa_products:
+                non_cash_payments = [p for p in payments if p['payment_method'] != 'cash']
+                if non_cash_payments:
+                    errors["payments"] = "POSA単独販売時は現金での支払いのみ可能です。"
 
         # スタッフコードのチェックおよび権限チェック
         staff_code = data.get("staff_code")
@@ -517,16 +520,18 @@ class TransactionSerializer(BaseTransactionSerializer):
         if totals is not None:
             total_amount = totals['total_amount']
             
-            # POSAと他商品混在時の支払い制限チェック
-            if posa_products and non_posa_products:
-                posa_total = sum((p.get("price", 0) - p.get("discount", 0)) * p.get("quantity", 1) 
-                            for p in posa_products)
-                non_posa_total = total_amount - posa_total
-                
-                # 現金支払い額を確認
-                cash_payment = sum(p['amount'] for p in payments if p['payment_method'] == 'cash')
-                if cash_payment < posa_total:
-                    errors["payments"] = f"POSA商品分（{posa_total}円）は現金での支払いが必要です。現金不足: {posa_total - cash_payment}円"
+            # 再売取引でない場合のみPOSA混在チェックを実行
+            if not self.context.get("skip_posa_check", False):
+                # POSAと他商品混在時の支払い制限チェック
+                if posa_products and non_posa_products:
+                    posa_total = sum((p.get("price", 0) - p.get("discount", 0)) * p.get("quantity", 1) 
+                                for p in posa_products)
+                    non_posa_total = total_amount - posa_total
+                    
+                    # 現金支払い額を確認
+                    cash_payment = sum(p['amount'] for p in payments if p['payment_method'] == 'cash')
+                    if cash_payment < posa_total:
+                        errors["payments"] = f"POSA商品分（{posa_total}円）は現金での支払いが必要です。現金不足: {posa_total - cash_payment}円"
             
             # 各支払い方法（現金、金券、キャッシュレス）毎に合計額を算出
             payment_totals = {
@@ -544,24 +549,33 @@ class TransactionSerializer(BaseTransactionSerializer):
                 else:
                     payment_totals['other'] += amount
 
-            # POSAがある場合のキャッシュレス決済上限チェック（POSAに現金充当を考慮）
-            if posa_products:
-                posa_total = sum((p.get("price", 0) - p.get("discount", 0)) * p.get("quantity", 1) 
-                            for p in posa_products)
-                
-                # POSAに現金を充当した後の残額を計算
-                cash_for_posa = min(payment_totals['cash'], posa_total)
-                remaining_after_posa_cash = total_amount - cash_for_posa
-                
-                # 残額に対する金券の有効額
-                effective_voucher = min(payment_totals['voucher'], remaining_after_posa_cash)
-                
-                # 金券使用後の残額に対するキャッシュレス決済上限チェック
-                remaining_after_voucher = remaining_after_posa_cash - effective_voucher
-                if payment_totals['other'] > remaining_after_voucher:
-                    errors["payments"] = "キャッシュレス決済が必要額を超えています。"
+            # 再売取引でない場合のみPOSAキャッシュレス制限チェックを実行
+            if not self.context.get("skip_posa_check", False):
+                # POSAがある場合のキャッシュレス決済上限チェック（POSAに現金充当を考慮）
+                if posa_products:
+                    posa_total = sum((p.get("price", 0) - p.get("discount", 0)) * p.get("quantity", 1) 
+                                for p in posa_products)
+                    
+                    # POSAに現金を充当した後の残額を計算
+                    cash_for_posa = min(payment_totals['cash'], posa_total)
+                    remaining_after_posa_cash = total_amount - cash_for_posa
+                    
+                    # 残額に対する金券の有効額
+                    effective_voucher = min(payment_totals['voucher'], remaining_after_posa_cash)
+                    
+                    # 金券使用後の残額に対するキャッシュレス決済上限チェック
+                    remaining_after_voucher = remaining_after_posa_cash - effective_voucher
+                    if payment_totals['other'] > remaining_after_voucher:
+                        errors["payments"] = "キャッシュレス決済が必要額を超えています。"
+                else:
+                    # POSAがない場合の従来のロジック
+                    effective_voucher = min(payment_totals['voucher'], total_amount)
+                    
+                    # キャッシュレス決済は、金券使用後の残り金額を超えての支払いは禁止
+                    if payment_totals['other'] > (total_amount - effective_voucher):
+                        errors["payments"] = "キャッシュレス決済が必要額を超えています。"
             else:
-                # POSAがない場合の従来のロジック
+                # 再売取引の場合は従来のロジック（POSAチェックなし）
                 effective_voucher = min(payment_totals['voucher'], total_amount)
                 
                 # キャッシュレス決済は、金券使用後の残り金額を超えての支払いは禁止
@@ -575,7 +589,7 @@ class TransactionSerializer(BaseTransactionSerializer):
             # 現金は、過不足なく支払いに利用される。（過剰な現金はお釣りとして返却される）
             # 支払い全体の有効合計が不足している場合のみエラーとする
             # POSAがある場合とない場合で計算方法を分ける
-            if posa_products:
+            if posa_products and not self.context.get("skip_posa_check", False):
                 # POSAがある場合：POSAに現金充当後の計算
                 posa_total = sum((p.get("price", 0) - p.get("discount", 0)) * p.get("quantity", 1) 
                             for p in posa_products)
@@ -586,7 +600,7 @@ class TransactionSerializer(BaseTransactionSerializer):
                 
                 total_effective_payment = cash_for_posa + effective_voucher + payment_totals['other'] + remaining_cash
             else:
-                # POSAがない場合：従来の計算
+                # POSAがない場合または再売取引の場合：従来の計算
                 effective_voucher = min(payment_totals['voucher'], total_amount)
                 total_effective_payment = effective_voucher + payment_totals['other'] + payment_totals['cash']
             
