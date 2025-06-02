@@ -327,7 +327,7 @@ class ReturnPaymentInline(admin.TabularInline):  # または StackedInline
 
 @admin.register(ReturnTransaction)
 class ReturnTransactionAdmin(admin.ModelAdmin):
-    list_display = ("pk", "return_type", "origin_transaction_links", "return_date", "staff_code")
+    list_display = ("pk", "return_type", "origin_transaction_links", "return_date", "staff_code", "receipt_button")
     fields = (("id", "return_type"), "return_date", ("origin_transaction",  "modify_id"), "store_code", "terminal_id", "staff_code", "reason", "restock",)
     list_display_links = ("pk", "origin_transaction_links",)
     search_fields = ("pk",)
@@ -341,6 +341,10 @@ class ReturnTransactionAdmin(admin.ModelAdmin):
         return format_html('<a href="{}">{}</a>', url, obj.origin_transaction)
 
     origin_transaction_links.short_description = 'Origin Transaction'  # 列のヘッダー名を設定
+
+    def receipt_button(self, obj):
+        return format_html('<a class="button" href="{}">レシート</a>', reverse('generate_receipt_view', args=[obj.id, 'return']))
+    receipt_button.short_description = 'レシートを表示'
 
     def get_queryset(self, request):
         qs = super().get_queryset(request)

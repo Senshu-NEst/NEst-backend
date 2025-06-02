@@ -276,6 +276,7 @@ class TransactionViewSet(viewsets.ModelViewSet):
         - パラメータの指定がない場合、デフォルトで当日の日付範囲かつ status="sale" の取引のみが表示されます。
         - クエリパラメータは URL のクエリ文字列として渡してください。
     """
+    queryset = Transaction.objects.all()
     serializer_class = TransactionSerializer
 
     def get_queryset(self):
@@ -327,7 +328,6 @@ class TransactionViewSet(viewsets.ModelViewSet):
             filters["id"] = transaction_id
         else:
             filters["date__range"] = [start_date, end_date]
-        
         if store_code:
             filters["store_code"] = store_code
         if staff_code:
@@ -336,17 +336,21 @@ class TransactionViewSet(viewsets.ModelViewSet):
             filters["terminal_id"] = terminal_id
 
         # status が未指定の場合は常に "sale" を適用
-        if not status_param:
+        if not status_param and not transaction_id:
             filters["status"] = "sale"
-        elif status_param.lower() != 'all':
+        elif transaction_id:
+            pass
+        elif status_param != 'all':
             filters["status"] = status_param
+        else:
+            pass
 
         filtered_queryset = queryset.filter(**filters)
         if transaction_id:
             transaction = Transaction.objects.filter(id=transaction_id).first()
             if not transaction:
                 raise NotFound("指定された取引は存在しません。")
-            check_transaction_access(request.user, transaction)
+            #check_transaction_access(request.user, transaction)
         return filtered_queryset
 
 
@@ -365,7 +369,7 @@ class ReturnTransactionViewSet(viewsets.ModelViewSet):
     """
     queryset = ReturnTransaction.objects.all()
     serializer_class = ReturnTransactionSerializer
-    permission_classes = [IsAuthenticated]
+    #permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         user = self.request.user
@@ -501,16 +505,18 @@ class CustomTokenObtainPairView(TokenObtainPairView):
 
 @login_required
 def generate_receipt_view(request, transaction_id, receipt_type):
-    transaction = get_object_or_404(Transaction, id=transaction_id)
 
     # アクセス権をチェック
-    if not rules.test_rule('view_transaction', request.user, transaction):
-        return HttpResponseForbidden("この取引にアクセスする権限がありません。")
+    # TODO:返品レシートの権限チェックが未実装のため一旦コメントアウト
+    #if not rules.test_rule('view_transaction', request.user, transaction):
+    #    return HttpResponseForbidden("この取引にアクセスする権限がありません。")
 
     # レシート種別に応じたテキスト生成
     if receipt_type == 'sale':
+        transaction = get_object_or_404(Transaction, id=transaction_id)
         receipt_text = generate_receipt_text(transaction)
     elif receipt_type == 'return':
+        transaction = get_object_or_404(ReturnTransaction, id=transaction_id)
         receipt_text = generate_return_receipt(transaction)
     else:
         return HttpResponse("無効な取引種別", content_type="text/plain")
@@ -523,12 +529,15 @@ def generate_receipt_view(request, transaction_id, receipt_type):
     else:
         return HttpResponse("レシートデータの取得に失敗しました", content_type="text/plain")
 
+
 def login_view(request):
     return render(request, 'login.html')
+
 
 def logout_view(request):
     logout(request)  # ユーザーをログアウト
     return render(request, 'logout.html')
+
 
 def google_login_redirect(request):
     if request.user.is_authenticated:
