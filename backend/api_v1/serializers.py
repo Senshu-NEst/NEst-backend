@@ -189,8 +189,8 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
         if price is not None and discount > price:
             raise serializers.ValidationError({"discount": "不正な割引額が入力されました。"})
 
-        # POSA販売処理（20桁、先頭999）
-        if isinstance(jan, str) and len(jan) == 20 and jan.startswith("999"):
+        # POSA販売処理（20桁、先頭999020）
+        if isinstance(jan, str) and len(jan) == 20 and jan.startswith("999020"):
             return self._validate_posa_sale(data)
 
         # 部門打ち処理（8桁、先頭999）
@@ -309,6 +309,7 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
         data["name"] = f'{dept_code}{dept.name}({posa_unique_code})'
         data["_department_name"] = dept.name
         data["jan"] = identifier  # JANは識別子（先頭8桁）に変更
+        data["_extra_code"] = posa_unique_code  # POSA固有番号をextra_codeに設定
 
         return data
 
@@ -918,7 +919,8 @@ class TransactionSerializer(BaseTransactionSerializer):
                     price=sale_product["price"],
                     tax=sale_product["tax"],
                     discount=sale_product.get("discount", 0),
-                    quantity=sale_product["quantity"]
+                    quantity=sale_product["quantity"],
+                    extra_code=sale_product.get("_extra_code")  # POSA固有番号を設定
                 )
                 
                 # POSA販売の場合は、ステータスを更新
@@ -957,6 +959,7 @@ class TransactionSerializer(BaseTransactionSerializer):
                     tax=sale_product["tax"],
                     discount=sale_product.get("discount", 0),
                     quantity=sale_product["quantity"]
+                    # 通常商品の場合はextra_codeは設定しない
                 )
 
         # 支払いの処理
@@ -1067,7 +1070,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         elif return_type == 'payment_change':
             self._validate_payment_change(data, payments, errors)
         elif return_type == 'partial':
-            self._validate_partial(data, origin_transaction, payments, errors)
+            self._validate_partial_return(data, origin_transaction, payments, errors)
 
         if errors:
             raise serializers.ValidationError(errors)
@@ -1076,7 +1079,19 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
     def _sanitize_items(self, items, group):
         """
         additional_items/delete_items の共通型変換と必須チェック。
+        POSA対応：999020から始まるjanコードを部門コード（前半8桁）+POSAコード（後半12桁）に分割
         """
+        def _validate_integer(value, field_name, optional=False):
+            if value is None:
+                if optional:
+                    return None
+                raise serializers.ValidationError({group: f"{group}には{field_name}が必須です。"})
+
+            try:
+                return int(value)
+            except ValueError:
+                raise serializers.ValidationError({group: f"{group}の{field_name}は整数でなければなりません。"})
+
         sanitized = []
         for item in items:
             if 'jan' not in item or 'quantity' not in item:
@@ -1120,6 +1135,57 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         total = sum(abs(float(p['amount'])) for p in payments)
         if origin_transaction and abs(total - origin_transaction.total_amount) > 0.01:
             errors['payments'] = "返金額合計が元の合計金額と一致しません。"
+        # POSA存在チェック（全返品時）
+        try:
+            self._validate_posa_deletion(origin_transaction)
+        except serializers.ValidationError as e:
+            detail = e.detail if isinstance(e.detail, dict) else {'validation': str(e)}
+            errors.update(detail)
+
+    def _validate_partial_return(self, data, origin_transaction, payments, errors):
+        if not data.get('additional_items') and not data.get('delete_items'):
+            errors['additional_items'] = "一部返品では追加・削除商品のいずれかが必要です。"
+            return
+
+        # POSA削除可能チェック（一部返品時）
+        delete_items = data.get('delete_items', [])
+        if delete_items:
+            try:
+                self._validate_posa_deletion(origin_transaction, delete_items)
+            except serializers.ValidationError as e:
+                detail = e.detail if isinstance(e.detail, dict) else {'validation': str(e)}
+                errors.update(detail)
+                return
+        # 追加・削除合計と支払い金額のバランスチェック（商品・POSA存在チェック含む）
+        try:
+            net_amount_tmp = (
+                self._compute_additional_delete_totals(
+                    data.get('additional_items', []),
+                    data.get('delete_items', []),
+                    origin_transaction
+                )
+            )
+            net_amount = net_amount_tmp[-1]
+        except serializers.ValidationError as e:
+            detail = e.detail if isinstance(e.detail, dict) else {'validation': str(e)}
+            errors.update(detail)
+            return
+
+        payment_sum = sum(int(p.get('amount', 0)) for p in payments)
+        print(payment_sum)
+        if net_amount > 0:  # 追加料金
+            if payment_sum < net_amount - 0.01:
+                errors['payments'] = f"追加支払いが不足しています。必要額: {net_amount}、入力額: {payment_sum}"
+            elif payment_sum > net_amount + 0.01:
+                errors['payments'] = f"追加支払いが多すぎます。必要額: {net_amount}、入力額: {payment_sum}"
+        # 差額がマイナス（返金額が足りない）
+        elif net_amount < 0:  # 追加支払いパターン
+            expected_refund = -net_amount
+            actual_refund = -payment_sum
+            if (actual_refund - expected_refund) > 0:
+                errors['payments'] = f"返金額が多すぎます。必要な返金額: {expected_refund}、入力額: {abs(actual_refund)}"
+            elif (actual_refund - expected_refund) < 0:
+                errors['payments'] = f"返金額が不足しています。必要な返金額: {expected_refund}、入力額: {abs(actual_refund)}"
 
     def _validate_payment_change(self, data, payments, errors):
         if data.get('additional_items') or data.get('delete_items'):
@@ -1128,85 +1194,208 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         if not positive_payments:
             errors['payments'] = "支払い変更では返金額と同額の支払い登録が必要です。"
 
-    def _validate_partial(self, data, origin_transaction, payments, errors):
-        if not data['additional_items'] and not data['delete_items']:
-            errors['additional_items'] = "一部返品では追加・削除商品のいずれかが必須です。"
+    def _validate_posa_deletion(self, origin_transaction, delete_items_list=None):
+        """
+        全返品または一部返品時のPOSA削除可能性をチェック
+        - origin_transaction: 元の取引
+        - delete_items_list: 一部返品の場合の削除アイテムリスト（None の場合は全返品）
+        """
+        errors = {}
+        # delete_items_listが空(全返品)の場合：元取引のすべての商品を走査
+        if delete_items_list is None:
+            posa_products = origin_transaction.sale_products.filter(
+                jan__startswith='999020',
+                extra_code__isnull=False  #　二重否定でわかりづらいがextra_codeが存在することをチェック
+            ).exclude(extra_code='')
+
+            for product in posa_products:
+                posa_code = product.jan + product.extra_code
+                try:
+                    self._validate_single_posa(posa_code, origin_transaction, 'posa_validation')
+                except serializers.ValidationError as e:
+                    detail = e.detail if isinstance(e.detail, dict) else {'posa_validation': str(e)}
+                    errors.update(detail)
+        else:
+            # delete_items_listに対してチェック
+            jan_codes = [item['jan'] for item in delete_items_list if item['jan'].startswith('999020') and len(item['jan']) == 20]
+            
+            for item in delete_items_list:
+                jan = item['jan']
+                if jan in jan_codes:
+                    posa_code = jan
+                    # POSA商品の数量チェック（1以外はエラー）
+                    delete_qty = item['quantity']
+                    if delete_qty != 1:
+                        errors['delete_items'] = f"POSAコード {posa_code} の数量は1である必要があります。指定された数量: {delete_qty}"
+                        continue
+                    
+                    try:
+                        self._validate_single_posa(posa_code, origin_transaction, 'delete_items')
+                    except serializers.ValidationError as e:
+                        detail = e.detail if isinstance(e.detail, dict) else {'delete_items': str(e)}
+                        errors.update(detail)
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+    def _validate_single_posa(self, posa_code, origin_transaction, field_name: str = 'posa_validation'):
+        """
+        単一のPOSAコードの存在とステータス検証
+        field_nameはエラーを返す時のフィールド名
+        """
+        dept_code = posa_code[:8]
+        extra_code = posa_code[8:]
+        
+        # 元取引に該当商品チェック
+        if not origin_transaction.sale_products.filter(jan=dept_code, extra_code=extra_code).exists():
+            raise serializers.ValidationError({field_name: f"元取引にPOSAコード {posa_code} を持つ商品が存在しません。"})
+
+        # POSAモデル存在チェック
         try:
-            additional_total, delete_total, net_amount = self._compute_additional_delete_totals(
-                data['additional_items'], data['delete_items'], origin_transaction
-            )
-            payment_sum = sum(float(p['amount']) for p in payments)
-            if net_amount > 0 and payment_sum < net_amount - 0.01:
-                errors['payments'] = f"追加領収不足: 必要額{net_amount}, 入力額{payment_sum}"
-            if net_amount < 0 and abs(payment_sum - net_amount) > 0.01:
-                errors['payments'] = f"返金不足: 必要額{net_amount}, 入력額{payment_sum}"
-        except serializers.ValidationError as e:
-            detail = e.detail if isinstance(e.detail, dict) else {'validation': str(e)}
-            errors.update(detail)
+            posa = POSA.objects.get(code=posa_code)
+        except POSA.DoesNotExist:
+            raise serializers.ValidationError({field_name: f"POSAコード {posa_code} はPOSAマスターから削除されているため返品を続行できません。"})
+
+        # ステータスチェック
+        if posa.status != 'salled':
+            raise serializers.ValidationError({field_name: f"POSAコード {posa_code} のステータスが'salled'ではないため削除できません。現在のステータス: {posa.status}"})
+
+    def _disable_posa_status(self, posa_code):
+        try:
+            posa = POSA.objects.get(code=posa_code)
+            posa.status = 'AF_disabled'
+            posa.save()
+        except POSA.DoesNotExist:
+            raise serializers.ValidationError({'posa': f"POSAコード {posa_code} が見つかりません。"})
+
+    def _process_posa_status_changes(self, origin_transaction, return_type, delete_items_list=None):
+        """
+        返品種別に応じてPOSAステータスを変更
+        - return_transaction: 返品取引
+        - origin_transaction: 元取引
+        - return_type: 返品種別
+        - delete_items_list: 一部返品の場合の削除アイテムリスト
+        """
+        if return_type == 'all':
+            # 全返品の場合：元取引のすべてのPOSA商品を無効化
+            posa_products = origin_transaction.sale_products.filter(jan__startswith='999020', extra_code__isnull=False).exclude(extra_code='')
+            
+            for product in posa_products:
+                posa_code = product.jan + product.extra_code
+                self._disable_posa_status(posa_code)
+                
+        elif return_type == 'partial' and delete_items_list:
+            # 一部返品の場合：指定されたPOSA商品のみ無効化
+            for item in delete_items_list:
+                jan = item['jan']
+                if jan.startswith('999020') and len(jan) == 20:
+                    self._disable_posa_status(jan)
 
     def _compute_additional_delete_totals(self, additional_items, delete_items, origin_transaction):
-        additional_total = sum(
-            (float(Product.objects.filter(jan=item['jan']).first().price) - item.get('discount', 0))
-            * item['quantity'] for item in additional_items
-            if Product.objects.filter(jan=item['jan']).exists()
-        )
-        delete_total = 0
-        original_products = list(origin_transaction.sale_products.all())
+        # リスト内包表記
         products_list = [
             {
                 'jan': p.jan,
-                'name': p.name,
+                'extra_code': p.extra_code,
                 'price': p.price,
-                'tax': int(p.tax),
                 'discount': p.discount,
+                'tax': int(p.tax),
                 'quantity': p.quantity,
                 'processed': False
             }
-            for p in original_products
+            for p in origin_transaction.sale_products.all()
         ]
+        # 追加商品の合計額計算 (元取引から価格を取得)
+        additional_total = 0
+        for item in additional_items:
+            jan = item['jan']
+            quantity = item['quantity']
+            specified_discount = item.get('discount')
+
+            # POSAの場合（999020から始まる20桁）
+            if jan.startswith('999020') and len(jan) == 20:
+                dept_code = jan[:8]
+                code = jan[8:]
+                
+                # 元取引から該当商品の詳細を検索
+                qs = origin_transaction.sale_products.filter(jan=dept_code, extra_code=code)
+                detail = qs.first()
+                if not detail:
+                    raise serializers.ValidationError({'additional_items': f"POSAコード {jan} は元取引に存在しません。"})
+            else:
+                # 通常商品の場合
+                qs = origin_transaction.sale_products.filter(jan=jan)
+                detail = qs.first()
+                if not detail:
+                    raise serializers.ValidationError({'additional_items': f"元取引にJANコード {jan} の商品が存在しません。"})
+
+            unit_price = detail.price
+            discount = float(specified_discount) if specified_discount is not None else float(detail.discount)
+            additional_total += (unit_price - discount) * quantity
+
+        # 削除商品の合計額計算（POSAチェックは_validate_posa_deletionで実行済み）
+        delete_total = 0
         for item in delete_items:
             jan = item['jan']
-            delete_quantity = item['quantity']
-            has_specific_tax = 'tax' in item and item['tax'] is not None
-            has_specific_discount = 'discount' in item and item['discount'] is not None
-            matching = [p for p in products_list if p['jan'] == jan and not p['processed']]
-            if not matching:
-                raise serializers.ValidationError({
-                    'delete_items': f"JANコード {jan} の商品は元取引に存在しません。"
-                })
-            filtered = matching
-            if has_specific_tax:
-                specified_tax = int(item['tax'])
-                filtered = [p for p in filtered if p['tax'] == specified_tax]
-                if not filtered:
-                    raise serializers.ValidationError({
-                        'delete_items': f"JANコード {jan} で税率 {specified_tax} に一致する商品が見つかりません。"
-                    })
-            if has_specific_discount:
-                specified_discount = float(item['discount'])
-                filtered = [p for p in filtered if abs(p['discount'] - specified_discount) < 0.01]
-                if not filtered:
-                    raise serializers.ValidationError({
-                        'delete_items': f"JANコード {jan} で値引き額 {specified_discount} に一致する商品が見つかりません。"
-                    })
-            if len(filtered) > 1:
-                conditions = []
-                if has_specific_tax:
-                    conditions.append(f"税率 {item['tax']}")
-                if has_specific_discount:
-                    conditions.append(f"値引き額 {item['discount']}")
-                raise serializers.ValidationError({
-                    'delete_items': f"JANコード {jan} で条件「{', '.join(conditions)}」に一致する商品が複数あります。"
-                })
-            target = filtered[0]
-            if delete_quantity > target['quantity']:
-                raise serializers.ValidationError({
-                    'delete_items': f"JANコード {jan} の削除数量 {delete_quantity} が元の数量 {target['quantity']} を超えています。"
-                })
-            delete_total += (target['price'] - target['discount']) * delete_quantity
-            target['processed'] = (delete_quantity == target['quantity'])
-            if delete_quantity < target['quantity']:
-                target['quantity'] -= delete_quantity
+            delete_qty = item['quantity']
+            specified_tax = item.get('tax')
+            specified_discount = item.get('discount')
+
+            # POSAの場合（999020から始まる20桁）- 存在チェックのみ
+            if jan.startswith('999020') and len(jan) == 20:
+                dept_code = jan[:8]
+                code = jan[8:]
+                
+                # マッチング：部門コードとPOSAコード
+                matching = [
+                    p for p in products_list
+                    if p['jan'] == dept_code and not p['processed'] and p['extra_code'] == code
+                ]
+                if not matching:
+                    raise serializers.ValidationError({'delete_items': f"元取引に部門コード {dept_code}、POSAコード {code} の商品が存在しません。"})
+            else:
+                # 通常商品の場合
+                matching = [
+                    p for p in products_list
+                    if p['jan'] == jan and not p['processed']
+                ]
+                if not matching:
+                    raise serializers.ValidationError({'delete_items': f"元取引にJANコード {jan} の商品が存在しません。"})
+
+            # 税率で絞り込み
+            if specified_tax is not None:
+                tax_int = int(specified_tax)
+                matching = [p for p in matching if p['tax'] == tax_int]
+                if not matching:
+                    raise serializers.ValidationError({'delete_items': f"JANコード {jan} で税率 {specified_tax} に一致する商品が見つかりません。"})
+
+            # 値引きで絞り込み
+            if specified_discount is not None:
+                disc_float = float(specified_discount)
+                matching = [p for p in matching if abs(p['discount'] - disc_float) < 0.01]
+                if not matching:
+                    raise serializers.ValidationError({'delete_items': f"JANコード {jan} で値引き額 {specified_discount} に一致する商品が見つかりません。"})
+
+            if len(matching) > 1:
+                if jan.startswith('999020') and len(jan) == 20:
+                    dept_code = jan[:8]
+                    code = jan[8:]
+                    raise serializers.ValidationError({'delete_items': f"部門コード {dept_code}、POSAコード {code} で条件に一致する商品が複数あります。税率や値引きを指定してください。"})
+                else:
+                    raise serializers.ValidationError({'delete_items': f"JANコード {jan} で条件に一致する商品が複数あります。税率や値引きを指定してください。"})
+
+            target = matching[0]
+            # 数量チェック（POSAの場合は_validate_posa_deletionで実行済み）
+            if not (jan.startswith('999020') and len(jan) == 20):
+                if delete_qty > target['quantity']:
+                    raise serializers.ValidationError({'delete_items': f"JANコード {jan} の削除数量 {delete_qty} が元の数量 {target['quantity']} を超えています。"})
+
+            delete_total += (target['price'] - target['discount']) * delete_qty
+            if delete_qty == target['quantity']:
+                target['processed'] = True
+            else:
+                target['quantity'] -= delete_qty
+
         net_amount = additional_total - delete_total
         return additional_total, delete_total, net_amount
 
@@ -1270,9 +1459,11 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
 
     def _copy_sale_products(self, origin_transaction, return_transaction):
         for detail in origin_transaction.sale_products.all():
+            # 返品明細を作成（extra_codeも含める）
             ReturnDetail.objects.create(
                 return_transaction=return_transaction,
                 jan=detail.jan,
+                extra_code=detail.extra_code,
                 name=detail.name,
                 price=detail.price,
                 tax=detail.tax,
@@ -1282,11 +1473,22 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
 
     def _process_partial_return(self, validated_data, return_transaction, origin_transaction):
         for item in validated_data.get('delete_items', []):
-            sale_detail = next((d for d in origin_transaction.sale_products.all() if d.jan == item['jan']), None)
+            jan = item['jan']
+            # POSAの場合（999020から始まる20桁）
+            if jan.startswith('999020') and len(jan) == 20:
+                dept_code = jan[:8]
+                code = jan[8:]
+                # 部門コードとPOSAコードでマッチング
+                matching_details = origin_transaction.sale_products.filter(jan=dept_code, extra_code=code)
+            else:
+                # 通常商品の場合
+                matching_details = origin_transaction.sale_products.filter(jan=jan)
+            sale_detail = matching_details.first()
             if sale_detail:
                 ReturnDetail.objects.create(
                     return_transaction=return_transaction,
                     jan=sale_detail.jan,
+                    extra_code=sale_detail.extra_code,
                     name=sale_detail.name,
                     price=sale_detail.price,
                     tax=sale_detail.tax,
@@ -1331,6 +1533,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         products_list = [
             {
                 'jan': p.jan,
+                'extra_code': p.extra_code,
                 'name': p.name,
                 'price': p.price,
                 'tax': int(p.tax),
@@ -1348,7 +1551,18 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
             delete_quantity = item['quantity']
             has_tax = 'tax' in item and item['tax'] is not None
             has_discount = 'discount' in item and item['discount'] is not None
-            matching_products = [p for p in products_list if p['jan'] == jan and not p['processed']]
+            
+            # POSAの場合（999020から始まる20桁）
+            if jan.startswith('999020') and len(jan) == 20:
+                dept_code = jan[:8]
+                code = jan[8:]
+                
+                # 部門コードとPOSAコードでマッチング
+                matching_products = [p for p in products_list if p['jan'] == dept_code and p['extra_code'] == code and not p['processed']]
+            else:
+                # 通常商品の場合
+                matching_products = [p for p in products_list if p['jan'] == jan and not p['processed']]
+            
             if len(matching_products) > 1:
                 if not (has_tax or has_discount):
                     raise serializers.ValidationError({
@@ -1380,6 +1594,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
             if delete_quantity < target['quantity']:
                 remaining_products.append({
                     'jan': target['jan'],
+                    'extra_code': target['extra_code'],
                     'name': target['name'],
                     'price': target['price'],
                     'tax': target['tax'],
@@ -1393,6 +1608,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
             if not product['processed']:
                 remaining_products.append({
                     'jan': product['jan'],
+                    'extra_code': product['extra_code'],
                     'name': product['name'],
                     'price': product['price'],
                     'tax': product['tax'],
@@ -1404,28 +1620,54 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         # 追加商品の処理
         for item in additional_items:
             jan = item['jan']
+            extra_code = item.get('extra_code')
             quantity = item['quantity']
             discount = item.get('discount', 0)
             tax = item.get('tax')
-            try:
-                product_instance = Product.objects.get(jan=jan)
-            except Product.DoesNotExist:
-                raise serializers.ValidationError({
-                    'additional_items': f"JANコード {jan} の商品が存在しません。"
+            
+            # POSAの場合（999020から始まる20桁）
+            if jan.startswith('999020') and len(jan) == 20:
+                dept_code = jan[:8]
+                code = jan[8:]
+                
+                # POSAの場合は部門マスタから情報を取得するか、デフォルト値を使用
+                if tax is None:
+                    tax = 10  # デフォルト税率（要調整）
+                else:
+                    tax = int(tax)
+                
+                remaining_products.append({
+                    'jan': dept_code,  # 部門コードを使用
+                    'extra_code': code,  # POSAコードを使用
+                    'name': item.get('name', 'POSA商品'),  # デフォルト名
+                    'price': item.get('price', 0),  # 価格は必須で渡されることを想定
+                    'tax': tax,
+                    'discount': discount,
+                    'quantity': quantity,
+                    'original_product': False
                 })
-            if tax is None:
-                tax = int(product_instance.tax)
             else:
-                tax = int(tax)
-            remaining_products.append({
-                'jan': jan,
-                'name': product_instance.name,
-                'price': product_instance.price,
-                'tax': tax,
-                'discount': discount,
-                'quantity': quantity,
-                'original_product': False
-            })
+                # 通常商品の処理
+                try:
+                    product_instance = Product.objects.get(jan=jan)
+                except Product.DoesNotExist:
+                    raise serializers.ValidationError({'additional_items': f"JANコード {jan} の商品が存在しません。"})
+                
+                if tax is None:
+                    tax = int(product_instance.tax)
+                else:
+                    tax = int(tax)
+                
+                remaining_products.append({
+                    'jan': jan,
+                    'extra_code': extra_code,
+                    'name': product_instance.name,
+                    'price': product_instance.price,
+                    'tax': tax,
+                    'discount': discount,
+                    'quantity': quantity,
+                    'original_product': False
+                })
 
         new_transaction_data = {
             'original_transaction': original_transaction.id,
@@ -1483,10 +1725,13 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         if return_type in ['all', 'payment_change']:
             self._copy_sale_products(original_transaction, return_transaction)
         elif return_type == 'partial':
-            self._process_partial_return(
-                validated_data, return_transaction, original_transaction
-            )
-        # 在庫戻し（payment_change ではスキップ
+            self._process_partial_return(validated_data, return_transaction, original_transaction)
+        
+        # POSAステータス変更処理（全返品種別で確実に実行）
+        delete_items = validated_data.get('delete_items', []) if return_type == 'partial' else None
+        self._process_posa_status_changes(original_transaction, return_type, delete_items)
+        
+        # 在庫戻し（payment_change ではスキップ）
         if return_transaction.restock and return_type != 'payment_change':
             self._restock_inventory(return_transaction)
 

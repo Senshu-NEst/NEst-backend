@@ -249,6 +249,7 @@ class TransactionDetail(BaseModel):
     """取引商品モデル(中間テーブル)"""
     transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name="sale_products", verbose_name="取引番号")
     jan = models.CharField(max_length=13, verbose_name="JANコード")  # 部門打ちのため外部キー制約を解除
+    extra_code = models.CharField(max_length=30, null=True, blank=True, verbose_name="特殊コード")  # POSAなどJANコード以外に必要な番号を記録するフィールド
     name = models.CharField(max_length=255, verbose_name="商品名")
     price = models.IntegerField(verbose_name="商品価格")
     tax = models.DecimalField(max_digits=3, decimal_places=1, verbose_name="消費税率")
@@ -378,7 +379,6 @@ class CustomUserManager(BaseUserManager):
 
 
 class CustomUser(AbstractBaseUser, PermissionsMixin):
-
     def generate_ulid():
         return str(ulid.new())
 
@@ -517,6 +517,7 @@ class ReturnDetail(BaseModel):
     """
     return_transaction = models.ForeignKey(ReturnTransaction, on_delete=models.CASCADE, related_name='return_details', verbose_name="返品取引")
     jan = models.CharField(max_length=13, verbose_name="JANコード")  # 部門打ちのため外部キー制約を解除
+    extra_code = models.CharField(max_length=30, null=True, blank=True, verbose_name="特殊コード")  # POSAなどJANコード以外に必要な番号を記録するフィールド
     name = models.CharField(max_length=255, verbose_name="商品名")
     price = models.IntegerField(verbose_name="商品価格")
     tax = models.DecimalField(max_digits=3, decimal_places=1, verbose_name="消費税率")
@@ -692,7 +693,7 @@ class POSA(BaseModel):
         ('salled', 'POS通過'),
         ('charged', 'チャージ済'),
         ('BF_disabled', '無効（販売前）'),
-        ('AF_disabled', '無効（販売済）'),
+        ('AF_disabled', '無効（販売後）'),
     )
     POSA_TYPE = (
         ('wallet_gift', 'ウォレットギフトカード'),
@@ -701,7 +702,7 @@ class POSA(BaseModel):
     # --- ステータス別必須フィールド定義 ---
     # created, BF_disabled の場合は buyer, relative_transaction 不要
     REQUIRE_BUYER_AND_TXN = {status for status, _ in POSA_STATUS}
-    REQUIRE_BUYER_AND_TXN -= {'created', 'BF_disabled'}
+    REQUIRE_BUYER_AND_TXN -= {'created', 'BF_disabled', 'AF_disabled'}
 
     # created, BF_disabled, salled の場合は user 不要
     REQUIRE_USER = REQUIRE_BUYER_AND_TXN - {'salled'}
