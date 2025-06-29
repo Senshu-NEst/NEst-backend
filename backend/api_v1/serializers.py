@@ -64,6 +64,7 @@ class ReturnPaymentSerializer(serializers.ModelSerializer):
 
 
 class BaseTransactionSerializer(serializers.ModelSerializer):
+    # TODO:BaseTransactionSerializerで共通する部分のバリデーションを統合する（店舗の存在チェックなど）
     def _check_permissions(self, staff_code, store_code, required_permissions=None):
         if not staff_code:
             raise serializers.ValidationError("スタッフコードが指定されていません。")
@@ -98,29 +99,21 @@ class TaxRateManager:
             return product.tax
         # 指定税率は 0, 8, 10 のいずれかでなければならない
         if specified_tax_rate not in [0, 8, 10]:
-            raise serializers.ValidationError(
-                f"JAN:{product.jan} 不正な税率。税率は0, 8, 10のいずれかを指定してください。"
-            )
+            raise serializers.ValidationError(f"JAN:{product.jan} 不正な税率。税率は0, 8, 10のいずれかを指定してください。")
         # 税率10%の商品は変更不可
         if product.tax == 10 and specified_tax_rate != 10:
-            raise serializers.ValidationError(
-                f"JAN:{product.jan} 税率10%の商品は税率変更できません。"
-            )
+            raise serializers.ValidationError(f"JAN:{product.jan} 税率10%の商品は税率変更できません。")
         # 税率変更が禁止されている場合は、指定税率と元の税率が一致しなければならない
         if product.disable_change_tax:
             if specified_tax_rate != product.tax:
-                raise serializers.ValidationError(
-                    f"JAN:{product.jan} は税率の変更が禁止されています。"
-                )
+                raise serializers.ValidationError(f"JAN:{product.jan} は税率の変更が禁止されています。")
             return product.tax
         # 8%の商品について、指定が10%であれば変更を許可
         if product.tax == 8 and specified_tax_rate == 10:
             return 10
         # それ以外で、指定税率が元と異なる場合はエラー
         if specified_tax_rate != product.tax:
-            raise serializers.ValidationError(
-                f"JAN:{product.jan} は税率変更できません。"
-            )
+            raise serializers.ValidationError(f"JAN:{product.jan} は税率変更できません。")
         return product.tax
 
 
@@ -229,9 +222,7 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
         identifier = jan[:8]
         dept_code = identifier[3:]
         if len(dept_code) != 5:
-            raise serializers.ValidationError({
-                "jan": "POSAコードの識別子が不正です。"
-            })
+            raise serializers.ValidationError({"jan": "POSAコードの識別子が不正です。"})
 
         big_code = dept_code[0]
         middle_code = dept_code[1:3]
@@ -245,9 +236,7 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
                 parent__parent__code=big_code,
             )
         except Department.DoesNotExist:
-            raise serializers.ValidationError({
-                "jan": f"指定された部門コード {dept_code} に一致する部門が存在しません。"
-            })
+            raise serializers.ValidationError({"jan": f"指定された部門コード {dept_code} に一致する部門が存在しません。"})
 
         # 会計フラグチェック
         if dept.get_accounting_flag() != "allow":
@@ -329,9 +318,7 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
         # 部門コード分解
         dept_code = jan[3:]
         if len(dept_code) != 5:
-            raise serializers.ValidationError({
-                "jan": "部門打ちの場合、JANコードは '999' + 5桁の部門コードでなければなりません。"
-            })
+            raise serializers.ValidationError({"jan": "部門打ちの場合、JANコードは '999' + 5桁の部門コードでなければなりません。"})
         big_code = dept_code[0]
         middle_code = dept_code[1:3]
         small_code = dept_code[3:]
@@ -419,9 +406,7 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
 
 class TransactionSerializer(BaseTransactionSerializer):
     # 外部から不足分を補完するため、original_transaction をオプション入力とする
-    original_transaction = serializers.PrimaryKeyRelatedField(
-        queryset=Transaction.objects.all(), write_only=True, required=False
-    )
+    original_transaction = serializers.PrimaryKeyRelatedField(queryset=Transaction.objects.all(), write_only=True, required=False)
     sale_products = TransactionDetailSerializer(many=True)
     payments = PaymentSerializer(many=True)
     date = serializers.DateTimeField(required=False)
@@ -443,10 +428,8 @@ class TransactionSerializer(BaseTransactionSerializer):
                 if field_name in self.fields:
                     self.fields[field_name].read_only = False
 
-
     def validate(self, data):
         errors = {}
-
         # ステータスのチェック：ReturnTransactionの場合は "resale" のみ、通常は "sale" と "training" のみ許可する
         status = data.get("status")
         if self.context.get("return_context", False):
@@ -461,6 +444,7 @@ class TransactionSerializer(BaseTransactionSerializer):
             errors["sale_products"] = "少なくとも1つの商品を指定してください。"
 
         payments = data.get("payments")
+
         if not payments or len(payments) == 0:
             errors["payments"] = "支払方法を指定してください。"
 
@@ -642,20 +626,20 @@ class TransactionSerializer(BaseTransactionSerializer):
 
         # 2) 支払額集計
         payment_totals = {'cash': 0, 'voucher': 0, 'other': 0}
-        for p in payments_data:
-            method = p['payment_method']
-            amt = p['amount']
+        for payments in payments_data:
+            method = payments['payment_method']
+            amount = payments['amount']
             if method == 'cash':
-                payment_totals['cash'] += amt
+                payment_totals['cash'] += amount
             elif method == 'voucher':
-                payment_totals['voucher'] += amt
+                payment_totals['voucher'] += amount
             elif method != 'carryover':
-                payment_totals['other'] += amt
+                payment_totals['other'] += amount
 
         # 3) 支払い処理を順序立てて実行
         remaining_amount = total_amount
         used_cash = 0
-        
+
         # ステップ1: POSA分を現金で優先充当
         if posa_total > 0:
             posa_cash_needed = min(payment_totals['cash'], posa_total)
@@ -719,7 +703,7 @@ class TransactionSerializer(BaseTransactionSerializer):
         total_quantity = 0
         total_amount_tax10 = 0
         total_amount_tax8 = 0
-        total_amount_tax0 = 0  # 税率0の合計金額
+        total_amount_tax0 = 0
         total_discount_amount = 0
 
         for sale_product in sale_products_data:
@@ -855,6 +839,7 @@ class TransactionSerializer(BaseTransactionSerializer):
                     quantity=aggregated_quantity
                 )
 
+    @transaction.atomic
     def create(self, validated_data):
         """
         部門打ち・POSA販売の場合は_validate時に整形済みの値（_is_department, name, jan, price, tax等）を利用し、
@@ -946,9 +931,7 @@ class TransactionSerializer(BaseTransactionSerializer):
                         try:
                             stock = Stock.objects.get(store_code=store_code, jan=product)
                         except Stock.DoesNotExist:
-                            raise serializers.ValidationError(
-                                {"sale_products": f"店舗コード {store_code} と JANコード {product.jan} の在庫は登録されていません。"}
-                            )
+                            raise serializers.ValidationError({"sale_products": f"店舗コード {store_code} と JANコード {product.jan} の在庫は登録されていません。"})
                         stock.stock -= sale_product.get("quantity", 1)
                         stock.save()
                 TransactionDetail.objects.create(
@@ -1010,45 +993,39 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
     class Meta:
         model = ReturnTransaction
         fields = ['id', 'origin_transaction', 'date', 'return_type', 'store_code', 'staff_code', 'terminal_id', 'reason', 'restock', 'payments', 'return_payments', 'return_products', 'additional_items', 'delete_items']
-        extra_kwargs = {
-            'origin_transaction': {'required': True},
-            'staff_code': {'required': True},
-            'restock': {'required': True},
-        }
+        extra_kwargs = {'origin_transaction': {'required': True}, 'staff_code': {'required': True}, 'restock': {'required': True}}
 
     def validate(self, data):
         errors = {}
 
-        # 元取引チェック
         origin_transaction = data.get('origin_transaction')
         if not origin_transaction:
-            errors['origin_transaction'] = "元取引IDが必要です。"
+            errors['origin_transaction'] = "不正な元取引IDです。"
         elif origin_transaction.status not in ['sale', 'resale']:
-            errors['origin_transaction'] = "返品対象外取引です。"
+            errors['origin_transaction'] = "返品できない取引種別です。"
 
         # スタッフ権限チェック
-        try:
+        try:  # TODO:全返品は販売権限なしでも行えるようにする（関数化しないといけないけど関数を関数でラップするのか？）
             self._check_permissions(
                 data.get('staff_code'),
                 store_code=data.get('store_code'),
-                required_permissions=["register", "void"]
+                required_permissions=["register", "void"]  # 再売も行う可能性があるため
             )
         except serializers.ValidationError as e:
             errors['staff_code'] = e.detail
 
-        # store_code 存在チェック
+        # 店舗の存在チェック
         store_code_val = data.get('store_code')
         try:
             data['store_code'] = Store.objects.get(store_code=store_code_val)
         except Store.DoesNotExist:
-            errors['store_code'] = "指定された店舗コードは存在しません。"
+            errors['store_code'] = "不正な店舗コードです。"
 
         # return_type チェック
         allowed_types = dict(ReturnTransaction.RETURN_TYPE_CHOICES)
-        allowed_types['payment_change'] = "支払い変更"
         return_type = data.get('return_type')
         if return_type not in allowed_types:
-            errors['return_type'] = "不正なreturn_typeです。"
+            errors['return_type'] = "不正な返品種別です。"
 
         # payments存在チェック
         payments = data.get('payments', [])
@@ -1131,7 +1108,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
     def _validate_all_return(self, payments, origin_transaction, errors):
         negative_payments = [p for p in payments if float(p.get('amount', 0)) >= 0]
         if negative_payments:
-            errors['payments'] = "全返品では返金金額をマイナスで入力する必要があります。"
+            errors['payments'] = "返金金額はマイナスで入力する必要があります。"
         total = sum(abs(float(p['amount'])) for p in payments)
         if origin_transaction and abs(total - origin_transaction.total_amount) > 0.01:
             errors['payments'] = "返金額合計が元の合計金額と一致しません。"
@@ -1495,7 +1472,6 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
                     discount=sale_detail.discount,
                     quantity=item['quantity']
                 )
-        return None
 
     def _create_new_transaction_for_payment_change(self, original_transaction, return_transaction, new_payments):
         copied_products = []
@@ -1522,12 +1498,9 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         serializer.is_valid(raise_exception=True)
         return serializer.save()
 
-    def _create_new_transaction(
-        self, original_transaction, additional_items, delete_items, payment_inputs
-    ):
+    def _create_new_transaction(self, original_transaction, additional_items, delete_items, payment_inputs):
         additional_items = self._sanitize_items(additional_items, 'additional_items')
         delete_items = self._sanitize_items(delete_items, 'delete_items')
-
         original_products = list(original_transaction.sale_products.all())
         remaining_products = []
         products_list = [
@@ -1565,9 +1538,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
             
             if len(matching_products) > 1:
                 if not (has_tax or has_discount):
-                    raise serializers.ValidationError({
-                        'delete_items': f"JANコード {jan} の商品が複数存在するため、税率または値引き額を指定して削除対象を特定してください。"
-                    })
+                    raise serializers.ValidationError({'delete_items': f"JANコード {jan} の商品が複数存在するため、税率または値引き額を指定して削除対象を特定してください。"})
                 filtered = matching_products
                 if has_tax:
                     specified_tax = int(item['tax'])
@@ -1579,17 +1550,13 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
             else:
                 target = matching_products[0]
                 if has_tax and target['tax'] != int(item['tax']):
-                    raise serializers.ValidationError({
-                        'delete_items': f"JANコード {jan} の指定税率 {item['tax']} が商品の税率 {target['tax']} と一致しません。"
-                    })
+                    raise serializers.ValidationError({'delete_items': f"JANコード {jan} の指定税率 {item['tax']} が商品の税率 {target['tax']} と一致しません。"})
                 if has_discount and abs(target['discount'] - float(item['discount'])) > 0.01:
-                    raise serializers.ValidationError({
-                        'delete_items': f"JANコード {jan} の指定値引き額 {item['discount']} が商品の値引き額 {target['discount']} と一致しません。"
-                    })
+                    raise serializers.ValidationError({'delete_items': f"JANコード {jan} の指定値引き額 {item['discount']} が商品の値引き額 {target['discount']} と一致しません。"})
+            
             if delete_quantity > target['quantity']:
-                raise serializers.ValidationError({
-                    'delete_items': f"JANコード {jan} の削除数量 {delete_quantity} が元の数量 {target['quantity']} を超えています。"
-                })
+                raise serializers.ValidationError({'delete_items': f"JANコード {jan} の削除数量 {delete_quantity} が元の数量 {target['quantity']} を超えています。"})
+            
             target['processed'] = True
             if delete_quantity < target['quantity']:
                 remaining_products.append({
@@ -1694,7 +1661,8 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
     def create(self, validated_data):
         return_type = validated_data.pop('return_type')
         original_transaction = validated_data['origin_transaction']
-        #元取引のステータスを"返品"に変更
+        
+        # 元取引のステータスを"返品"に変更
         original_transaction.status = 'return'
         original_transaction.save()
 
@@ -1737,21 +1705,15 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
 
         # 修正取引（resale）の作成と modify_id への紐付け
         if return_type == 'payment_change':
-            correction_payments = self._create_new_transaction_for_payment_change(
-                original_transaction, return_transaction, correction_payments
-            )
+            correction_payments = self._create_new_transaction_for_payment_change(original_transaction, return_transaction, correction_payments)
         elif return_type == 'partial':
             add_items = validated_data.get('additional_items', [])
             del_items = validated_data.get('delete_items', [])
-            _, _, net_amount = self._compute_additional_delete_totals(
-                add_items, del_items, original_transaction
-            )
+            _, _, net_amount = self._compute_additional_delete_totals(add_items, del_items, original_transaction)
             refund_amount = abs(net_amount) if net_amount < 0 else 0
             carryover_amount = original_transaction.total_amount - refund_amount
             correction_payments = self._create_new_transaction(
-                original_transaction,
-                add_items,
-                del_items,
+                original_transaction, add_items, del_items,
                 [{'payment_method': 'carryover', 'amount': carryover_amount}]
             )
 
@@ -1790,9 +1752,7 @@ class ProductVariationSerializer(serializers.ModelSerializer):
 
     def get_variations(self, obj):
         """バリエーション詳細を取得するメソッド"""
-        variation_details = ProductVariationDetail.objects.filter(
-            product_variation=obj
-        ).select_related('product')
+        variation_details = ProductVariationDetail.objects.filter(product_variation=obj).select_related('product')
         return ProductVariationDetailSerializer(variation_details, many=True).data
 
 
