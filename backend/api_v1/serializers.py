@@ -813,52 +813,33 @@ class TransactionSerializer(BaseTransactionSerializer):
             payment_instances.append(payment_instance)
         transaction_instance.payments.set(payment_instances)
 
-    def _create_transaction_details(self, transaction_instance, sale_products_data, status, store_code):
-        aggregated_details = {}
+    def _aggregate_same_products(self, sale_products_data):
+        aggregated_products = {}
         for sale_product in sale_products_data:
-            product_jan = sale_product.get("jan")
-            tax_rate = sale_product.get("tax")
-            discount_value = sale_product.get("discount", 0)
-            quantity_value = sale_product.get("quantity", 1)
-            is_original = sale_product.get("original_product", False)
-            key = (product_jan, tax_rate, discount_value, is_original)
-            if key not in aggregated_details:
-                aggregated_details[key] = {"quantity": 0, "detail_data": sale_product}
-            aggregated_details[key]["quantity"] += quantity_value
-
-        for key, data in aggregated_details.items():
-            product_jan, tax_rate, discount_value, is_original = key
-            aggregated_quantity = data["quantity"]
-            if data["detail_data"].get("_is_department", False):
-                effective_price = data["detail_data"].get("price")
-                # 商品名は必ず validate 時に設定された "name" または "_department_name" を利用
-                name = data["detail_data"].get("name") or data["detail_data"].get("_department_name")
-                # jan は文字列として格納しているので、そのまま利用
-                TransactionDetail.objects.create(
-                    transaction=transaction_instance,
-                    jan=data["detail_data"].get("jan"),
-                    name=name,
-                    price=effective_price,
-                    tax=tax_rate,
-                    discount=discount_value,
-                    quantity=aggregated_quantity
+            # 部門打ち商品の場合は価格も統合キーに含める
+            if sale_product.get("_is_department", False):
+                key = (
+                    sale_product["jan"],
+                    sale_product["tax"],
+                    sale_product.get("discount", 0),
+                    sale_product.get("original_product", False),
+                    sale_product.get("price", 0)
                 )
             else:
-                product = self._get_product(product_jan)
-                if is_original:
-                    effective_price = data["detail_data"].get("price")
-                else:
-                    store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
-                    effective_price = store_price.get_price() if store_price else product.price
-                TransactionDetail.objects.create(
-                    transaction=transaction_instance,
-                    jan=product.jan,
-                    name=product.name,
-                    price=effective_price,
-                    tax=tax_rate,
-                    discount=discount_value,
-                    quantity=aggregated_quantity
+                key = (
+                    sale_product["jan"],
+                    sale_product["tax"],
+                    sale_product.get("discount", 0),
+                    sale_product.get("original_product", False)
                 )
+            if key not in aggregated_products:
+                aggregated_products[key] = {
+                    "data": sale_product.copy(),
+                    "total_quantity": 0
+                }
+            aggregated_products[key]["total_quantity"] += sale_product["quantity"]
+
+        return aggregated_products
 
     @transaction.atomic
     def create(self, validated_data):
@@ -913,9 +894,15 @@ class TransactionSerializer(BaseTransactionSerializer):
         # Transactionインスタンス作成
         transaction_instance = Transaction.objects.create(**validated_data)
         
-        # 各明細の登録
-        for sale_product in sale_products_data:
-            # 部門打ち・POSA販売なら_ is_departmentフラグに従う
+        # 商品統合処理：同一商品（jan, tax, discount, original_product）の数量を統合
+        aggregated_products = self._aggregate_same_products(sale_products_data)
+
+        # 統合された商品データで各明細を登録
+        for key, aggregated_data in aggregated_products.items():
+            sale_product = aggregated_data["data"]
+            total_quantity = aggregated_data["total_quantity"]
+            
+            # 部門打ち・POSA販売なら_i_create_transaction_detailss_departmentフラグに従う
             if sale_product.get("_is_department", False):
                 # 部門打ち・POSA販売の場合はvalidateで整形済みの値をそのまま利用（在庫減算等はスキップ）
                 TransactionDetail.objects.create(
@@ -925,8 +912,8 @@ class TransactionSerializer(BaseTransactionSerializer):
                     price=sale_product["price"],
                     tax=sale_product["tax"],
                     discount=sale_product.get("discount", 0),
-                    quantity=sale_product["quantity"],
-                    extra_code=sale_product.get("_extra_code")  # POSA固有番号を設定
+                    quantity=total_quantity,
+                    extra_code=sale_product.get("_extra_code")
                 )
                 
                 # POSA販売の場合は、ステータスを更新
@@ -943,6 +930,7 @@ class TransactionSerializer(BaseTransactionSerializer):
                     product = Product.objects.get(jan=sale_product["jan"])
                 except Product.DoesNotExist:
                     raise serializers.ValidationError({"jan": f"JANコード {sale_product['jan']} は登録されていません。"})
+                
                 if sale_product.get("original_product", False):
                     effective_price = sale_product.get("price")
                 else:
@@ -953,8 +941,9 @@ class TransactionSerializer(BaseTransactionSerializer):
                             stock = Stock.objects.get(store_code=store_code, jan=product)
                         except Stock.DoesNotExist:
                             raise serializers.ValidationError({"sale_products": f"店舗コード {store_code} と JANコード {product.jan} の在庫は登録されていません。"})
-                        stock.stock -= sale_product.get("quantity", 1)
+                        stock.stock -= total_quantity
                         stock.save()
+                
                 TransactionDetail.objects.create(
                     transaction=transaction_instance,
                     jan=product.jan,
@@ -962,8 +951,7 @@ class TransactionSerializer(BaseTransactionSerializer):
                     price=effective_price,
                     tax=sale_product["tax"],
                     discount=sale_product.get("discount", 0),
-                    quantity=sale_product["quantity"]
-                    # 通常商品の場合はextra_codeは設定しない
+                    quantity=total_quantity 
                 )
 
         # 支払いの処理
