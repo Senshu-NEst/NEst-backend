@@ -3,7 +3,7 @@ from django.utils import timezone
 from django.db import transaction
 from rest_framework.fields import empty
 from .views import StockReceiveHistory, StockReceiveHistoryItem
-from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, WalletTransaction, Wallet, Approval, Store, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA
+from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, WalletTransaction, Wallet, Approval, Store, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA, DiscountedJAN
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 
@@ -64,31 +64,54 @@ class ReturnPaymentSerializer(serializers.ModelSerializer):
 
 
 class BaseTransactionSerializer(serializers.ModelSerializer):
-    # TODO:BaseTransactionSerializerで共通する部分のバリデーションを統合する（店舗の存在チェックなど）
-    def _check_permissions(self, staff_code, store_code, required_permissions=None):
-        if not staff_code:
-            raise serializers.ValidationError("スタッフコードが指定されていません。")
+    # 各サブクラスでオーバーライドされるべき権限リスト
+    required_permissions = []
+
+    def validate(self, data):
+        """共通バリデーション：店舗の存在チェックとスタッフの権限チェック"""
+        errors = {}
+        staff_code = data.get("staff_code")
+        store_code_val = data.get("store_code")
+
+        # 1. 店舗の存在チェック
         try:
-            staff = Staff.objects.get(staff_code=staff_code)
-        except Staff.DoesNotExist:
-            raise serializers.ValidationError("指定されたスタッフが存在しません。")
+            store_instance = Store.objects.get(store_code=store_code_val)
+            data['store_code'] = store_instance  # 後続処理のためにインスタンスを渡す
+        except Store.DoesNotExist:
+            errors['store_code'] = "不正な店舗コードです。"
+            # 店舗が存在しない場合は以降のスタッフチェックができないため、ここで例外を発生
+            raise serializers.ValidationError(errors)
 
-        permission_checker = UserPermissionChecker(staff_code)
-        permissions = permission_checker.get_permissions()
+        # 2. スタッフの権限チェック
+        if not staff_code:
+            errors["staff_code"] = "スタッフコードが指定されていません。"
+        else:
+            try:
+                staff = Staff.objects.get(staff_code=staff_code)
+                permission_checker = UserPermissionChecker(staff_code)
+                permissions = permission_checker.get_permissions()
 
-        # store_codeがオブジェクトの場合は、store_codeを取り出す
-        if isinstance(store_code, Store):
-            store_code = store_code.store_code
+                # 所属店舗と処理対象店舗が異なる場合の権限チェック
+                if staff.affiliate_store.store_code != store_instance.store_code:
+                    if "global" not in permissions:
+                        errors["staff_code"] = "このスタッフは自店のみ処理可能です。"
+                
+                # サブクラスで定義された権限のチェック
+                if self.required_permissions:
+                    missing = [p for p in self.required_permissions if p not in permissions]
+                    if missing:
+                        errors["staff_code"] = f"このスタッフは次の権限が不足しています: {', '.join(missing)}"
+                
+                # 後続処理のために権限情報を渡す
+                data['_permissions'] = permissions
 
-        if staff.affiliate_store.store_code != store_code:
-            if "global" not in permissions:
-                raise serializers.ValidationError("このスタッフは自店のみ処理可能です。")
-        # 必要なパーミッションの存在確認
-        if required_permissions:
-            missing_permissions = [perm for perm in required_permissions if perm not in permissions]
-            if missing_permissions:
-                raise serializers.ValidationError(f"このスタッフは次の権限が不足しています: {', '.join(missing_permissions)}")
-        return permissions
+            except Staff.DoesNotExist:
+                errors["staff_code"] = "指定されたスタッフが存在しません。"
+
+        if errors:
+            raise serializers.ValidationError(errors)
+        
+        return data
 
 
 class TaxRateManager:
@@ -189,6 +212,11 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"quantity": "数量は必須項目です。"})
         if price is not None and discount > price:
             raise serializers.ValidationError({"discount": "不正な割引額が入力されました。"})
+
+        # 値引きJAN処理
+        discounted_data = self._validate_discounted_jan(data)
+        if discounted_data:
+            return discounted_data
 
         # POSA販売処理（20桁、先頭999020）
         if isinstance(jan, str) and len(jan) == 20 and jan.startswith("999020"):
@@ -411,14 +439,59 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
         data["discount"] = discount
         return data
 
+    def _validate_discounted_jan(self, data):
+        """値引きJANの検証処理"""
+        jan = data.get("jan")
+        
+        try:
+            discounted_jan = DiscountedJAN.objects.select_related(
+                'stock__jan', 
+                'stock__store_code'
+            ).get(instore_jan=jan)
+        except DiscountedJAN.DoesNotExist:
+            return None
+
+        # ルートシリアライザからstore_codeを取得
+        if not hasattr(self, 'root') or not self.root:
+            return None
+        store_code = self.root.initial_data.get('store_code')
+        if not store_code:
+            # store_codeが取得できない場合は、何もしない（TransactionSerializerのvalidateでエラーになるはず）
+            return None
+
+        # 店舗コードのチェック
+        if discounted_jan.stock.store_code.store_code != store_code:
+            raise serializers.ValidationError({"jan": "この店舗では使用できない値引きJANです。"})
+        
+        # 使用済みチェック
+        if discounted_jan.is_used:
+            raise serializers.ValidationError({"jan": "この値引きJANは既に使用済みです。"})
+
+        # 在庫チェック
+        #if discounted_jan.stock.stock < data.get("quantity", 1):
+        #    raise serializers.ValidationError({"quantity": "値引き商品の在庫が不足しています。"})
+
+        original_product = discounted_jan.stock.jan
+        
+        # dataを値引きJANの情報で上書き
+        data["jan"] = original_product.jan
+        data["name"] = original_product.name
+        data["price"] = discounted_jan.discounted_price
+        data["tax"] = int(original_product.tax)
+        data["discount"] = original_product.price - discounted_jan.discounted_price
+        data["extra_code"] = discounted_jan.instore_jan
+        data["_is_discounted"] = True
+        data["_discounted_jan_instance"] = discounted_jan  # createメソッドで使うためにインスタンスを渡す
+
+        return data
+
 
 class TransactionSerializer(BaseTransactionSerializer):
-    # 外部から不足分を補完するため、original_transaction をオプション入力とする
+    required_permissions = ["register"]
     original_transaction = serializers.PrimaryKeyRelatedField(queryset=Transaction.objects.all(), write_only=True, required=False)
     sale_products = TransactionDetailSerializer(many=True)
     payments = PaymentSerializer(many=True)
     date = serializers.DateTimeField(required=False)
-    # 承認番号は外部入力がない場合もあるので required=False
     approval_number = serializers.CharField(required=False, write_only=True)
 
     class Meta:
@@ -427,9 +500,6 @@ class TransactionSerializer(BaseTransactionSerializer):
         read_only_fields = ["id", "user", "total_quantity", "total_tax10", "total_tax8", "tax_amount", "total_amount", "change", "discount_amount", "deposit"]
 
     def __init__(self, *args, **kwargs):
-        """
-        コンテキストに 'external_data': True がある場合、read_only_fields も外部から上書きできるようにする。
-        """
         super().__init__(*args, **kwargs)
         if self.context.get("external_data", False):
             for field_name in self.Meta.read_only_fields:
@@ -437,156 +507,138 @@ class TransactionSerializer(BaseTransactionSerializer):
                     self.fields[field_name].read_only = False
 
     def validate(self, data):
+        # BaseTransactionSerializerの共通バリデーションを呼び出す
+        data = super().validate(data)
         errors = {}
-        # ステータスのチェック：ReturnTransactionの場合は "resale" のみ、通常は "sale" と "training" のみ許可する
+        
         status = data.get("status")
-        if self.context.get("return_context", False):
-            allowed_statuses = ["resale"]
-        else:
-            allowed_statuses = ["sale", "training"]
+        sale_products = data.get("sale_products")
+        payments = data.get("payments")
+        permissions = data.get("_permissions")
+
+        # ステータスチェック
+        allowed_statuses = ["resale"] if self.context.get("return_context") else ["sale", "training"]
         if status not in allowed_statuses:
             errors["status"] = "無効なstatusが指定されました。"
 
-        sale_products = data.get("sale_products")
-        if not sale_products or len(sale_products) == 0:
+        # 商品・支払い情報の存在チェック
+        if not sale_products:
             errors["sale_products"] = "少なくとも1つの商品を指定してください。"
-
-        payments = data.get("payments")
-
-        if not payments or len(payments) == 0:
+        if not payments:
             errors["payments"] = "支払方法を指定してください。"
-
-        if status != "resale" and any(item['payment_method'] == 'carryover' for item in payments):
+        if status != "resale" and any(p['payment_method'] == 'carryover' for p in payments):
             errors["payments"] = "引継支払は再売以外で使用できません。"
 
-        # POSA販売時の支払い方法チェック（POSAのみの購入の場合は現金のみ）
-        # ただし、再売取引（一部返品からの修正取引）の場合はPOSAチェックをスキップ
-        posa_products = [p for p in sale_products if p.get("_is_posa", False)]
+        # 承認番号チェック
+        if not self.context.get("external_data"):
+            self._validate_approval_number(data.get("approval_number"), status, data, errors)
 
-        # スタッフコードのチェックおよび権限チェック
-        staff_code = data.get("staff_code")
-        try:
-            permissions = self._check_permissions(staff_code, data.get("store_code"), required_permissions=["register"])
-        except serializers.ValidationError as e:
-            errors["staff"] = e.detail
-            permissions = None
-
-        # 承認番号のチェック（external_data=Falseの場合）
-        if not self.context.get("external_data", False):
-            approval_number = data.get("approval_number")
-            if not approval_number:
-                errors["approval_number"] = "承認番号が入力されていません。"
-            else:
-                if not (len(approval_number) == 8 and approval_number.isdigit()):
-                    errors["approval_number"] = "承認番号の形式に誤りがあります。数字8桁を入力してください。"
-                else:
-                    try:
-                        approval = Approval.objects.get(approval_number=approval_number)
-                        if status != "training" and approval.is_used:
-                            errors["approval_number"] = "この承認番号は使用済みです。"
-                        else:
-                            data["user"] = approval.user
-                    except Approval.DoesNotExist:
-                        errors["approval_number"] = "承認番号が存在しません。"
-
-        # 各商品の値引きチェック（各商品ごとにエラーを集約）
-        discount_errors = self._aggregate_discount_errors(sale_products, data.get("store_code"), permissions)
-        if discount_errors:
-            errors["sale_products_discount"] = discount_errors
-
-        # 支払い金額と商品合計金額のチェック
-        try:
-            totals = self._calculate_totals(sale_products, data.get("store_code"))
-        except serializers.ValidationError as e:
-            errors["sale_products_totals"] = e.detail
-            totals = None
-
-        if totals is not None:
-            total_amount = totals['total_amount']
+        # 商品関連のチェック
+        if sale_products:
+            store_code_instance = data.get("store_code")  # super().validate()でインスタンス化済み
+            discount_errors = self._aggregate_discount_errors(sale_products, store_code_instance, permissions)
+            if discount_errors:
+                errors["sale_products_discount"] = discount_errors
             
-            # 各支払い方法（現金、金券、キャッシュレス）毎に合計額を算出
-            payment_totals = {
-                'cash': 0,
-                'voucher': 0,  # 金券
-                'other': 0,    # キャッシュレス（例: card, wallet, qr など）
-            }
-            for payment in payments:
-                method = payment.get('payment_method')
-                amount = payment.get('amount', 0)
-                if method == 'cash':
-                    payment_totals['cash'] += amount
-                elif method == 'voucher':
-                    payment_totals['voucher'] += amount
-                else:
-                    payment_totals['other'] += amount
-
-            # 支払いバリデーションの実行
-            payment_validation_errors = self._validate_payment_amounts(payment_totals, total_amount, posa_products)
-            if payment_validation_errors:
-                errors.update(payment_validation_errors)
-
-            # トレーニング以外の場合はウォレット残高のチェック（withdraw は create 側で実施）
-            if status != "training":
-                user = data.get("user")
-                wallet_payments = [p for p in payments if p['payment_method'] == 'wallet']
-                if wallet_payments and user:
-                    total_wallet_payment = sum(p['amount'] for p in wallet_payments)
-                    if total_wallet_payment > user.wallet.balance:
-                        shortage = total_wallet_payment - user.wallet.balance
-                        errors["wallet"] = f"ウォレット残高不足。{int(shortage)}円分不足しています。"
+            try:
+                totals = self._calculate_totals(sale_products, store_code_instance)
+                data["_totals"] = totals
+                # 支払い関連のチェック
+                self._validate_all_payments(payments, totals, status, data.get("user"), errors)
+            except serializers.ValidationError as e:
+                errors["sale_products_totals"] = e.detail
 
         if errors:
             raise serializers.ValidationError(errors)
-
-        # 補助情報として計算結果を data に付与
-        data["_totals"] = totals
         return data
 
-    def _validate_payment_amounts(self, payment_totals, total_amount, posa_products=None):
-            """
-            支払いバリデーションを効率的に実行
-            優先順位：1. POSA現金充当 2. キャッシュレス決済上限チェック 3. 金券利用チェック
-            すべてのエラーを収集してから一括で返す
-            """
-            errors = {}
-            
-            # 基本的な支払い総額チェック
-            basic_payment_total = payment_totals['cash'] + payment_totals['voucher'] + payment_totals['other']
-            if basic_payment_total < total_amount:
-                errors["payment_total"] = "支払いの合計金額が不足しています。"
-            
-            # 支払い処理の優先順位に従った計算
-            remaining_amount = total_amount
-            
-            # 1. POSA商品の現金充当（最優先）
-            if posa_products and not self.context.get("skip_posa_check", False):
-                posa_total = sum((p.get("price", 0) - p.get("discount", 0)) * p.get("quantity", 1) for p in posa_products)
-                
-                # POSA商品分の現金不足チェック
-                if payment_totals['cash'] < posa_total:
-                    shortage = posa_total - payment_totals['cash']
-                    errors["posa_payment"] = f"POSA商品分（{posa_total}円）は現金での支払いが必要です。現金不足: {shortage}円"
+    def _validate_approval_number(self, approval_number, status, data, errors):
+        if not approval_number:
+            errors["approval_number"] = "承認番号が入力されていません。"
+        elif not (len(approval_number) == 8 and approval_number.isdigit()):
+            errors["approval_number"] = "承認番号の形式に誤りがあります。数字8桁を入力してください。"
+        else:
+            try:
+                approval = Approval.objects.get(approval_number=approval_number)
+                if status != "training" and approval.is_used:
+                    errors["approval_number"] = "この承認番号は使用済みです。"
                 else:
-                    # POSA分を残額から差し引き
-                    remaining_amount -= posa_total
-            
-            # 2. キャッシュレス決済上限チェック（釣り銭が出せないため）
-            if payment_totals['other'] > remaining_amount:
-                errors["cashless_payment"] = "キャッシュレス決済が必要額を超えています。"
+                    data["user"] = approval.user
+            except Approval.DoesNotExist:
+                errors["approval_number"] = "承認番号が存在しません。"
+
+    def _validate_all_payments(self, payments, totals, status, user, errors):
+        total_amount = totals['total_amount']
+        posa_products = [p for p in self.initial_data.get("sale_products", []) if p.get("_is_posa", False)]
+        
+        payment_totals = {'cash': 0, 'voucher': 0, 'other': 0}
+        for p in payments:
+            method = p.get('payment_method')
+            amount = p.get('amount', 0)
+            if method == 'cash':
+                payment_totals['cash'] += amount
+            elif method == 'voucher':
+                payment_totals['voucher'] += amount
             else:
-                # キャッシュレス決済分を残額から差し引き
-                remaining_amount -= payment_totals['other']
+                payment_totals['other'] += amount
+
+        payment_errors = self._validate_payment_amounts(payment_totals, total_amount, posa_products)
+        if payment_errors:
+            errors.update(payment_errors)
+
+        if status != "training" and user:
+            wallet_payments = [p for p in payments if p['payment_method'] == 'wallet']
+            if wallet_payments:
+                total_wallet_payment = sum(p['amount'] for p in wallet_payments)
+                if total_wallet_payment > user.wallet.balance:
+                    shortage = total_wallet_payment - user.wallet.balance
+                    errors["wallet"] = f"ウォレット残高不足。{int(shortage)}円分不足しています。"
+
+    def _validate_payment_amounts(self, payment_totals, total_amount, posa_products=None):
+        """
+        支払いバリデーションを効率的に実行
+        優先順位：1. POSA現金充当 2. キャッシュレス決済上限チェック 3. 金券利用チェック
+        すべてのエラーを収集してから一括で返す
+        """
+        errors = {}
+        
+        # 基本的な支払い総額チェック
+        basic_payment_total = payment_totals['cash'] + payment_totals['voucher'] + payment_totals['other']
+        if basic_payment_total < total_amount:
+            errors["payment_total"] = "支払いの合計金額が不足しています。"
+        
+        # 支払い処理の優先順位に従った計算
+        remaining_amount = total_amount
+        
+        # 1. POSA商品の現金充当（最優先）
+        if posa_products and not self.context.get("skip_posa_check", False):
+            posa_total = sum((p.get("price", 0) - p.get("discount", 0)) * p.get("quantity", 1) for p in posa_products)
             
-            # 3. 金券利用チェック（キャッシュレス決済後の残額に対して）
-            if payment_totals['voucher'] > 0:
-                # 金券が実際に利用される額
-                actual_voucher_usage = min(payment_totals['voucher'], remaining_amount)
-                
-                # 金券が登録されているのに全く利用されていない場合
-                if actual_voucher_usage == 0:
-                    errors["voucher_payment"] = "金券が登録されていますが、利用されていません。"
+            # POSA商品分の現金不足チェック
+            if payment_totals['cash'] < posa_total:
+                shortage = posa_total - payment_totals['cash']
+                errors["posa_payment"] = f"POSA商品分（{posa_total}円）は現金での支払いが必要です。現金不足: {shortage}円"
+            else:
+                # POSA分を残額から差し引き
+                remaining_amount -= posa_total
+        
+        # 2. キャッシュレス決済上限チェック（釣り銭が出せないため）
+        if payment_totals['other'] > remaining_amount:
+            errors["cashless_payment"] = "キャッシュレス決済が必要額を超えています。"
+        else:
+            # キャッシュレス決済分を残額から差し引き
+            remaining_amount -= payment_totals['other']
+        
+        # 3. 金券利用チェック（キャッシュレス決済後の残額に対して）
+        if payment_totals['voucher'] > 0:
+            # 金券が実際に利用される額
+            actual_voucher_usage = min(payment_totals['voucher'], remaining_amount)
             
-            return errors
+            # 金券が登録されているのに全く利用されていない場合
+            if actual_voucher_usage == 0:
+                errors["voucher_payment"] = "金券が登録されていますが、利用されていません。"
+        
+        return errors
 
     def _calculate_change(self, payments_data, total_amount, sale_products_data):
         """
@@ -645,8 +697,8 @@ class TransactionSerializer(BaseTransactionSerializer):
     def _aggregate_discount_errors(self, sale_products_data, store_code, permissions):
         discount_error_list = []
         for sale_product in sale_products_data:
-            # 部門打ち・POSA販売の場合は割引チェックをスキップ
-            if sale_product.get("_is_department", False):
+            # 部門打ち・POSA販売・値引きJANの場合は割引チェックをスキップ
+            if sale_product.get("_is_department", False) or sale_product.get("_is_discounted", False):
                 continue
             jan = sale_product.get("jan", "不明")
             try:
@@ -704,8 +756,8 @@ class TransactionSerializer(BaseTransactionSerializer):
             jan = sale_product.get("jan", "不明")
             
             try:
-                # 部門打ち・POSA販売の場合は、製品情報に依存せず入力値を利用する
-                if sale_product.get("_is_department", False):
+                # 部門打ち・POSA販売・値引きJANの場合は、製品情報に依存せず入力値を利用する
+                if sale_product.get("_is_department", False) or sale_product.get("_is_discounted", False):
                     effective_price = sale_product.get("price")
                     applied_tax_rate = sale_product.get("tax")
                 else:
@@ -758,60 +810,13 @@ class TransactionSerializer(BaseTransactionSerializer):
             'total_amount': total_amount
         }
 
-    def _process_product(self, store_code, sale_product_data, status):
-        errors = []
-        jan_value = sale_product_data.get("jan")
-        
-        if isinstance(jan_value, str) and jan_value.startswith("999"):
-            # 部門打ちの場合は在庫減算をスキップし、price をそのまま返す
-            return None, sale_product_data.get("price"), errors
-        else:
-            product, product_error = self._get_product(jan_value)
-            if product_error:
-                errors.append(f"JAN:{jan_value} - {product_error}")
-                return None, 0, errors
-            
-            store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
-            effective_price = store_price.get_price() if store_price else product.price
-            
-            if status != "training":
-                stock, stock_error = self._get_stock(store_code, product)
-                if stock_error:
-                    errors.append(f"JAN:{jan_value} - {stock_error}")
-                else:
-                    stock.stock -= sale_product_data.get("quantity", 1)
-                    stock.save()
-            
-            return product, effective_price, errors
-
     def _get_product(self, jan_code):
         try:
-            product = Product.objects.get(jan=jan_code)
-            return product, None
+            return Product.objects.get(jan=jan_code), None
         except Product.DoesNotExist:
             return None, f"JANコード {jan_code} は登録されていません。"
         except Exception as e:
             return None, f"商品取得エラー: {str(e)}"
-
-    def _get_stock(self, store_code, product):
-        try:
-            stock = Stock.objects.get(store_code=store_code, jan=product)
-            return stock, None
-        except Stock.DoesNotExist:
-            return None, f"店舗コード {store_code} と JANコード {product.jan} の在庫は登録されていません。"
-        except Exception as e:
-            return None, f"在庫取得エラー: {str(e)}"
-
-    def _create_payments(self, transaction_instance, payments_data):
-        payment_instances = []
-        for payment_data in payments_data:
-            payment_instance = Payment.objects.create(
-                transaction=transaction_instance,
-                payment_method=payment_data['payment_method'],
-                amount=payment_data['amount']
-            )
-            payment_instances.append(payment_instance)
-        transaction_instance.payments.set(payment_instances)
 
     def _aggregate_same_products(self, sale_products_data):
         aggregated_products = {}
@@ -902,19 +907,21 @@ class TransactionSerializer(BaseTransactionSerializer):
             sale_product = aggregated_data["data"]
             total_quantity = aggregated_data["total_quantity"]
             
-            # 部門打ち・POSA販売なら_i_create_transaction_detailss_departmentフラグに従う
-            if sale_product.get("_is_department", False):
-                # 部門打ち・POSA販売の場合はvalidateで整形済みの値をそのまま利用（在庫減算等はスキップ）
-                TransactionDetail.objects.create(
-                    transaction=transaction_instance,
-                    jan=sale_product["jan"],
-                    name=sale_product.get("name") or sale_product.get("_department_name"),
-                    price=sale_product["price"],
-                    tax=sale_product["tax"],
-                    discount=sale_product.get("discount", 0),
-                    quantity=total_quantity,
-                    extra_code=sale_product.get("_extra_code")
-                )
+            # 部門打ち・POSA販売・値引きJANならフラグに従う
+            if sale_product.get("_is_department", False) or sale_product.get("_is_discounted", False):
+                # 値引きJANの場合は在庫を減算し、使用済みにする
+                if sale_product.get("_is_discounted", False):
+                    discounted_jan_instance = sale_product.get("_discounted_jan_instance")
+                    if discounted_jan_instance:
+                        stock = discounted_jan_instance.stock
+                        if status != "training":
+                            stock.stock -= total_quantity
+                            stock.save()
+                            discounted_jan_instance.is_used = True
+                            discounted_jan_instance.save()
+                    else:
+                        # _validate_discounted_janで渡されるはずだが、念のため
+                        raise serializers.ValidationError({"jan": f"値引きJAN {sale_product.get('extra_code')} の処理中にエラーが発生しました。"})
                 
                 # POSA販売の場合は、ステータスを更新
                 if sale_product.get("_is_posa", False):
@@ -988,6 +995,7 @@ class ReturnDetailSerializer(serializers.ModelSerializer):
 
 
 class ReturnTransactionSerializer(BaseTransactionSerializer):
+    required_permissions = ["register", "void"]
     return_type = serializers.CharField()
     reason = serializers.CharField()
     payments = ReturnPaymentSerializer(many=True, write_only=True)
@@ -1005,58 +1013,44 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         extra_kwargs = {'origin_transaction': {'required': True}, 'staff_code': {'required': True}, 'restock': {'required': True}}
 
     def validate(self, data):
+        # BaseTransactionSerializerの共通バリデーションを呼び出す
+        data = super().validate(data)
         errors = {}
 
         origin_transaction = data.get('origin_transaction')
+        return_type = data.get('return_type')
+        payments = data.get('payments', [])
+
+        # 元取引のチェック
         if not origin_transaction:
             errors['origin_transaction'] = "不正な元取引IDです。"
         elif origin_transaction.status not in ['sale', 'resale']:
             errors['origin_transaction'] = "返品できない取引種別です。"
 
-        # スタッフ権限チェック
-        try:  # TODO:全返品は販売権限なしでも行えるようにする（関数化しないといけないけど関数を関数でラップするのか？）
-            self._check_permissions(
-                data.get('staff_code'),
-                store_code=data.get('store_code'),
-                required_permissions=["register", "void"]  # 再売も行う可能性があるため
-            )
-        except serializers.ValidationError as e:
-            errors['staff_code'] = e.detail
-
-        # 店舗の存在チェック
-        store_code_val = data.get('store_code')
-        try:
-            data['store_code'] = Store.objects.get(store_code=store_code_val)
-        except Store.DoesNotExist:
-            errors['store_code'] = "不正な店舗コードです。"
-
-        # return_type チェック
-        allowed_types = dict(ReturnTransaction.RETURN_TYPE_CHOICES)
-        return_type = data.get('return_type')
-        if return_type not in allowed_types:
+        # 返品種別のチェック
+        if return_type not in dict(ReturnTransaction.RETURN_TYPE_CHOICES):
             errors['return_type'] = "不正な返品種別です。"
 
-        # payments存在チェック
-        payments = data.get('payments', [])
+        # 支払い情報の存在チェック
         if not payments:
             errors['payments'] = "支払い情報を入力してください。"
 
-        # 部分返品時はアイテムを型変換・チェック
+        # 部分返品時のアイテムサニタイズ
         if return_type == 'partial':
-            data['additional_items'] = self._sanitize_items(
-                data.get('additional_items', []), 'additional_items'
-            )
-            data['delete_items'] = self._sanitize_items(
-                data.get('delete_items', []), 'delete_items'
-            )
+            try:
+                data['additional_items'] = self._sanitize_items(data.get('additional_items', []), 'additional_items')
+                data['delete_items'] = self._sanitize_items(data.get('delete_items', []), 'delete_items')
+            except serializers.ValidationError as e:
+                errors.update(e.detail)
 
-        # 各ケースの個別バリデーション
-        if return_type == 'all':
-            self._validate_all_return(payments, origin_transaction, errors)
-        elif return_type == 'payment_change':
-            self._validate_payment_change(data, payments, errors)
-        elif return_type == 'partial':
-            self._validate_partial_return(data, origin_transaction, payments, errors)
+        # 各返品種別の個別バリデーション
+        if not errors:  # 基本的なエラーがない場合のみ個別バリデーションに進む
+            if return_type == 'all':
+                self._validate_all_return(payments, origin_transaction, errors)
+            elif return_type == 'payment_change':
+                self._validate_payment_change(data, payments, errors)
+            elif return_type == 'partial':
+                self._validate_partial_return(data, origin_transaction, payments, errors)
 
         if errors:
             raise serializers.ValidationError(errors)
@@ -1140,7 +1134,6 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
             return
 
         payment_sum = sum(int(p.get('amount', 0)) for p in payments)
-        print(payment_sum)
         if net_amount > 0:  # 追加料金
             if payment_sum < net_amount - 0.01:
                 errors['payments'] = f"追加支払いが不足しています。必要額: {net_amount}、入力額: {payment_sum}"
@@ -1173,7 +1166,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         if delete_items_list is None:
             posa_products = origin_transaction.sale_products.filter(
                 jan__startswith='999020',
-                extra_code__isnull=False  #　二重否定でわかりづらいがextra_codeが存在することをチェック
+                extra_code__isnull=False  # 二重否定でわかりづらいがextra_codeが存在することをチェック
             ).exclude(extra_code='')
 
             for product in posa_products:
@@ -1321,6 +1314,14 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
                 ]
                 if not matching:
                     raise serializers.ValidationError({'delete_items': f"元取引に部門コード {dept_code}、POSAコード {code} の商品が存在しません。"})
+            # 値引きJANの場合
+            elif jan.startswith('20') and len(jan) == 13:
+                matching = [
+                    p for p in products_list
+                    if p['extra_code'] == jan and not p['processed']
+                ]
+                if not matching:
+                    raise serializers.ValidationError({'delete_items': f"元取引に値引きJAN {jan} の商品が存在しません。"})
             else:
                 # 通常商品の場合
                 matching = [
@@ -1390,52 +1391,63 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
 
     def _restock_inventory(self, return_transaction):
         """
-        返品先店舗(return_transaction.store_code)に対して、
-        返品明細(return_transaction.return_details)の数量分を
-        StockReceiveHistory/StockReceiveHistoryItem を経由して戻します。
+        返品先店舗に対して在庫を戻します。
+        - 通常商品：StockReceiveHistory経由で在庫を戻す。
+        - 値引きJAN商品：直接Stockを更新し、is_usedフラグをFalseに戻す。
         """
-        # 1) 返品明細を処理するために必要な情報を事前に取得
         return_details = return_transaction.return_details.all()
+        normal_return_items = []
         
-        # 2) JANコードが999から始まる商品（POSA等）を除外して処理対象を確認
-        target_details = [detail for detail in return_details if not detail.jan.startswith('999')]
-        
-        # 3) 在庫に戻す商品がない場合は処理を終了
-        if not target_details:
+        for detail in return_details:
+            # 値引きJAN（extra_codeに"20"で始まるJANがある）の場合
+            if detail.extra_code and detail.extra_code.startswith('20'):
+                try:
+                    discounted_jan = DiscountedJAN.objects.get(instore_jan=detail.extra_code)
+                    
+                    # 在庫を戻す
+                    stock = discounted_jan.stock
+                    stock.stock += detail.quantity
+                    stock.save()
+                    
+                    # 使用済みフラグを解除
+                    discounted_jan.is_used = False
+                    discounted_jan.save()
+                    
+                except DiscountedJAN.DoesNotExist:
+                    # 念のためエラーハンドリング
+                    continue
+            # 通常商品（POSA等を除く）の場合
+            elif not detail.jan.startswith('999'):
+                normal_return_items.append(detail)
+
+        # 通常商品の在庫戻し処理
+        if not normal_return_items:
             return
-        
-        # 4) 入荷履歴を作成（返品担当者＝入荷担当者）
+
         history = StockReceiveHistory.objects.create(
             store_code=return_transaction.store_code,
             staff_code=return_transaction.staff_code,
         )
-        # 5) 商品を一括取得
-        target_jan_codes = [detail.jan for detail in target_details]
-        products = {product.jan: product for product in Product.objects.filter(jan__in=target_jan_codes)}
+        target_jan_codes = [detail.jan for detail in normal_return_items]
+        products = {p.jan: p for p in Product.objects.filter(jan__in=target_jan_codes)}
         
-        # 6) 在庫を一括取得
-        stock_entries = {f"{stock.store_code}_{stock.jan.jan}": stock for stock in Stock.objects.filter(store_code=history.store_code, jan__in=products.values())}
-
-        # 7) 各返品明細ごとに在庫を戻す
-        for detail in target_details:
-            jan_code = detail.jan
-
-            # 商品取得
-            product = products.get(jan_code)
-            if not product:
-                raise serializers.ValidationError({"restock": f"JANコード {jan_code} の商品が存在しません。"})
-
-            # 在庫エントリ取得
-            stock_entry = stock_entries.get(f"{history.store_code}_{product.jan}")
-            if not stock_entry:
-                raise serializers.ValidationError({"restock": f"店舗 {history.store_code.store_code} に JANコード {product.jan} の在庫エントリが見つかりません。"})
-
-            # 在庫の更新
-            stock_entry.stock += detail.quantity
-            stock_entry.save()
-
-            # 入荷履歴アイテム作成
-            StockReceiveHistoryItem.objects.create(history=history, jan=product, additional_stock=detail.quantity)
+        for detail in normal_return_items:
+            product = products.get(detail.jan)
+            if product:
+                stock_entry, created = Stock.objects.get_or_create(
+                    store_code=history.store_code, 
+                    jan=product,
+                    defaults={'stock': detail.quantity}
+                )
+                if not created:
+                    stock_entry.stock += detail.quantity
+                    stock_entry.save()
+                
+                StockReceiveHistoryItem.objects.create(
+                    history=history, 
+                    jan=product, 
+                    additional_stock=detail.quantity
+                )
 
     def _copy_sale_products(self, origin_transaction, return_transaction):
         for detail in origin_transaction.sale_products.all():
@@ -1768,8 +1780,8 @@ class StockSerializer(serializers.ModelSerializer):
     class Meta:
         model = Stock
         fields = ['store_code', 'name', 'jan', 'stock', 'standard_price', 'store_price', 'tax']
-# TODO:なぜmodels側のget_priceだけでは価格が取得できないのか調査する
-# （現在のコードだとstore_priceが存在しない時のフォールバック処理を二回行なっていることになっている）
+    # TODO:なぜmodels側のget_priceだけでは価格が取得できないのか調査する
+    # （現在のコードだとstore_priceが存在しない時のフォールバック処理を二回行なっていることになっている）
 
     def get_store_price(self, obj):
         store_price = StorePrice.objects.filter(store_code=obj.store_code, jan=obj.jan).first()

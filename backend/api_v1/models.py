@@ -748,3 +748,26 @@ class BulkGeneratePOSACodes(POSA):
         proxy = True
         verbose_name = "POSA 一括発行"
         verbose_name_plural = "POSA 一括発行"
+
+
+class DiscountedJAN(BaseModel):
+    """値引きJANモデル"""
+    instore_jan = models.CharField(primary_key=True, max_length=13, unique=True, editable=False, verbose_name="インストアJANコード")
+    stock = models.ForeignKey(Stock, on_delete=models.CASCADE, verbose_name="対象在庫")
+    discounted_price = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="値引き後価格")
+    is_used = models.BooleanField(default=False, verbose_name="使用済み")
+
+    class Meta:
+        verbose_name = "値引きJAN"
+        verbose_name_plural = "値引きJAN一覧"
+
+    def __str__(self):
+        return self.instore_jan
+
+    def save(self, *args, **kwargs):
+        if not self.instore_jan:
+            # 'ProductVariation'モデルと'DiscountedJAN'モデルの両方から既存のJANコードを取得
+            existing_jans = set(ProductVariation.objects.values_list('instore_jan', flat=True))
+            existing_jans.update(DiscountedJAN.objects.values_list('instore_jan', flat=True))
+            self.instore_jan = generate_unique_instore_jan(existing_jans)
+        super().save(*args, **kwargs)

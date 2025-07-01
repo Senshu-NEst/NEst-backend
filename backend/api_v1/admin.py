@@ -2,7 +2,7 @@ from django.contrib import admin, messages
 from import_export import resources
 from import_export.admin import ImportExportModelAdmin
 from django import forms
-from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA, BulkGeneratePOSACodes
+from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA, BulkGeneratePOSACodes, DiscountedJAN
 from django.utils import timezone
 from . import utils
 from django.apps import apps
@@ -86,6 +86,54 @@ class ProductVariationAdmin(admin.ModelAdmin):
     list_display = ("instore_jan", "name")
     search_fields = ("instore_jan", "name")
     inlines = [VariationDetailInline]
+
+
+@admin.register(DiscountedJAN)
+class DiscountedJANAdmin(admin.ModelAdmin):
+    list_display = ('instore_jan', 'get_store_name', 'get_product_jan', 'get_product_name', 'get_original_price', 'discounted_price', 'get_current_stock', 'is_used')
+    search_fields = ('instore_jan', 'stock__jan__jan', 'stock__jan__name', 'stock__store_code__name')
+    list_filter = ('stock__store_code__name', 'is_used')
+    raw_id_fields = ('stock',)
+    readonly_fields = ('get_stock_info',)
+    fields = ('stock', 'discounted_price', 'get_stock_info')
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('stock__store_code', 'stock__jan')
+
+    def get_store_name(self, obj):
+        return obj.stock.store_code.name
+    get_store_name.short_description = '店舗名'
+    get_store_name.admin_order_field = 'stock__store_code__name'
+
+    def get_product_jan(self, obj):
+        return obj.stock.jan.jan
+    get_product_jan.short_description = '元JAN'
+    get_product_jan.admin_order_field = 'stock__jan__jan'
+
+    def get_product_name(self, obj):
+        return obj.stock.jan.name
+    get_product_name.short_description = '商品名'
+    get_product_name.admin_order_field = 'stock__jan__name'
+
+    def get_original_price(self, obj):
+        return obj.stock.jan.price
+    get_original_price.short_description = '元価格'
+
+    def get_current_stock(self, obj):
+        return obj.stock.stock
+    get_current_stock.short_description = '現在庫数'
+    
+    def get_stock_info(self, obj):
+        if obj.pk:  # オブジェクトが保存されている場合のみ
+            return format_html(
+                "<b>店舗:</b> {}<br><b>商品:</b> {} ({})<br><b>現在庫:</b> {}",
+                obj.stock.store_code.name,
+                obj.stock.jan.name,
+                obj.stock.jan.jan,
+                obj.stock.stock
+            )
+        return "在庫を選択して保存すると、情報が表示されます。"
+    get_stock_info.short_description = '在庫情報'
 
 
 @admin.register(StorePrice)
