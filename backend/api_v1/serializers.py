@@ -1394,28 +1394,31 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         返品明細(return_transaction.return_details)の数量分を
         StockReceiveHistory/StockReceiveHistoryItem を経由して戻します。
         """
-        # 1) 入荷履歴を作成（返品担当者＝入荷担当者）
+        # 1) 返品明細を処理するために必要な情報を事前に取得
+        return_details = return_transaction.return_details.all()
+        
+        # 2) JANコードが999から始まる商品（POSA等）を除外して処理対象を確認
+        target_details = [detail for detail in return_details if not detail.jan.startswith('999')]
+        
+        # 3) 在庫に戻す商品がない場合は処理を終了
+        if not target_details:
+            return
+        
+        # 4) 入荷履歴を作成（返品担当者＝入荷担当者）
         history = StockReceiveHistory.objects.create(
             store_code=return_transaction.store_code,
             staff_code=return_transaction.staff_code,
         )
-
-        # 2) 返品明細を処理するために必要な情報を事前に取得
-        return_details = return_transaction.return_details.all()
-        jan_codes = [detail.jan for detail in return_details]
+        # 5) 商品を一括取得
+        target_jan_codes = [detail.jan for detail in target_details]
+        products = {product.jan: product for product in Product.objects.filter(jan__in=target_jan_codes)}
         
-        # 3) 商品を一括取得
-        products = {product.jan: product for product in Product.objects.filter(jan__in=jan_codes)}
-        
-        # 4) 在庫を一括取得
+        # 6) 在庫を一括取得
         stock_entries = {f"{stock.store_code}_{stock.jan.jan}": stock for stock in Stock.objects.filter(store_code=history.store_code, jan__in=products.values())}
 
-        # 5) 各返品明細ごとに在庫を戻す
-        for detail in return_details:
+        # 7) 各返品明細ごとに在庫を戻す
+        for detail in target_details:
             jan_code = detail.jan
-            # JANコードが999から始まる商品はスキップ
-            if jan_code.startswith('999'):
-                continue
 
             # 商品取得
             product = products.get(jan_code)
