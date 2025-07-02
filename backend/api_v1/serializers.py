@@ -342,7 +342,6 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
         """部門打ち販売の検証処理（既存ロジックを分離）"""
         jan = data["jan"]
         price = data.get("price")
-        quantity = data.get("quantity")
         discount = data.get("discount", 0) or 0
 
         data["_is_department"] = True
@@ -467,10 +466,6 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
         if discounted_jan.is_used:
             raise serializers.ValidationError({"jan": "この値引きJANは既に使用済みです。"})
 
-        # 在庫チェック
-        #if discounted_jan.stock.stock < data.get("quantity", 1):
-        #    raise serializers.ValidationError({"quantity": "値引き商品の在庫が不足しています。"})
-
         original_product = discounted_jan.stock.jan
         
         # dataを値引きJANの情報で上書き
@@ -487,6 +482,7 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
 
 
 class TransactionSerializer(BaseTransactionSerializer):
+    store_code = serializers.CharField()
     required_permissions = ["register"]
     original_transaction = serializers.PrimaryKeyRelatedField(queryset=Transaction.objects.all(), write_only=True, required=False)
     sale_products = TransactionDetailSerializer(many=True)
@@ -637,6 +633,9 @@ class TransactionSerializer(BaseTransactionSerializer):
             # 金券が登録されているのに全く利用されていない場合
             if actual_voucher_usage == 0:
                 errors["voucher_payment"] = "金券が登録されていますが、利用されていません。"
+            
+            # 金券利用分を残額から差し引く
+            remaining_amount -= actual_voucher_usage
         
         return errors
 
@@ -646,7 +645,7 @@ class TransactionSerializer(BaseTransactionSerializer):
         - POSAは現金でしか支払えない
         - 金券 (voucher), キャッシュレス (other) は釣り銭を発行しない（残額まで使用）
         - 現金 (cash) の過剰分のみ釣り銭として返却
-        - 適用順序：現金でPOSA分を優先充当 → 残額に金券 → 残額にキャッシュレス → 残額に現金残り
+        - 適用順序：現金でPOSA分を優先充当 → 残額にキャッシュレス → 残額に金券 → 残額に現金残り
         """
         # 1) POSA金額を算出
         posa_total = sum(
@@ -853,6 +852,7 @@ class TransactionSerializer(BaseTransactionSerializer):
         通常商品の場合は、Product存在チェックおよび在庫減算を行って TransactionDetail を作成します。
         POSA販売の場合は、販売後にPOSAのステータスを更新します。
         """
+        validated_data.pop("_permissions", None)
         approval_number_input = validated_data.pop("approval_number", None)
         original_transaction = validated_data.pop("original_transaction", None)
         sale_products_data = validated_data.pop("sale_products", [])
@@ -907,8 +907,21 @@ class TransactionSerializer(BaseTransactionSerializer):
             sale_product = aggregated_data["data"]
             total_quantity = aggregated_data["total_quantity"]
             
+            detail_data = {
+                "transaction": transaction_instance,
+                "quantity": total_quantity,
+                "tax": sale_product["tax"],
+                "discount": sale_product.get("discount", 0),
+                "extra_code": sale_product.get("extra_code", None)
+            }
+
             # 部門打ち・POSA販売・値引きJANならフラグに従う
             if sale_product.get("_is_department", False) or sale_product.get("_is_discounted", False):
+                detail_data.update({
+                    "jan": sale_product["jan"],
+                    "name": sale_product["name"],
+                    "price": sale_product["price"],
+                })
                 # 値引きJANの場合は在庫を減算し、使用済みにする
                 if sale_product.get("_is_discounted", False):
                     discounted_jan_instance = sale_product.get("_discounted_jan_instance")
@@ -951,15 +964,13 @@ class TransactionSerializer(BaseTransactionSerializer):
                         stock.stock -= total_quantity
                         stock.save()
                 
-                TransactionDetail.objects.create(
-                    transaction=transaction_instance,
-                    jan=product.jan,
-                    name=product.name,
-                    price=effective_price,
-                    tax=sale_product["tax"],
-                    discount=sale_product.get("discount", 0),
-                    quantity=total_quantity 
-                )
+                detail_data.update({
+                    "jan": product.jan,
+                    "name": product.name,
+                    "price": effective_price,
+                })
+
+            TransactionDetail.objects.create(**detail_data)
 
         # 支払いの処理
         for payment_data in payments_data:
@@ -1435,7 +1446,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
             product = products.get(detail.jan)
             if product:
                 stock_entry, created = Stock.objects.get_or_create(
-                    store_code=history.store_code, 
+                    store_code=history.store_code,
                     jan=product,
                     defaults={'stock': detail.quantity}
                 )
@@ -1443,11 +1454,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
                     stock_entry.stock += detail.quantity
                     stock_entry.save()
                 
-                StockReceiveHistoryItem.objects.create(
-                    history=history, 
-                    jan=product, 
-                    additional_stock=detail.quantity
-                )
+                StockReceiveHistoryItem.objects.create(history=history, jan=product, additional_stock=detail.quantity)
 
     def _copy_sale_products(self, origin_transaction, return_transaction):
         for detail in origin_transaction.sale_products.all():
@@ -1780,8 +1787,8 @@ class StockSerializer(serializers.ModelSerializer):
     class Meta:
         model = Stock
         fields = ['store_code', 'name', 'jan', 'stock', 'standard_price', 'store_price', 'tax']
-    # TODO:なぜmodels側のget_priceだけでは価格が取得できないのか調査する
-    # （現在のコードだとstore_priceが存在しない時のフォールバック処理を二回行なっていることになっている）
+    # TODO: なぜmodels側のget_priceだけでは価格が取得できないのか調査する
+    #  （現在のコードだとstore_priceが存在しない時のフォールバック処理を二回行なっていることになっている）
 
     def get_store_price(self, obj):
         store_price = StorePrice.objects.filter(store_code=obj.store_code, jan=obj.jan).first()
