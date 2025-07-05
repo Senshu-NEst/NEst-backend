@@ -750,6 +750,13 @@ class BulkGeneratePOSACodes(POSA):
         verbose_name_plural = "POSA 一括発行"
 
 
+class DailySalesReport(Transaction):
+    class Meta:
+        proxy = True
+        verbose_name = "売上参照"
+        verbose_name_plural = "日次売上レポート"
+
+
 class DiscountedJAN(BaseModel):
     """値引きJANモデル"""
     instore_jan = models.CharField(primary_key=True, max_length=13, unique=True, editable=False, verbose_name="インストアJANコード")

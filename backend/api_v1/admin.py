@@ -2,10 +2,13 @@ from django.contrib import admin, messages
 from import_export import resources
 from import_export.admin import ImportExportModelAdmin
 from django import forms
-from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA, BulkGeneratePOSACodes, DiscountedJAN
+from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA, BulkGeneratePOSACodes, DiscountedJAN, DailySalesReport
 from django.utils import timezone
 from . import utils
+from django.db.models import Sum, Count
+from django.db.models.functions import TruncDate
 from django.apps import apps
+from django.template.response import TemplateResponse
 from rest_framework_simplejwt.token_blacklist.admin import BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin, OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 from django.urls import reverse
@@ -625,6 +628,162 @@ admin.site.unregister(OutstandingToken)
 
 admin.site.register(BlacklistedToken, BlacklistedTokenAdmin)
 admin.site.register(OutstandingToken, OutstandingTokenAdmin)
+
+from collections import defaultdict
+from datetime import date
+
+@admin.register(DailySalesReport)
+class DailySalesReportAdmin(admin.ModelAdmin):
+    change_list_template = 'admin/daily_sales_report.html'
+
+    def changelist_view(self, request, extra_context=None):
+        # --- 権限に基づく店舗リストの作成 ---
+        user = request.user
+        has_full_permission = user.is_superuser or (hasattr(user, 'staff_profile') and user.staff_profile.permission and user.staff_profile.permission.global_permission)
+        
+        if has_full_permission:
+            allowed_stores = Store.objects.all()
+        else:
+            if hasattr(user, 'staff_profile') and user.staff_profile.affiliate_store:
+                allowed_stores = Store.objects.filter(store_code=user.staff_profile.affiliate_store.store_code)
+            else:
+                allowed_stores = Store.objects.none()
+
+        # --- GETパラメータの取得 ---
+        start_date_str = request.GET.get('start_date')
+        end_date_str = request.GET.get('end_date')
+        selected_store_code = request.GET.get('store_code', 'all')
+
+        # 日付の決定
+        if start_date_str and end_date_str:
+            start_date = date.fromisoformat(start_date_str)
+            end_date = date.fromisoformat(end_date_str)
+        else:
+            start_date = end_date = timezone.now().date()
+
+        # --- クエリセットのフィルタリング ---
+        sales_details = TransactionDetail.objects.filter(transaction__date__date__range=(start_date, end_date))
+        return_details = ReturnDetail.objects.filter(return_transaction__return_date__date__range=(start_date, end_date))
+
+        if selected_store_code != 'all':
+            sales_details = sales_details.filter(transaction__store_code=selected_store_code)
+            # 返品は元の販売店舗でフィルタリング
+            return_details = return_details.filter(return_transaction__origin_transaction__store_code=selected_store_code)
+
+        # --- 集計ロジック ---
+        department_summary = defaultdict(lambda: defaultdict(int))
+        store_summary = defaultdict(lambda: defaultdict(int))
+        product_summary = defaultdict(lambda: defaultdict(int))
+        payment_summary = defaultdict(lambda: defaultdict(int))
+
+        # 1. 売上集計
+        for detail in sales_details.select_related('transaction__store_code'):
+            # JANから商品情報を取得
+            try:
+                product = Product.objects.get(jan=detail.jan)
+                dep_name = product.department_code.name if product.department_code else '部門未設定'
+            except Product.DoesNotExist:
+                dep_name = '商品マスター未登録'
+
+            store_name = detail.transaction.store_code.name
+            
+            # 金額と数量
+            amount = detail.price * detail.quantity
+            quantity = detail.quantity
+            discount = detail.discount
+
+            # 各サマリーに加算
+            department_summary[dep_name]['sales'] += amount
+            department_summary[dep_name]['quantity'] += quantity
+            store_summary[store_name]['sales'] += amount
+            store_summary[store_name]['quantity'] += quantity
+            store_summary[store_name]['discount'] += discount
+            product_summary[detail.jan]['sales'] += amount
+            product_summary[detail.jan]['quantity'] += quantity
+            product_summary[detail.jan]['discount'] += discount
+            product_summary[detail.jan]['name'] = detail.name
+
+
+        # 2. 返品集計
+        for detail in return_details.select_related('return_transaction__origin_transaction__store_code'):
+            try:
+                product = Product.objects.get(jan=detail.jan)
+                dep_name = product.department_code.name if product.department_code else '部門未設定'
+            except Product.DoesNotExist:
+                dep_name = '商品マスター未登録'
+            
+            # 元の販売店舗で集計
+            store_name = detail.return_transaction.origin_transaction.store_code.name
+            
+            amount = detail.price * detail.quantity
+            quantity = detail.quantity
+            discount = detail.discount
+
+            department_summary[dep_name]['returns'] += amount
+            department_summary[dep_name]['return_quantity'] += quantity
+            store_summary[store_name]['returns'] += amount
+            store_summary[store_name]['return_quantity'] += quantity
+            store_summary[store_name]['return_discount'] += discount
+            product_summary[detail.jan]['returns'] += amount
+            product_summary[detail.jan]['return_quantity'] += quantity
+            product_summary[detail.jan]['return_discount'] += discount
+
+        # 3. 支払い方法集計
+        payments = Payment.objects.filter(transaction__date__date__range=(start_date, end_date))
+        return_payments = ReturnPayment.objects.filter(return_transaction__return_date__date__range=(start_date, end_date))
+
+        if selected_store_code != 'all':
+            payments = payments.filter(transaction__store_code=selected_store_code)
+            return_payments = return_payments.filter(return_transaction__origin_transaction__store_code=selected_store_code)
+
+        for p in payments:
+            payment_summary[p.get_payment_method_display()]['amount'] += p.amount
+        for rp in return_payments:
+            payment_summary[rp.get_payment_method_display()]['amount'] -= rp.amount
+
+
+        # --- 全体サマリー計算 ---
+        total_sales = sum(s['sales'] for s in store_summary.values())
+        total_returns = sum(s['returns'] for s in store_summary.values())
+        total_discount = sum(s['discount'] for s in store_summary.values())
+        net_sales = total_sales - total_returns
+        discount_rate = (total_discount / total_sales * 100) if total_sales > 0 else 0
+
+        # --- 純計算と最終的なコンテキストの準備 ---
+        def calculate_net_and_rates(summary, is_product=False):
+            for k, v in summary.items():
+                v['net_sales'] = v['sales'] - v['returns']
+                v['net_quantity'] = v['quantity'] - v['return_quantity']
+                if is_product:
+                    v['net_discount'] = v.get('discount', 0) - v.get('return_discount', 0)
+                    v['discount_rate'] = (v['net_discount'] / v['sales'] * 100) if v['sales'] > 0 else 0
+            return summary
+
+        department_summary = calculate_net_and_rates(department_summary)
+        store_summary = calculate_net_and_rates(store_summary)
+        product_summary = calculate_net_and_rates(product_summary, is_product=True)
+
+        context = self.admin_site.each_context(request)
+        context.update({
+            'start_date': start_date,
+            'end_date': end_date,
+            'allowed_stores': allowed_stores,
+            'has_full_permission': has_full_permission,
+            'selected_store_code': selected_store_code,
+            'department_sales': sorted([{'name': k, **v} for k, v in department_summary.items()], key=lambda x: x['net_sales'], reverse=True),
+            'store_sales': sorted([{'name': k, **v} for k, v in store_summary.items()], key=lambda x: x['net_sales'], reverse=True),
+            'product_sales': sorted([{'jan': k, **v} for k, v in product_summary.items()], key=lambda x: x['net_sales'], reverse=True),
+            'payment_summary': sorted([{'method': k, **v} for k, v in payment_summary.items()], key=lambda x: x['amount'], reverse=True),
+            'total_summary': {
+                'net_sales': net_sales,
+                'total_discount': total_discount,
+                'discount_rate': discount_rate,
+            },
+            'opts': self.model._meta,
+            'title': '売上レポート',
+        })
+        
+        return TemplateResponse(request, self.change_list_template, context)
 
 # 管理画面のタイトル設定
 admin.site.site_header = "商品管理システム"
