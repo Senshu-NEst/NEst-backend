@@ -6,7 +6,7 @@ from django.contrib.auth.models import BaseUserManager, AbstractBaseUser, Permis
 from django.core.exceptions import ValidationError
 from django.db.models.signals import post_save
 from django.dispatch import receiver
-from django.core.validators import MaxValueValidator, MinValueValidator
+from django.core.validators import MinValueValidator
 from .utils import is_valid_jan_code, generate_unique_instore_jan
 
 
@@ -58,7 +58,7 @@ class Product(BaseModel):
 
     class Meta:
         verbose_name = "商品"
-        verbose_name_plural = "商品一覧"
+        verbose_name_plural = "[マスタ] 商品一覧"
 
     def __str__(self):
         return self.jan
@@ -95,7 +95,7 @@ class Store(BaseModel):
 
     class Meta:
         verbose_name = "店舗"
-        verbose_name_plural = "店舗一覧"
+        verbose_name_plural = "[マスタ] 店舗一覧"
 
     def __str__(self):
         return f"{self.store_code}-{self.name}"
@@ -121,7 +121,7 @@ class Stock(BaseModel):
     class Meta:
         unique_together = ("store_code", "jan")
         verbose_name = "在庫"
-        verbose_name_plural = "在庫一覧"
+        verbose_name_plural = "[在庫] 在庫一覧"
 
     def __str__(self):
         return f"{self.store_code.store_code} - {self.jan}"
@@ -136,7 +136,7 @@ class StorePrice(BaseModel):
     class Meta:
         unique_together = ("store_code", "jan")
         verbose_name = "店舗価格"
-        verbose_name_plural = "店舗価格一覧"
+        verbose_name_plural = "[在庫] 店舗別価格"
 
     def __str__(self):
         return f"{self.store_code} - {self.jan} - {self.price}"
@@ -161,7 +161,7 @@ class ProductVariation(models.Model):
 
     class Meta:
         verbose_name = "商品バリエーション"
-        verbose_name_plural = "商品バリエーション一覧"
+        verbose_name_plural = "[マスタ] 商品バリエーション"
 
     def save(self, *args, **kwargs):
         if not self.instore_jan:
@@ -193,7 +193,7 @@ class StockReceiveHistory(BaseModel):
 
     class Meta:
         verbose_name = "入荷"
-        verbose_name_plural = "入荷履歴一覧"
+        verbose_name_plural = "[在庫] 入荷履歴"
 
     def __str__(self):
         return f"{self.store_code} - {self.staff_code} - {self.received_at}"
@@ -241,7 +241,7 @@ class Transaction(BaseModel):
 
     class Meta:
         verbose_name = "取引"
-        verbose_name_plural = "取引一覧"
+        verbose_name_plural = "[取引] 取引履歴"
 
     def __str__(self):
         return f"取引番号: {self.id}"
@@ -297,7 +297,7 @@ class Wallet(BaseModel):
 
     class Meta:
         verbose_name = "ウォレット"
-        verbose_name_plural = "ウォレット一覧"
+        verbose_name_plural = "[金券] ウォレット"
 
     def __str__(self):
         return f"Wallet of {self.user.email} - Balance: {self.balance}"
@@ -343,7 +343,7 @@ class WalletTransaction(BaseModel):
 
     class Meta:
         verbose_name = "取引"
-        verbose_name_plural = "ウォレット履歴"
+        verbose_name_plural = "[金券] ウォレット取引履歴"
 
     def __str__(self):
         return f"{self.transaction_type.capitalize()} of {self.amount} (残高: {self.balance})"
@@ -418,7 +418,7 @@ class CustomUser(AbstractBaseUser, PermissionsMixin):
 
     class Meta:
         verbose_name = "人"
-        verbose_name_plural = "ユーザーマスター"
+        verbose_name_plural = "[マスタ] ユーザー"
 
 
 class Staff(BaseModel):
@@ -430,7 +430,7 @@ class Staff(BaseModel):
 
     class Meta:
         verbose_name = "人"
-        verbose_name_plural = "スタッフマスター"
+        verbose_name_plural = "[マスタ] スタッフ"
 
     def __str__(self):
         return self.staff_code
@@ -458,7 +458,7 @@ class Customer(BaseModel):
 
     class Meta:
         verbose_name = "人"
-        verbose_name_plural = "顧客マスター"
+        verbose_name_plural = "[マスタ] 顧客"
 
     def __str__(self):
         return self.name if self.name else f"顧客 ({self.user.email})"
@@ -483,7 +483,7 @@ class UserPermission(BaseModel):
 
     class Meta:
         verbose_name = "役職"
-        verbose_name_plural = "役職一覧"
+        verbose_name_plural = "[マスタ] 役職"
 
     def __str__(self):
         return self.role_name
@@ -500,7 +500,7 @@ class Approval(BaseModel):
 
     class Meta:
         verbose_name = "承認番号"
-        verbose_name_plural = "ウォレット承認番号"
+        verbose_name_plural = "[金券] ウォレット承認番号"
 
     def __str__(self):
         return f"Approval {self.approval_number} for {self.user.email}"
@@ -529,7 +529,7 @@ class ReturnTransaction(BaseModel):
 
     class Meta:
         verbose_name = "返品取引"
-        verbose_name_plural = "返品取引一覧"
+        verbose_name_plural = "[取引] 返品履歴"
 
     def __str__(self):
         return f"返品取引 {self.id}（取消取引：{self.origin_transaction.id}）"
@@ -631,7 +631,7 @@ class Department(BaseModel):
     
     class Meta:
         verbose_name = "部門"
-        verbose_name_plural = "部門一覧"
+        verbose_name_plural = "[マスタ] 部門一覧"
         unique_together = (('parent', 'code'),)
     
     def __str__(self):
@@ -744,7 +744,7 @@ class POSA(BaseModel):
 
     class Meta:
         verbose_name = "POSA"
-        verbose_name_plural = "POSA一覧"
+        verbose_name_plural = "[金券] POSAカード"
 
     def __str__(self):
         return f"POSAコード: {self.code} - ステータス: {self.status} - 金額: {self.card_value}"
@@ -773,14 +773,14 @@ class BulkGeneratePOSACodes(POSA):
     class Meta:
         proxy = True
         verbose_name = "POSA 一括発行"
-        verbose_name_plural = "POSA 一括発行"
+        verbose_name_plural = "[金券] POSA一括発行"
 
 
 class DailySalesReport(Transaction):
     class Meta:
         proxy = True
         verbose_name = "売上参照"
-        verbose_name_plural = "日次売上レポート"
+        verbose_name_plural = "[取引] 日次売上レポート"
 
 
 class DiscountedJAN(BaseModel):
@@ -792,7 +792,7 @@ class DiscountedJAN(BaseModel):
 
     class Meta:
         verbose_name = "値引きJAN"
-        verbose_name_plural = "値引きJAN一覧"
+        verbose_name_plural = "[マスタ] 値引きJAN"
 
     def __str__(self):
         return self.instore_jan
