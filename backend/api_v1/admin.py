@@ -2,18 +2,38 @@ from django.contrib import admin, messages
 from import_export import resources
 from import_export.admin import ImportExportModelAdmin
 from django import forms
-from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA, BulkGeneratePOSACodes, DiscountedJAN, DailySalesReport
+from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA, DiscountedJAN, DailySalesReport
 from django.utils import timezone
 from . import utils
-from django.db.models import Sum, Count
-from django.db.models.functions import TruncDate
 from django.apps import apps
 from django.template.response import TemplateResponse
 from rest_framework_simplejwt.token_blacklist.admin import BlacklistedTokenAdmin as DefaultBlacklistedTokenAdmin, OutstandingTokenAdmin as DefaultOutstandingTokenAdmin
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 from django.urls import reverse
 from django.utils.html import format_html
-from .rules import check_transaction_access, filter_transactions_by_user
+from django.db.models import Q
+
+
+class StoreLimitedAdminMixin:
+    """
+    ユーザーの権限に基づいて、表示されるデータを所属店舗に限定するMixin。
+    - スーパーユーザーまたはグローバル権限を持つユーザーは全店舗のデータを表示。
+    - それ以外のスタッフは、自身の所属店舗のデータのみ表示。
+    """
+    # 各ModelAdminでオーバーライドする店舗情報を参照するフィールド
+    store_field_lookup = 'store_code'
+
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        user = request.user
+
+        if user.is_superuser or (hasattr(user, 'staff_profile') and user.staff_profile.permission and user.staff_profile.permission.global_permission):
+            return qs
+
+        if hasattr(user, 'staff_profile') and user.staff_profile.affiliate_store:
+            return qs.filter(**{self.store_field_lookup: user.staff_profile.affiliate_store})
+
+        return qs.none()
 
 
 class NegativeStockFilter(admin.SimpleListFilter):
@@ -73,7 +93,7 @@ class VariationDetailInline(admin.TabularInline):
 class ProductAdmin(ImportExportModelAdmin):
     resource_class = ProductResource
     list_display = ("jan", "department_code__name", "name", "price", "tax", "status")
-    fields = ("jan","department_code", "name", ("price", "tax"), "status", ("disable_change_tax", "disable_change_price"))
+    fields = ("jan", "department_code", "name", ("price", "tax"), "status", ("disable_change_tax", "disable_change_price"))
     search_fields = ("name", "jan")
     list_filter = ("status", "tax")
     inlines = [StockInline]
@@ -92,7 +112,8 @@ class ProductVariationAdmin(admin.ModelAdmin):
 
 
 @admin.register(DiscountedJAN)
-class DiscountedJANAdmin(admin.ModelAdmin):
+class DiscountedJANAdmin(StoreLimitedAdminMixin, admin.ModelAdmin):
+    store_field_lookup = 'stock__store_code'
     list_display = ('instore_jan', 'get_store_name', 'get_product_jan', 'get_product_name', 'get_original_price', 'discounted_price', 'get_current_stock', 'is_used')
     search_fields = ('instore_jan', 'stock__jan__jan', 'stock__jan__name', 'stock__store_code__name')
     list_filter = ('stock__store_code__name', 'is_used')
@@ -101,7 +122,17 @@ class DiscountedJANAdmin(admin.ModelAdmin):
     fields = ('stock', 'discounted_price', 'get_stock_info')
 
     def get_queryset(self, request):
-        return super().get_queryset(request).select_related('stock__store_code', 'stock__jan')
+        # Mixinのget_querysetを呼び出し、さらに最適化を追加
+        qs = super().get_queryset(request)
+        return qs.select_related('stock__store_code', 'stock__jan')
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name == "stock":
+            user = request.user
+            if not (user.is_superuser or (hasattr(user, 'staff_profile') and user.staff_profile.permission and user.staff_profile.permission.global_permission)):
+                if hasattr(user, 'staff_profile') and user.staff_profile.affiliate_store:
+                    kwargs["queryset"] = Stock.objects.filter(store_code=user.staff_profile.affiliate_store)
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
     def get_store_name(self, obj):
         return obj.stock.store_code.name
@@ -140,10 +171,14 @@ class DiscountedJANAdmin(admin.ModelAdmin):
 
 
 @admin.register(StorePrice)
-class StorePriceAdmin(admin.ModelAdmin):
+class StorePriceAdmin(StoreLimitedAdminMixin, admin.ModelAdmin):
     list_display = ("store_code", "jan", "jan__name", "price")
-    search_fields = ("store_code", "jan")
+    search_fields = ("store_code__name", "jan__jan", "jan__name")
     list_filter = ("store_code",)
+
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        return qs.select_related('store_code', 'jan')
 
 
 @admin.register(Store)
@@ -157,11 +192,15 @@ class StoreAdmin(ImportExportModelAdmin):
 
 
 @admin.register(Stock)
-class StockAdmin(admin.ModelAdmin):
+class StockAdmin(StoreLimitedAdminMixin, admin.ModelAdmin):
     readonly_fields = ("updated_at",)
     list_display = ("store_code", "jan", "jan__name", "stock")
-    search_fields = ("jan__name", "jan__jan")
+    search_fields = ("jan__name", "jan__jan", "store_code__name")
     list_filter = ("store_code", NegativeStockFilter)
+
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        return qs.select_related('store_code', 'jan')
 
 
 class StockReceiveHistoryItemInline(admin.TabularInline):
@@ -172,19 +211,18 @@ class StockReceiveHistoryItemInline(admin.TabularInline):
 
 
 @admin.register(StockReceiveHistory)
-class StockReceiveHistoryAdmin(admin.ModelAdmin):
-    list_display = ("received_at", "store_code__store_code", "staff_code__name")
+class StockReceiveHistoryAdmin(StoreLimitedAdminMixin, admin.ModelAdmin):
+    list_display = ("received_at", "store_code", "staff_code")
     list_filter = ("received_at", "store_code", "staff_code__name")
     inlines = [StockReceiveHistoryItemInline]
 
     def get_queryset(self, request):
         qs = super().get_queryset(request)
-        # ユーザーのアクセス権限に基づいてクエリセットをフィルタリング
-        return filter_transactions_by_user(request.user, qs)
+        return qs.select_related('store_code', 'staff_code')
 
 
 @admin.register(Transaction)
-class TransactionAdmin(admin.ModelAdmin):
+class TransactionAdmin(StoreLimitedAdminMixin, admin.ModelAdmin):
     list_display = ("id", "date", "store_code", "staff_code", "status", "total_amount", "receipt_button")
     fieldsets = [
         ('取引情報', {'fields': ("status", "relation_return_id", "date", ("store_code", "staff_code", "user", "terminal_id"))}),
@@ -202,14 +240,7 @@ class TransactionAdmin(admin.ModelAdmin):
 
     def get_queryset(self, request):
         qs = super().get_queryset(request)
-        # ユーザーのアクセス権限に基づいてクエリセットをフィルタリング
-        return filter_transactions_by_user(request.user, qs)
-
-    #def has_view_permission(self, request, obj=None):
-    #    if obj is not None:
-    #        check_transaction_access(request.user, obj)
-    #        return True
-    #    return super().has_view_permission(request, obj)
+        return qs.select_related('store_code', 'staff_code')
 
 
 class WalletTransactionInline(admin.TabularInline):
@@ -348,7 +379,11 @@ class CustomerAdmin(admin.ModelAdmin):
 @admin.register(UserPermission)
 class UserPermissionAdmin(admin.ModelAdmin):
     list_display = (
-        "role_name", "register_permission", "global_permission",
+        "role_name", "group", "register_permission", "global_permission",
+        "change_price_permission", "void_permission", "stock_receive_permission"
+    )
+    fields = (
+        "role_name", "group", "global_permission", "register_permission",
         "change_price_permission", "void_permission", "stock_receive_permission"
     )
 
@@ -377,9 +412,9 @@ class ReturnPaymentInline(admin.TabularInline):  # または StackedInline
 
 
 @admin.register(ReturnTransaction)
-class ReturnTransactionAdmin(admin.ModelAdmin):
+class ReturnTransactionAdmin(StoreLimitedAdminMixin, admin.ModelAdmin):
     list_display = ("pk", "return_type", "origin_transaction_links", "return_date", "staff_code", "receipt_button")
-    fields = (("id", "return_type"), "return_date", ("origin_transaction",  "modify_id"), "store_code", "terminal_id", "staff_code", "reason", "restock",)
+    fields = (("id", "return_type"), "return_date", ("origin_transaction", "modify_id"), "store_code", "terminal_id", "staff_code", "reason", "restock",)
     list_display_links = ("pk", "origin_transaction_links",)
     search_fields = ("pk",)
     list_filter = ("return_type", "return_date",)
@@ -398,9 +433,19 @@ class ReturnTransactionAdmin(admin.ModelAdmin):
     receipt_button.short_description = 'レシートを表示'
 
     def get_queryset(self, request):
-        qs = super().get_queryset(request)
-        # ユーザーのアクセス権限に基づいてクエリセットをフィルタリング
-        return filter_transactions_by_user(request.user, qs)
+        qs = super(StoreLimitedAdminMixin, self).get_queryset(request)
+        user = request.user
+
+        if user.is_superuser or (hasattr(user, 'staff_profile') and user.staff_profile.permission and user.staff_profile.permission.global_permission):
+            return qs.select_related('store_code', 'staff_code', 'origin_transaction__store_code')
+
+        if hasattr(user, 'staff_profile') and user.staff_profile.affiliate_store:
+            store = user.staff_profile.affiliate_store
+            return qs.filter(
+                Q(store_code=store) | Q(origin_transaction__store_code=store)
+            ).select_related('store_code', 'staff_code', 'origin_transaction__store_code')
+
+        return qs.none()
 
     def has_add_permission(self, request):
         """新規作成を許可しない"""

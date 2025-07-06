@@ -2,8 +2,10 @@ import ulid
 from django.utils import timezone
 from datetime import timedelta, date
 from django.db import models, transaction
-from django.contrib.auth.models import BaseUserManager, AbstractBaseUser, PermissionsMixin
+from django.contrib.auth.models import BaseUserManager, AbstractBaseUser, PermissionsMixin, Group
 from django.core.exceptions import ValidationError
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 from django.core.validators import MaxValueValidator, MinValueValidator
 from .utils import is_valid_jan_code, generate_unique_instore_jan
 
@@ -434,6 +436,22 @@ class Staff(BaseModel):
         return self.staff_code
 
 
+@receiver(post_save, sender=Staff)
+def update_user_group(sender, instance, **kwargs):
+    """
+    スタッフの役職が更新されたら、対応するDjangoグループにユーザーを自動で割り当てる。
+    """
+    user = instance.user
+    new_permission = instance.permission
+
+    # 一旦すべてのグループからユーザーを削除
+    user.groups.clear()
+
+    # 新しい役職に紐づくグループがあれば追加
+    if new_permission and new_permission.group:
+        user.groups.add(new_permission.group)
+
+
 class Customer(BaseModel):
     user = models.OneToOneField(CustomUser, on_delete=models.CASCADE, related_name='customer_profile')
     name = models.CharField(max_length=30, null=True, blank=True, verbose_name="ユーザー名")
@@ -449,6 +467,14 @@ class Customer(BaseModel):
 class UserPermission(BaseModel):
     """役職管理モデル"""
     role_name = models.CharField(max_length=20, verbose_name="役職名")
+    group = models.ForeignKey(
+        Group,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name="Django権限グループ",
+        help_text="この役職に紐づくDjangoの権限グループを選択してください。"
+    )
     register_permission = models.BooleanField(default=True, verbose_name="レジ操作権限")
     void_permission = models.BooleanField(default=False, verbose_name="返品権限")
     stock_receive_permission = models.BooleanField(default=False, verbose_name="入荷権限")

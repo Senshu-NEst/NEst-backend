@@ -38,7 +38,7 @@ def check_transaction_access(user, transaction):
         raise PermissionDenied("この取引にアクセスする権限がありません。")
     return True
 
-# ④ クエリセットのフィルタリング用共通関数
+
 def filter_transactions_by_user(user, queryset):
     """
     ユーザーのアクセス権限に応じて、取引クエリセットをフィルタリングする。
@@ -57,6 +57,7 @@ def filter_transactions_by_user(user, queryset):
         return queryset
     # それ以外は所属店舗と一致する取引のみフィルタリング
     return queryset.filter(store_code=staff.affiliate_store)
+
 
 ## ⑤ 他の操作（変更・削除）についても同様にプレディケートを定義可能
 #@rules.predicate
