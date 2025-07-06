@@ -39,7 +39,7 @@
 
     <!-- 全体サマリー -->
     <div class="results" style="margin-bottom: 20px;">
-        <h2>全体サマリー ({{ start_date|date:"Y/m/d" }} - {{ end_date|date:"Y/m/d" }}{% if selected_store_code != 'all' %} - {{ allowed_stores.first.name }}{% endif %})</h2>
+        <h2>全体サマリー ({{ start_date|date:"Y/m/d" }} - {{ end_date|date:"Y/m/d" }} - {{ selected_store_name }})</h2>
         <table>
             <tr>
                 <th>純売上合計</th>
@@ -200,7 +200,9 @@ document.addEventListener('DOMContentLoaded', function() {
                     startDate = new Date(today);
                     break;
                 case 'this_week':
-                    startDate = new Date(today.setDate(today.getDate() - today.getDay()));
+                    const dayOfWeek = today.getDay(); // 0 (Sun) - 6 (Sat)
+                    const diff = today.getDate() - dayOfWeek + (dayOfWeek === 0 ? -6 : 1); // Adjust for Sunday
+                    startDate = new Date(today.setDate(diff));
                     break;
                 case 'this_month':
                     startDate = new Date(today.getFullYear(), today.getMonth(), 1);

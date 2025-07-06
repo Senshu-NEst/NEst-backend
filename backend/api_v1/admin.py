@@ -676,6 +676,10 @@ class DailySalesReportAdmin(admin.ModelAdmin):
         product_summary = defaultdict(lambda: defaultdict(int))
         payment_summary = defaultdict(lambda: defaultdict(int))
 
+        # パフォーマンス向上のため、部門情報を先に辞書化
+        small_departments = Department.objects.filter(level='small')
+        department_map = {d.department_code: d.name for d in small_departments}
+
         # 1. 売上集計
         for detail in sales_details.select_related('transaction__store_code'):
             # JANから商品情報を取得
@@ -683,7 +687,11 @@ class DailySalesReportAdmin(admin.ModelAdmin):
                 product = Product.objects.get(jan=detail.jan)
                 dep_name = product.department_code.name if product.department_code else '部門未設定'
             except Product.DoesNotExist:
-                dep_name = '商品マスター未登録'
+                if detail.jan.startswith('999') and len(detail.jan) == 8:
+                    dep_code = detail.jan[3:]
+                    dep_name = department_map.get(dep_code, '不明な部門')
+                else:
+                    dep_name = '商品マスター未登録'
 
             store_name = detail.transaction.store_code.name
             
@@ -710,7 +718,11 @@ class DailySalesReportAdmin(admin.ModelAdmin):
                 product = Product.objects.get(jan=detail.jan)
                 dep_name = product.department_code.name if product.department_code else '部門未設定'
             except Product.DoesNotExist:
-                dep_name = '商品マスター未登録'
+                if detail.jan.startswith('999') and len(detail.jan) == 8:
+                    dep_code = detail.jan[3:]
+                    dep_name = department_map.get(dep_code, '不明な部門')
+                else:
+                    dep_name = '商品マスター未登録'
             
             # 元の販売店舗で集計
             store_name = detail.return_transaction.origin_transaction.store_code.name
@@ -762,6 +774,14 @@ class DailySalesReportAdmin(admin.ModelAdmin):
         department_summary = calculate_net_and_rates(department_summary)
         store_summary = calculate_net_and_rates(store_summary)
         product_summary = calculate_net_and_rates(product_summary, is_product=True)
+        
+        selected_store_name = "全店舗"
+        if selected_store_code != 'all':
+            try:
+                selected_store_name = Store.objects.get(store_code=selected_store_code).name
+            except Store.DoesNotExist:
+                selected_store_name = "不明な店舗"
+
 
         context = self.admin_site.each_context(request)
         context.update({
@@ -770,6 +790,7 @@ class DailySalesReportAdmin(admin.ModelAdmin):
             'allowed_stores': allowed_stores,
             'has_full_permission': has_full_permission,
             'selected_store_code': selected_store_code,
+            'selected_store_name': selected_store_name,
             'department_sales': sorted([{'name': k, **v} for k, v in department_summary.items()], key=lambda x: x['net_sales'], reverse=True),
             'store_sales': sorted([{'name': k, **v} for k, v in store_summary.items()], key=lambda x: x['net_sales'], reverse=True),
             'product_sales': sorted([{'jan': k, **v} for k, v in product_summary.items()], key=lambda x: x['net_sales'], reverse=True),
