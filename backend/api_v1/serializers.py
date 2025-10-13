@@ -947,7 +947,7 @@ class TransactionSerializer(BaseTransactionSerializer):
                 "quantity": total_quantity,
                 "tax": sale_product["tax"],
                 "discount": sale_product.get("discount", 0),
-                "extra_code": sale_product.get("extra_code", None)
+                "extra_code": sale_product.get("_extra_code", None)
             }
 
             # 部門打ち・POSA販売・値引きJANならフラグに従う
