@@ -2,7 +2,7 @@ from django.contrib import admin, messages
 from import_export import resources
 from import_export.admin import ImportExportModelAdmin
 from django import forms
-from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA, DiscountedJAN, DailySalesReport
+from .models import Product, Store, Stock, Transaction, TransactionDetail, CustomUser, UserPermission, StockReceiveHistory, StockReceiveHistoryItem, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, Customer, Wallet, WalletTransaction, Approval, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA, DiscountedJAN, DailySalesReport, Terminal
 from django.utils import timezone
 from . import utils
 from django.apps import apps
@@ -673,6 +673,7 @@ admin.site.unregister(OutstandingToken)
 
 admin.site.register(BlacklistedToken, BlacklistedTokenAdmin)
 admin.site.register(OutstandingToken, OutstandingTokenAdmin)
+admin.site.register(Terminal)
 
 from collections import defaultdict
 from datetime import date

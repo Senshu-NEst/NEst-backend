@@ -804,3 +804,18 @@ class DiscountedJAN(BaseModel):
             existing_jans.update(DiscountedJAN.objects.values_list('instore_jan', flat=True))
             self.instore_jan = generate_unique_instore_jan(existing_jans)
         super().save(*args, **kwargs)
+
+
+class Terminal(BaseModel):
+    """POS端末モデル"""
+    terminal_id = models.CharField(max_length=50, unique=True, verbose_name="端末ID")
+    store = models.ForeignKey(Store, on_delete=models.CASCADE, verbose_name="店舗")
+    allow_move = models.BooleanField(default=False, verbose_name="店舗コード上書き許可")
+    expires_at = models.DateTimeField(null=True, blank=True, verbose_name="有効期限")
+
+    class Meta:
+        verbose_name = "POS端末"
+        verbose_name_plural = "[マスタ] POS端末一覧"
+
+    def __str__(self):
+        return self.terminal_id

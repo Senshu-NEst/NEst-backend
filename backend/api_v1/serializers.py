@@ -3,7 +3,7 @@ from django.utils import timezone
 from django.db import transaction
 from rest_framework.fields import empty
 from .views import StockReceiveHistory, StockReceiveHistoryItem
-from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, WalletTransaction, Wallet, Approval, Store, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA, DiscountedJAN
+from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, WalletTransaction, Wallet, Approval, Store, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA, DiscountedJAN, Terminal
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 
@@ -66,6 +66,26 @@ class ReturnPaymentSerializer(serializers.ModelSerializer):
 class BaseTransactionSerializer(serializers.ModelSerializer):
     # 各サブクラスでオーバーライドされるべき権限リスト
     required_permissions = []
+
+    def validate_terminal(self, terminal_id, store_code):
+        if not terminal_id:
+            return None, {"terminal_id": "端末IDが指定されていません。"}
+        try:
+            terminal = Terminal.objects.get(terminal_id=terminal_id)
+        except Terminal.DoesNotExist:
+            return None, {"terminal_id": f"端末ID '{terminal_id}' は登録されていません。"}
+
+        if terminal.expires_at and terminal.expires_at < timezone.now():
+            return None, {"terminal_id": f"端末ID '{terminal_id}' の有効期限が切れています。"}
+
+        if store_code:
+            if not terminal.allow_move:
+                return store_code, {"terminal_id": f"端末ID '{terminal_id}' は店舗の移動が許可されていません。"}
+            return store_code, None
+        else:
+            if not terminal.store:
+                return None, {"terminal_id": f"端末ID '{terminal_id}' に店舗が紐付いていません。"}
+            return terminal.store.store_code, None
 
     def validate(self, data):
         """共通バリデーション：店舗の存在チェックとスタッフの権限チェック"""
@@ -482,7 +502,7 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
 
 
 class TransactionSerializer(BaseTransactionSerializer):
-    store_code = serializers.CharField()
+    store_code = serializers.CharField(required=False)
     required_permissions = ["register"]
     original_transaction = serializers.PrimaryKeyRelatedField(queryset=Transaction.objects.all(), write_only=True, required=False)
     sale_products = TransactionDetailSerializer(many=True)
@@ -503,9 +523,23 @@ class TransactionSerializer(BaseTransactionSerializer):
                     self.fields[field_name].read_only = False
 
     def validate(self, data):
-        # BaseTransactionSerializerの共通バリデーションを呼び出す
-        data = super().validate(data)
         errors = {}
+
+        # ターミナルIDと店舗コードを取得
+        terminal_id = data.get('terminal_id')
+        store_code = data.get('store_code')
+
+        # ターミナルを検証し、店舗コードを解決
+        resolved_store_code, terminal_error = self.validate_terminal(terminal_id, store_code)
+        if terminal_error:
+            errors.update(terminal_error)
+        data['store_code'] = resolved_store_code
+
+        # BaseTransactionSerializerの共通バリデーションを呼び出す
+        try:
+            data = super().validate(data)
+        except serializers.ValidationError as e:
+            errors.update(e.detail)
         
         status = data.get("status")
         sale_products = data.get("sale_products")
@@ -522,7 +556,7 @@ class TransactionSerializer(BaseTransactionSerializer):
             errors["sale_products"] = "少なくとも1つの商品を指定してください。"
         if not payments:
             errors["payments"] = "支払方法を指定してください。"
-        if status != "resale" and any(p['payment_method'] == 'carryover' for p in payments):
+        if status != "resale" and payments and any(p['payment_method'] == 'carryover' for p in payments):
             errors["payments"] = "引継支払は再売以外で使用できません。"
 
         # 承認番号チェック
@@ -532,17 +566,18 @@ class TransactionSerializer(BaseTransactionSerializer):
         # 商品関連のチェック
         if sale_products:
             store_code_instance = data.get("store_code")  # super().validate()でインスタンス化済み
-            discount_errors = self._aggregate_discount_errors(sale_products, store_code_instance, permissions)
-            if discount_errors:
-                errors["sale_products_discount"] = discount_errors
-            
-            try:
-                totals = self._calculate_totals(sale_products, store_code_instance)
-                data["_totals"] = totals
-                # 支払い関連のチェック
-                self._validate_all_payments(payments, totals, status, data.get("user"), errors)
-            except serializers.ValidationError as e:
-                errors["sale_products_totals"] = e.detail
+            if store_code_instance:
+                discount_errors = self._aggregate_discount_errors(sale_products, store_code_instance, permissions)
+                if discount_errors:
+                    errors["sale_products_discount"] = discount_errors
+                
+                try:
+                    totals = self._calculate_totals(sale_products, store_code_instance)
+                    data["_totals"] = totals
+                    # 支払い関連のチェック
+                    self._validate_all_payments(payments, totals, status, data.get("user"), errors)
+                except serializers.ValidationError as e:
+                    errors["sale_products_totals"] = e.detail
 
         if errors:
             raise serializers.ValidationError(errors)
@@ -1012,7 +1047,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
     payments = ReturnPaymentSerializer(many=True, write_only=True)
     return_payments = ReturnPaymentSerializer(many=True, read_only=True)
     date = serializers.DateTimeField(source='created_at', read_only=True)
-    store_code = serializers.CharField(required=True)
+    store_code = serializers.CharField(required=False)
     terminal_id = serializers.CharField(required=True)
     return_products = ReturnDetailSerializer(many=True, source='return_details', read_only=True)
     additional_items = serializers.ListField(child=serializers.DictField(child=serializers.CharField(required=True)), required=False)
@@ -1024,9 +1059,23 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         extra_kwargs = {'origin_transaction': {'required': True}, 'staff_code': {'required': True}, 'restock': {'required': True}}
 
     def validate(self, data):
-        # BaseTransactionSerializerの共通バリデーションを呼び出す
-        data = super().validate(data)
         errors = {}
+
+        # ターミナルIDと店舗コードを取得
+        terminal_id = data.get('terminal_id')
+        store_code = data.get('store_code')
+
+        # ターミナルを検証し、店舗コードを解決
+        resolved_store_code, terminal_error = self.validate_terminal(terminal_id, store_code)
+        if terminal_error:
+            errors.update(terminal_error)
+        data['store_code'] = resolved_store_code
+
+        # BaseTransactionSerializerの共通バリデーションを呼び出す
+        try:
+            data = super().validate(data)
+        except serializers.ValidationError as e:
+            errors.update(e.detail)
 
         origin_transaction = data.get('origin_transaction')
         return_type = data.get('return_type')
