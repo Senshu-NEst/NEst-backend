@@ -452,9 +452,26 @@ def update_user_group(sender, instance, **kwargs):
         user.groups.add(new_permission.group)
 
 
+USER_STATUS_CHOICES = [
+    (0, '有効'),
+    (10, '事故（その他）'),
+    (11, '事故（一時停止）'),
+    (12, '事故（自主退会）'),
+    (13, '事故（強制退会）'),
+    (50, '社販対象（その他）'),
+    (51, '社販対象（社員）'),
+    (52, '社販対象（アルバイト）'),
+    (53, '社販対象（取引先）'),
+    (54, '社販対象（その他）'),
+    (90, '試験ユーザー（その他）'),
+    (99, '試験ユーザー'),
+]
+
+
 class Customer(BaseModel):
     user = models.OneToOneField(CustomUser, on_delete=models.CASCADE, related_name='customer_profile')
     name = models.CharField(max_length=30, null=True, blank=True, verbose_name="ユーザー名")
+    user_status = models.IntegerField(choices=USER_STATUS_CHOICES, default=0, verbose_name="ユーザーステータス")
 
     class Meta:
         verbose_name = "人"

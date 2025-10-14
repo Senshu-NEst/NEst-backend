@@ -1,6 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import TestViewSet, ProductViewSet, StockViewSet, TransactionViewSet, StockReceiveHistoryViewSet, ProductVariationViewSet, generate_receipt_view, WalletViewSet, CustomUserTokenViewSet, ApprovalViewSet, ReturnTransactionViewSet
+from .views import TestViewSet, ProductViewSet, StockViewSet, TransactionViewSet, StockReceiveHistoryViewSet, ProductVariationViewSet, generate_receipt_view, WalletViewSet, CustomUserTokenViewSet, ApprovalViewSet, ReturnTransactionViewSet, TokenVerifyViewSet
 
 router = DefaultRouter()
 router.register(r"test", TestViewSet, basename="test")
@@ -13,6 +13,7 @@ router.register(r'stock-receive-history', StockReceiveHistoryViewSet, basename='
 router.register(r'wallet', WalletViewSet, basename='wallet')
 router.register(r"custom-token", CustomUserTokenViewSet, basename="custom-token")
 router.register(r"approval", ApprovalViewSet, basename="approval")
+router.register(r'verify_token', TokenVerifyViewSet, basename='verify_token')
 
 
 urlpatterns = [

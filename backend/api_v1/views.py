@@ -17,6 +17,7 @@ from django.db.models.query import QuerySet
 import rules
 # DRFライブラリ
 from rest_framework import viewsets, status, mixins
+from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.decorators import action, api_view
 from rest_framework.authtoken.models import Token
@@ -27,9 +28,9 @@ from rest_framework_simplejwt.tokens import AccessToken
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.settings import api_settings
 # モデル
-from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, ProductVariationDetail, Wallet, WalletTransaction, Staff, Approval, ReturnTransaction
+from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, Staff, Approval, ReturnTransaction, Customer
 # シリアライザー
-from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer, ProductVariationSerializer, ProductVariationDetailSerializer, WalletChargeSerializer, WalletBalanceSerializer, CustomUserTokenSerializer, ApprovalSerializer, ReturnTransactionSerializer
+from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer, ProductVariationSerializer, WalletChargeSerializer, WalletBalanceSerializer, CustomUserTokenSerializer, ApprovalSerializer, ReturnTransactionSerializer, StaffSerializer, CustomerSerializer
 # 自作モジュール
 from .get_receipt_data import generate_receipt_text, generate_return_receipt
 from .rules import check_transaction_access, filter_transactions_by_user
@@ -502,7 +503,6 @@ class CustomTokenObtainPairView(TokenObtainPairView):
     """カスタマイズされたJWTトークン発行View"""
     serializer_class = CustomTokenObtainPairSerializer
 
-
 @login_required
 def generate_receipt_view(request, transaction_id, receipt_type):
 
@@ -662,3 +662,45 @@ class ApprovalViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
         Approval.objects.create(user=user, approval_number=approval_number, is_used=False)
 
         return Response({"approval_number": approval_number}, status=status.HTTP_201_CREATED)
+
+
+class TokenVerifyViewSet(viewsets.ViewSet):
+    """
+    POSTされたJWTを検証し、トークンが有効な場合にユーザー情報を返すViewSet
+    """
+    permission_classes = []  # 認証不要
+
+    def create(self, request, *args, **kwargs):
+        token_str = request.data.get("token")
+        if not token_str:
+            return Response({"error": "tokenパラメータが必要です。"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            # トークンのデコードと検証
+            access_token = AccessToken(token_str)
+            user_id = access_token.get("user_id")
+            if not user_id:
+                raise TokenError("トークンにユーザー情報が含まれていません。")
+
+        except TokenError as e:
+            return Response({"error": f"トークンが無効または期限切れです: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user = CustomUser.objects.get(pk=user_id)
+        except CustomUser.DoesNotExist:
+            return Response({"error": "ユーザーが存在しません。"}, status=status.HTTP_400_BAD_REQUEST)
+
+        data = {}
+        try:
+            staff = Staff.objects.get(user=user)
+            data['staff'] = StaffSerializer(staff).data
+        except Staff.DoesNotExist:
+            pass
+
+        try:
+            customer = Customer.objects.get(user=user)
+            data['customer'] = CustomerSerializer(customer).data
+        except Customer.DoesNotExist:
+            pass
+
+        return Response(data, status=status.HTTP_200_OK)

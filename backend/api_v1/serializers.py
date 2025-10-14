@@ -3,7 +3,7 @@ from django.utils import timezone
 from django.db import transaction
 from rest_framework.fields import empty
 from .views import StockReceiveHistory, StockReceiveHistoryItem
-from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, WalletTransaction, Wallet, Approval, Store, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA, DiscountedJAN, Terminal
+from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, Customer, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, WalletTransaction, Wallet, Approval, Store, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA, DiscountedJAN, Terminal
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 
@@ -1931,3 +1931,47 @@ class ApprovalSerializer(serializers.ModelSerializer):
     class Meta:
         model = Approval
         fields = ['id', 'user', 'approval_number', 'created_at']
+
+
+class StaffSerializer(serializers.ModelSerializer):
+    """スタッフ情報用のシリアライザー"""
+    store = serializers.SlugRelatedField(
+        slug_field='store_code',
+        read_only=True,
+        source='affiliate_store'
+    )
+    name = serializers.CharField(read_only=True)
+    role = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Staff
+        fields = ('staff_code', 'store', 'name', 'role')
+
+    def get_role(self, obj):
+        roles = []
+        permission = obj.permission
+        if permission:
+            # UserPermissionモデルのBooleanFieldをリストアップ
+            permission_fields = [
+                'register_permission',
+                'void_permission',
+                'stock_receive_permission',
+                'global_permission',
+                'change_price_permission',
+            ]
+            for field_name in permission_fields:
+                if getattr(permission, field_name):
+                    roles.append(field_name)
+        return roles
+
+
+class CustomerSerializer(serializers.ModelSerializer):
+    """顧客情報用のシリアライザー"""
+    status = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Customer
+        fields = ('name', 'status')
+
+    def get_status(self, obj):
+        return (obj.user_status // 10) * 10
