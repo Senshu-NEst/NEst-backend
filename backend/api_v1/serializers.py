@@ -584,17 +584,23 @@ class TransactionSerializer(BaseTransactionSerializer):
         return data
 
     def _validate_approval_number(self, approval_number, status, data, errors):
+        terminal_id = data.get("terminal_id") # 会計リクエストのterminal_idを取得
+
         if not approval_number:
             errors["approval_number"] = "承認番号が入力されていません。"
         elif not (len(approval_number) == 8 and approval_number.isdigit()):
             errors["approval_number"] = "承認番号の形式に誤りがあります。数字8桁を入力してください。"
         else:
             try:
-                approval = Approval.objects.get(approval_number=approval_number)
+                approval = Approval.objects.select_related('terminal_id').get(approval_number=approval_number)
                 if status != "training" and approval.is_used:
                     errors["approval_number"] = "この承認番号は使用済みです。"
                 else:
-                    data["user"] = approval.user
+                    # terminal_id の検証ロジックを追加
+                    if approval.terminal_id and approval.terminal_id.terminal_id != terminal_id:
+                        errors["approval_number"] = "承認番号が発行された端末と会計端末が一致しません。"
+                    else:
+                        data["user"] = approval.user
             except Approval.DoesNotExist:
                 errors["approval_number"] = "承認番号が存在しません。"
 

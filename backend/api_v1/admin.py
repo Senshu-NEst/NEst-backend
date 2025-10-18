@@ -12,6 +12,8 @@ from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, Ou
 from django.urls import reverse
 from django.utils.html import format_html
 from django.db.models import Q
+from collections import defaultdict
+from datetime import date
 
 
 class StoreLimitedAdminMixin:
@@ -390,8 +392,8 @@ class UserPermissionAdmin(admin.ModelAdmin):
 
 @admin.register(Approval)
 class ApprovalAdmin(admin.ModelAdmin):
-    list_display = ("user", "approval_number", "is_used")
-    fields = ("user", "approval_number", "created_at", "is_used")
+    list_display = ("user", "approval_number", "terminal_id", "is_used")
+    fields = ("user", "approval_number", "terminal_id", "created_at", "is_used")
     readonly_fields = ("created_at",)
     search_fields = ("user__email",)
     list_filter = ("user", "created_at")
@@ -673,10 +675,25 @@ admin.site.unregister(OutstandingToken)
 
 admin.site.register(BlacklistedToken, BlacklistedTokenAdmin)
 admin.site.register(OutstandingToken, OutstandingTokenAdmin)
-admin.site.register(Terminal)
+@admin.register(Terminal)
+class TerminalAdmin(admin.ModelAdmin):
+    list_display = ('terminal_id', 'store_code', 'terminal_name')
+    search_fields = ('terminal_id', 'store__store_code', 'store__name')
+    list_filter = ('store',)
 
-from collections import defaultdict
-from datetime import date
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('store')
+
+    def store_code(self, obj):
+        return obj.store.store_code
+    store_code.short_description = '店舗コード'
+    store_code.admin_order_field = 'store__store_code'
+
+    def terminal_name(self, obj):
+        return obj.store.name
+    terminal_name.short_description = '店舗名'
+    terminal_name.admin_order_field = 'store__name'
+
 
 @admin.register(DailySalesReport)
 class DailySalesReportAdmin(admin.ModelAdmin):
@@ -757,7 +774,6 @@ class DailySalesReportAdmin(admin.ModelAdmin):
             product_summary[detail.jan]['discount'] += discount
             product_summary[detail.jan]['name'] = detail.name
 
-
         # 2. 返品集計
         for detail in return_details.select_related('return_transaction__origin_transaction__store_code'):
             try:
@@ -799,7 +815,6 @@ class DailySalesReportAdmin(admin.ModelAdmin):
         for rp in return_payments:
             payment_summary[rp.get_payment_method_display()]['amount'] -= rp.amount
 
-
         # --- 全体サマリー計算 ---
         total_sales = sum(s['sales'] for s in store_summary.values())
         total_returns = sum(s['returns'] for s in store_summary.values())
@@ -828,7 +843,6 @@ class DailySalesReportAdmin(admin.ModelAdmin):
             except Store.DoesNotExist:
                 selected_store_name = "不明な店舗"
 
-
         context = self.admin_site.each_context(request)
         context.update({
             'start_date': start_date,
@@ -851,6 +865,7 @@ class DailySalesReportAdmin(admin.ModelAdmin):
         })
         
         return TemplateResponse(request, self.change_list_template, context)
+
 
 # 管理画面のタイトル設定
 admin.site.site_header = "商品管理システム"

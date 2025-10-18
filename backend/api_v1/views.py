@@ -28,7 +28,7 @@ from rest_framework_simplejwt.tokens import AccessToken
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.settings import api_settings
 # モデル
-from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, Staff, Approval, ReturnTransaction, Customer
+from .models import Product, Stock, Transaction, Store, StockReceiveHistory, CustomUser, StockReceiveHistoryItem, ProductVariation, Staff, Approval, ReturnTransaction, Customer, Terminal
 # シリアライザー
 from .serializers import ProductSerializer, StockSerializer, TransactionSerializer, CustomTokenObtainPairSerializer, StockReceiveSerializer, ProductVariationSerializer, WalletChargeSerializer, WalletBalanceSerializer, CustomUserTokenSerializer, ApprovalSerializer, ReturnTransactionSerializer, StaffSerializer, CustomerSerializer
 # 自作モジュール
@@ -624,8 +624,21 @@ class ApprovalViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
 
     def create(self, request, *args, **kwargs):
         token_str = request.data.get("token")
+        terminal_id = request.data.get("terminal_id")
+
+        # バリデーションを追加
+        if not terminal_id:
+            return Response({"error": "terminal_idパラメータは必須です。"}, status=status.HTTP_400_BAD_REQUEST)
+
         if not token_str:
             return Response({"error": "tokenパラメータが必要です。"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            terminal_instance = Terminal.objects.get(terminal_id=terminal_id)
+            if terminal_instance.expires_at and terminal_instance.expires_at < timezone.now():
+                return Response({"error": f"端末ID '{terminal_id}' の有効期限が切れています。"}, status=status.HTTP_400_BAD_REQUEST)
+        except Terminal.DoesNotExist:
+            return Response({"error": f"端末ID '{terminal_id}' は登録されていません。"}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             access_token = AccessToken(token_str)
@@ -658,8 +671,13 @@ class ApprovalViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
         # 承認番号を生成（重複チェック）
         approval_number = generate_unique_approval_number()
 
-        # Approval モデルに保存（CustomUser を親として外部キーで紐付け）
-        Approval.objects.create(user=user, approval_number=approval_number, is_used=False)
+        # Approval モデルに保存（terminal_id も含める）
+        Approval.objects.create(
+            user=user,
+            approval_number=approval_number,
+            is_used=False,
+            terminal_id=terminal_instance
+        )
 
         return Response({"approval_number": approval_number}, status=status.HTTP_201_CREATED)
 

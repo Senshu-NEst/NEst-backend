@@ -512,6 +512,11 @@ class Approval(BaseModel):
     CustomUser を親とし、外部キーで紐付ける。
     """
     user = models.ForeignKey("CustomUser", on_delete=models.CASCADE, related_name="approvals")
+    terminal_id = models.ForeignKey(
+        'Terminal',
+        on_delete=models.CASCADE,
+        verbose_name="発行端末ID"
+    )
     approval_number = models.CharField(max_length=8)
     is_used = models.BooleanField(default=False, verbose_name="使用済みフラグ")
 
