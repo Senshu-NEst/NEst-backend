@@ -1575,7 +1575,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         data = {
             'original_transaction': original_transaction.id,
             'sale_products': copied_products,
-            'store_code': self.initial_data.get('store_code'),
+            'store_code': return_transaction.store_code.store_code,
             'terminal_id': self.initial_data.get('terminal_id'),
             'staff_code': self.initial_data.get('staff_code'),
             'payments': new_payments,  # 正の金額のみ取り込み
@@ -1585,7 +1585,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         serializer.is_valid(raise_exception=True)
         return serializer.save()
 
-    def _create_new_transaction(self, original_transaction, additional_items, delete_items, payment_inputs):
+    def _create_new_transaction(self, original_transaction, additional_items, delete_items, payment_inputs, validated_data):
         additional_items = self._sanitize_items(additional_items, 'additional_items')
         delete_items = self._sanitize_items(delete_items, 'delete_items')
         original_products = list(original_transaction.sale_products.all())
@@ -1726,7 +1726,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         new_transaction_data = {
             'original_transaction': original_transaction.id,
             'sale_products': remaining_products,
-            'store_code': self.initial_data.get('store_code'),
+            'store_code': validated_data.get('store_code').store_code,
             'terminal_id': self.initial_data.get('terminal_id'),
             'staff_code': self.initial_data.get('staff_code'),
             'payments': payment_inputs,
@@ -1754,7 +1754,7 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         original_transaction.save()
 
         # 返品先店舗を取得（存在しなければ ValidationError）
-        store = validated_data.pop('store_code')
+        store = validated_data.get('store_code') # 超重要！`pop`じゃなくて`get` `pop`したら後から参照できない！
         # ReturnTransaction を作成
         return_transaction = ReturnTransaction.objects.create(
             origin_transaction=original_transaction,
@@ -1801,7 +1801,8 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
             carryover_amount = original_transaction.total_amount - refund_amount
             correction_payments = self._create_new_transaction(
                 original_transaction, add_items, del_items,
-                [{'payment_method': 'carryover', 'amount': carryover_amount}]
+                [{'payment_method': 'carryover', 'amount': carryover_amount}],
+                validated_data
             )
 
         if correction_payments:
