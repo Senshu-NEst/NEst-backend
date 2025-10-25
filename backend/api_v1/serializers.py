@@ -67,25 +67,36 @@ class BaseTransactionSerializer(serializers.ModelSerializer):
     # 各サブクラスでオーバーライドされるべき権限リスト
     required_permissions = []
 
-    def validate_terminal(self, terminal_id, store_code):
+    def validate_terminal(self, terminal_id, store_code=None):
+        """
+        store_codeの指定がない場合はterminal_idに紐づくStoreから取得
+        最終的に使用すべきstore_codeとエラー情報を返す
+        """
         if not terminal_id:
             return None, {"terminal_id": "端末IDが指定されていません。"}
+
         try:
-            terminal = Terminal.objects.get(terminal_id=terminal_id)
+            terminal = Terminal.objects.select_related('store').get(terminal_id=terminal_id)
         except Terminal.DoesNotExist:
             return None, {"terminal_id": f"端末ID '{terminal_id}' は登録されていません。"}
 
         if terminal.expires_at and terminal.expires_at < timezone.now():
             return None, {"terminal_id": f"端末ID '{terminal_id}' の有効期限が切れています。"}
 
-        if store_code:
-            if not terminal.allow_move:
-                return store_code, {"terminal_id": f"端末ID '{terminal_id}' は店舗の移動が許可されていません。"}
-            return store_code, None
-        else:
-            if not terminal.store:
-                return None, {"terminal_id": f"端末ID '{terminal_id}' に店舗が紐付いていません。"}
-            return terminal.store.store_code, None
+        if not terminal.store:
+            return None, {"terminal_id": f"端末ID '{terminal_id}' に店舗が紐付いていません。"}
+        terminal_store_code = terminal.store.store_code
+
+        # store_codeの指定がない場合はterminal_idに紐づくStoreから取得
+        if not store_code:
+            store_code = terminal_store_code
+
+        # store_code が端末店舗と異なる場合の移動許可チェック
+        if store_code != terminal_store_code and not terminal.allow_move:
+            return store_code, {"terminal_id": f"端末ID '{terminal_id}' は店舗の移動が許可されていません。"}
+
+        # 問題なし(エラーコードなし)
+        return store_code, None
 
     def validate(self, data):
         """共通バリデーション：店舗の存在チェックとスタッフの権限チェック"""
@@ -525,11 +536,11 @@ class TransactionSerializer(BaseTransactionSerializer):
     def validate(self, data):
         errors = {}
 
-        # ターミナルIDと店舗コードを取得
+        # ターミナルIDと店舗コードを入力値から取得
         terminal_id = data.get('terminal_id')
         store_code = data.get('store_code')
 
-        # ターミナルを検証し、店舗コードを解決
+        # validate_terminalの1つ目の戻り値が決定された店舗となる（terminal_idからの店舗参照を含む）
         resolved_store_code, terminal_error = self.validate_terminal(terminal_id, store_code)
         if terminal_error:
             errors.update(terminal_error)
@@ -584,7 +595,7 @@ class TransactionSerializer(BaseTransactionSerializer):
         return data
 
     def _validate_approval_number(self, approval_number, status, data, errors):
-        terminal_id = data.get("terminal_id") # 会計リクエストのterminal_idを取得
+        terminal_id = data.get("terminal_id")  # 会計リクエストのterminal_idを取得
 
         if not approval_number:
             errors["approval_number"] = "承認番号が入力されていません。"
@@ -1062,16 +1073,15 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
     class Meta:
         model = ReturnTransaction
         fields = ['id', 'origin_transaction', 'date', 'return_type', 'store_code', 'staff_code', 'terminal_id', 'reason', 'restock', 'payments', 'return_payments', 'return_products', 'additional_items', 'delete_items']
-        extra_kwargs = {'origin_transaction': {'required': True}, 'staff_code': {'required': True}, 'restock': {'required': True}}
+        extra_kwargs = {'origin_transaction': {'required': True}, 'staff_code': {'required': False}, 'restock': {'required': True}}
 
     def validate(self, data):
         errors = {}
-
-        # ターミナルIDと店舗コードを取得
+        # ターミナルIDと店舗コードを入力値から取得
         terminal_id = data.get('terminal_id')
         store_code = data.get('store_code')
 
-        # ターミナルを検証し、店舗コードを解決
+        # validate_terminalの1つ目の戻り値が決定された店舗となる（terminal_idからの店舗参照を含む）
         resolved_store_code, terminal_error = self.validate_terminal(terminal_id, store_code)
         if terminal_error:
             errors.update(terminal_error)
