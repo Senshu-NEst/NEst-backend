@@ -120,8 +120,8 @@ class DiscountedJANAdmin(StoreLimitedAdminMixin, admin.ModelAdmin):
     search_fields = ('instore_jan', 'stock__jan__jan', 'stock__jan__name', 'stock__store_code__name')
     list_filter = ('stock__store_code__name', 'is_used')
     raw_id_fields = ('stock',)
-    readonly_fields = ('get_stock_info',)
-    fields = ('stock', 'discounted_price', 'get_stock_info')
+    readonly_fields = ('get_original_price', 'get_stock_info',)
+    fields = ('stock', 'get_stock_info', 'get_original_price', 'discounted_price', 'is_used',)
 
     def get_queryset(self, request):
         # Mixinのget_querysetを呼び出し、さらに最適化を追加
@@ -135,6 +135,14 @@ class DiscountedJANAdmin(StoreLimitedAdminMixin, admin.ModelAdmin):
                 if hasattr(user, 'staff_profile') and user.staff_profile.affiliate_store:
                     kwargs["queryset"] = Stock.objects.filter(store_code=user.staff_profile.affiliate_store)
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+    def get_readonly_fields(self, request, obj=None):
+        # obj が None の場合 → 新規作成フォーム
+        if obj is None:
+            return self.readonly_fields + ('is_used',)
+        else:
+            # 編集時は transaction_code を編集不可にする
+            return self.readonly_fields + ('stock',)
 
     def get_store_name(self, obj):
         return obj.stock.store_code.name
@@ -342,17 +350,9 @@ class CustomUserAdmin(admin.ModelAdmin):
             customer_profile, created = Customer.objects.get_or_create(user=obj)
             if created:
                 customer_profile.name = '顧客名'
-                customer_profile.phone_number = ''
-                customer_profile.address = ''
+                customer_profile.user_status = 0
                 customer_profile.save()
-
-        # ユーザータイプが変更された場合、元の関連テーブルから情報を削除
-        if change:
-            if obj.user_type != form.initial['user_type']:
-                if form.initial['user_type'] == 'staff':
-                    Staff.objects.filter(user=obj).delete()  # 既存のスタッフ情報を削除
-                elif form.initial['user_type'] == 'customer':
-                    Customer.objects.filter(user=obj).delete()  # 既存の顧客情報を削除
+                # ユーザータイプが社員の場合は社販のステータスを自動登録する予定
 
 
 class StaffInline(admin.StackedInline):
@@ -406,7 +406,7 @@ class ApprovalAdmin(admin.ModelAdmin):
 class ReturnDetailInline(admin.TabularInline):  # または StackedInline
     model = ReturnDetail
     extra = 0  # 空のフォームを表示しない
-    readonly_fields = ("jan", "name", "price", "tax", "discount", "quantity")  # 返品内容は変更不可
+    readonly_fields = ("jan", "extra_code", "name", "price", "tax", "discount", "quantity",)  # 返品内容は変更不可
     can_delete = False  # インライン上で削除できないように設定
 
 
@@ -424,7 +424,7 @@ class ReturnTransactionAdmin(StoreLimitedAdminMixin, admin.ModelAdmin):
     list_display_links = ("pk", "origin_transaction_links",)
     search_fields = ("pk",)
     list_filter = ("return_type", "return_date",)
-    readonly_fields = ("id", "origin_transaction", "return_date", "staff_code", "reason")  # 必要に応じて追加
+    readonly_fields = ("id", "origin_transaction", "return_date", "staff_code", "reason",)  # 必要に応じて追加
     inlines = [ReturnDetailInline, ReturnPaymentInline]  # インラインで関連データを表示
 
     def origin_transaction_links(self, obj):
@@ -679,6 +679,7 @@ admin.site.unregister(OutstandingToken)
 
 admin.site.register(BlacklistedToken, BlacklistedTokenAdmin)
 admin.site.register(OutstandingToken, OutstandingTokenAdmin)
+
 @admin.register(Terminal)
 class TerminalAdmin(admin.ModelAdmin):
     list_display = ('terminal_id', 'store_code', 'terminal_name')
@@ -869,6 +870,10 @@ class DailySalesReportAdmin(admin.ModelAdmin):
         })
         
         return TemplateResponse(request, self.change_list_template, context)
+
+    def has_add_permission(self, request):
+        """新規作成を許可しない"""
+        return False
 
 
 # 管理画面のタイトル設定
