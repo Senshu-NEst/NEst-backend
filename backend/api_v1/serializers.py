@@ -118,7 +118,8 @@ class BaseTransactionSerializer(serializers.ModelSerializer):
             errors["staff_code"] = "スタッフコードが指定されていません。"
         else:
             try:
-                staff = Staff.objects.get(staff_code=staff_code)
+                # Staff と関連する affiliate_store をまとめて取得
+                staff = Staff.objects.select_related('affiliate_store').get(staff_code=staff_code)
                 permission_checker = UserPermissionChecker(staff_code)
                 permissions = permission_checker.get_permissions()
 
@@ -126,13 +127,13 @@ class BaseTransactionSerializer(serializers.ModelSerializer):
                 if staff.affiliate_store.store_code != store_instance.store_code:
                     if "global" not in permissions:
                         errors["staff_code"] = "このスタッフは自店のみ処理可能です。"
-                
+
                 # サブクラスで定義された権限のチェック
                 if self.required_permissions:
                     missing = [p for p in self.required_permissions if p not in permissions]
                     if missing:
                         errors["staff_code"] = f"このスタッフは次の権限が不足しています: {', '.join(missing)}"
-                
+
                 # 後続処理のために権限情報を渡す
                 data['_permissions'] = permissions
 
@@ -141,7 +142,7 @@ class BaseTransactionSerializer(serializers.ModelSerializer):
 
         if errors:
             raise serializers.ValidationError(errors)
-        
+
         return data
 
 
@@ -296,7 +297,7 @@ class TransactionDetailSerializer(serializers.ModelSerializer):
         small_code = dept_code[3:]
 
         try:
-            dept = Department.objects.get(
+            dept = Department.objects.select_related('parent', 'parent__parent').get(
                 level="small",
                 code=small_code,
                 parent__code=middle_code,
