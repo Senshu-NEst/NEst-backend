@@ -25,6 +25,7 @@ def can_view_transaction(user, transaction):
     # それ以外は、取引の店舗コードとスタッフの所属店舗が一致していることを確認
     return transaction.store_code == staff.affiliate_store
 
+
 # ② 上記プレディケートを rules に登録
 rules.add_rule('view_transaction', can_view_transaction)
 
@@ -57,6 +58,64 @@ def filter_transactions_by_user(user, queryset):
         return queryset
     # それ以外は所属店舗と一致する取引のみフィルタリング
     return queryset.filter(store_code=staff.affiliate_store)
+
+
+# ⑤ 返品取引閲覧権限の判定用プレディケート
+@rules.predicate
+def can_view_returntransaction(user, returntransaction):
+    # スーパーユーザーなら無条件アクセス
+    if user.is_superuser:
+        return True
+
+    # ユーザーにスタッフ情報が存在しない場合はアクセス不可
+    try:
+        staff = user.staff_profile
+    except AttributeError:
+        return False
+
+    # スタッフ権限が設定されていない場合はアクセス不可
+    if not (staff.permission and isinstance(staff.permission, object)):
+        return False
+
+    # global_permission があれば無条件アクセス
+    if staff.permission.global_permission:
+        return True
+
+    # それ以外は、返品取引の店舗コードとスタッフの所属店舗が一致するか、または元取引の店舗コードとスタッフの所属店舗が一致することを確認
+    # ReturnTransaction モデルが origin_transaction という名前で元取引の Transaction モデルへの ForeignKey を持っていることを前提
+    return (returntransaction.store_code == staff.affiliate_store or
+            returntransaction.origin_transaction.store_code == staff.affiliate_store)
+
+
+# ⑥ 上記プレディケートを rules に登録
+rules.add_rule('view_returntransaction', can_view_returntransaction)
+
+
+# ⑦ 権限がない場合に403エラーを発生させる関数
+def check_returntransaction_access(user, returntransaction):
+    if not rules.test_rule('view_returntransaction', user, returntransaction):
+        raise PermissionDenied("この返品取引にアクセスする権限がありません。")
+    return True
+
+
+def filter_returntransactions_by_user(user, queryset):
+    """
+    ユーザーのアクセス権限に応じて、返品取引クエリセットをフィルタリングする。
+    スーパーユーザーまたは global_permission を持つ場合はフィルタリングせず、
+    それ以外はユーザーの所属店舗に一致する返品取引、または元取引の店舗に一致する返品取引のみを返す。
+    """
+    # スーパーユーザーまたは global_permission がある場合はフィルタ不要
+    if user.is_superuser:
+        return queryset
+    try:
+        staff = user.staff_profile
+    except AttributeError:
+        # スタッフ情報がない場合は空のクエリセットを返す
+        return queryset.none()
+    if staff.permission and staff.permission.global_permission:
+        return queryset
+    # それ以外は所属店舗と一致する返品取引のみフィルタリング
+    return queryset.filter(store_code=staff.affiliate_store) | queryset.filter(original_transaction__store_code=staff.affiliate_store)
 
 
 ## ⑤ 他の操作（変更・削除）についても同様にプレディケートを定義可能
