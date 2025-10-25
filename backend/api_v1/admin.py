@@ -152,7 +152,11 @@ class DiscountedJANAdmin(StoreLimitedAdminMixin, admin.ModelAdmin):
     get_product_name.admin_order_field = 'stock__jan__name'
 
     def get_original_price(self, obj):
-        return obj.stock.jan.price
+        store_price = StorePrice.objects.filter(store_code=obj.stock.store_code, jan=obj.stock.jan).first()
+        if store_price:
+            return str(f'*{store_price.price}')
+        else:
+            return obj.stock.jan.price
     get_original_price.short_description = '元価格'
 
     def get_current_stock(self, obj):
