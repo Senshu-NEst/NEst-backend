@@ -1143,27 +1143,30 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
                 if optional:
                     return None
                 raise serializers.ValidationError({group: f"{group}には{field_name}が必須です。"})
-
+    
             try:
                 return int(value)
-            except ValueError:
+            except (ValueError, TypeError):
                 raise serializers.ValidationError({group: f"{group}の{field_name}は整数でなければなりません。"})
-
+    
         sanitized = []
         for item in items:
             if 'jan' not in item or 'quantity' not in item:
                 raise serializers.ValidationError({group: f"{group}にはJANコードと数量が必須です。"})
-
-            # 数量、割引、価格の変換とチェック
+    
+            # 数量、割引、価格、税率の変換とチェック
             quantity = _validate_integer(item.get('quantity'), '数量')
             discount = _validate_integer(item.get('discount'), '値引額', optional=True)
             price = _validate_integer(item.get('price'), '価格', optional=True)
-
+            tax = _validate_integer(item.get('tax'), '税率', optional=True)
+    
             obj = {'jan': item['jan'], 'quantity': quantity}
             if discount is not None:
                 obj['discount'] = discount
             if price is not None:
                 obj['price'] = price
+            if tax is not None:
+                obj['tax'] = tax
             sanitized.append(obj)
         return sanitized
 
@@ -1358,39 +1361,107 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
             else:
                 return 'NORMAL'
 
-        # 削除商品のマッチング
-        def match_product(jan, quantity, tax=None, discount=None):
+        def match_product(jan, quantity, tax=None, discount=None, price=None, item=None):
+            """
+            指定された削除アイテム情報に含まれるフィールドだけを使って
+            段階的に候補を絞り込む。
+            明示的に指定された値については厳格な一致を要求する。
+            """
+            # 共通エラーメッセージ
+            MISMATCH_ERROR = {'delete_items': f"JANコード {jan} 元取引と内容が一致しません。検索条件を確認してください。"}
+            
             type_ = classify_jan(jan)
             if type_ == 'POSA':
                 dept_code, code = jan[:8], jan[8:]
                 matching = [p for p in products_list if p['jan'] == dept_code and not p['processed'] and p['extra_code'] == code]
-                if not matching:
-                    raise serializers.ValidationError({'delete_items': f"部門コード {dept_code}、POSAコード {code} の商品が存在しません。"})
             elif type_ == 'DISCOUNTED':
                 matching = [p for p in products_list if p['extra_code'] == jan and not p['processed']]
-                if not matching:
-                    raise serializers.ValidationError({'delete_items': f"値引きJAN {jan} の商品が存在しません。"})
             else:
                 matching = [p for p in products_list if p['jan'] == jan and not p['processed']]
-                if not matching:
-                    raise serializers.ValidationError({'delete_items': f"JANコード {jan} の商品が存在しません。"})
 
-            # 税率で絞り込み
-            if tax is not None:
-                matching = [p for p in matching if p['tax'] == int(tax)]
-                if not matching:
-                    raise serializers.ValidationError({'delete_items': f"JANコード {jan} で税率 {tax} に一致する商品が見つかりません。"})
+            if not matching:
+                return None
 
-            # 値引きで絞り込み
-            if discount is not None:
-                disc_float = float(discount)
-                matching = [p for p in matching if abs(p['discount'] - disc_float) < 0.01]
-                if not matching:
-                    raise serializers.ValidationError({'delete_items': f"JANコード {jan} で値引き額 {discount} に一致する商品が見つかりません。"})
+            # 部門打ち判定
+            is_dept = (jan.startswith('999') and len(jan) == 8)
+            
+            # === price の判定と絞り込み ===
+            price_provided = False
+            input_price = None
+            if price is not None and price not in (None, ''):
+                price_provided = True
+                input_price = price
+            elif item is not None and 'price' in item and item.get('price') not in (None, ''):
+                price_provided = True
+                input_price = item.get('price')
+            
+            if is_dept and not price_provided:
+                raise serializers.ValidationError({'delete_items': f"部門打ち商品の返品には price が必須です: {item}"})
 
+            if price_provided:
+                try:
+                    input_price = int(input_price)
+                except (ValueError, TypeError):
+                    input_price = int(float(input_price))
+                
+                matching = [p for p in matching if p['price'] == input_price]
+                if not matching:
+                    raise serializers.ValidationError({'delete_items': MISMATCH_ERROR})
+
+            # === discount の判定と絞り込み ===
+            discount_provided = False
+            input_discount = None
+            if discount is not None and discount not in (None, ''):
+                discount_provided = True
+                input_discount = discount
+            elif item is not None and 'discount' in item and item.get('discount') not in (None, ''):
+                discount_provided = True
+                input_discount = item.get('discount')
+            
+            if discount_provided:
+                try:
+                    input_discount = float(input_discount)
+                except (ValueError, TypeError):
+                    input_discount = 0.0
+                
+                matching = [p for p in matching if abs(p['discount'] - input_discount) < 0.01]
+                if not matching:
+                    raise serializers.ValidationError({'delete_items': MISMATCH_ERROR})
+
+            # === tax の判定と絞り込み ===
+            tax_provided = False
+            input_tax = None
+            if tax is not None and tax not in (None, ''):
+                tax_provided = True
+                input_tax = tax
+            elif item is not None and 'tax' in item and item.get('tax') not in (None, ''):
+                tax_provided = True
+                input_tax = item.get('tax')
+            
+            if tax_provided:
+                # 入力値は整数であることが保証されている
+                input_tax = int(input_tax)
+                
+                # 候補の税率と比較
+                matching = [p for p in matching if int(p['tax']) == input_tax]
+                
+                if not matching:
+                    raise serializers.ValidationError({'delete_items': MISMATCH_ERROR})
+            else:
+                # tax が指定されていない場合、残った候補の税率が複数存在するならエラー
+                if matching:
+                    tax_rates = set(int(p['tax']) for p in matching)
+                    if len(tax_rates) > 1:
+                        item_repr = item if item is not None else jan
+                        raise serializers.ValidationError({'delete_items': f"一致する候補の税率が複数存在します。tax を指定してください: {item_repr}"})
+            
+            # 候補が複数ある場合はエラー
             if len(matching) > 1:
-                raise serializers.ValidationError({'delete_items': f"JANコード {jan} で条件に一致する商品が複数あります。税率や値引きを指定してください。"})
-
+                raise serializers.ValidationError({'delete_items': MISMATCH_ERROR})
+            
+            if not matching:
+                return None
+            
             return matching[0]
 
         # 追加商品の単価取得
@@ -1441,7 +1512,26 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
         # 削除商品の合計金額計算
         delete_total = 0
         for item in delete_items:
-            target = match_product(item['jan'], item['quantity'], tax=item.get('tax'), discount=item.get('discount'))
+            # キーの存在チェックを行い、存在する場合のみ値を渡す
+            kwargs = {
+                'jan': item['jan'],
+                'quantity': item['quantity'],
+                'item': item
+            }
+            
+            # キーが存在し、かつ値が None でも空文字列でもない場合のみ追加
+            if 'tax' in item and item['tax'] not in (None, ''):
+                kwargs['tax'] = item['tax']
+            if 'discount' in item and item['discount'] not in (None, ''):
+                kwargs['discount'] = item['discount']
+            if 'price' in item and item['price'] not in (None, ''):
+                kwargs['price'] = item['price']
+            
+            target = match_product(**kwargs)
+            
+            # match_product が None を返した場合のハンドリング: 一致する明細が無ければ ValidationError を投げる
+            if target is None:
+                raise serializers.ValidationError({'delete_items': f"削除対象の商品に一致する元取引の明細が見つかりません: {item}"})
             qty = item['quantity']
 
             # 元数量チェック（POSA以外）
@@ -1621,45 +1711,28 @@ class ReturnTransactionSerializer(BaseTransactionSerializer):
             for p in original_products
         ]
 
-        # 削除商品の処理
+        # 削除商品の処理（検証は _compute_additional_delete_totals で済んでいる前提）
         for item in delete_items:
             jan = item['jan']
             delete_quantity = item['quantity']
-            has_tax = 'tax' in item and item['tax'] is not None
-            has_discount = 'discount' in item and item['discount'] is not None
-            
+
             # POSAの場合（999020から始まる20桁）
             if jan.startswith('999020') and len(jan) == 20:
                 dept_code = jan[:8]
                 code = jan[8:]
-                
-                # 部門コードとPOSAコードでマッチング
                 matching_products = [p for p in products_list if p['jan'] == dept_code and p['extra_code'] == code and not p['processed']]
             else:
-                # 通常商品の場合
                 matching_products = [p for p in products_list if p['jan'] == jan and not p['processed']]
-            
-            if len(matching_products) > 1:
-                if not (has_tax or has_discount):
-                    raise serializers.ValidationError({'delete_items': f"JANコード {jan} の商品が複数存在するため、税率または値引き額を指定して削除対象を特定してください。"})
-                filtered = matching_products
-                if has_tax:
-                    specified_tax = int(item['tax'])
-                    filtered = [p for p in filtered if p['tax'] == specified_tax]
-                if has_discount:
-                    specified_discount = float(item['discount'])
-                    filtered = [p for p in filtered if abs(p['discount'] - specified_discount) < 0.01]
-                target = filtered[0] if filtered else matching_products[0]
-            else:
-                target = matching_products[0]
-                if has_tax and target['tax'] != int(item['tax']):
-                    raise serializers.ValidationError({'delete_items': f"JANコード {jan} の指定税率 {item['tax']} が商品の税率 {target['tax']} と一致しません。"})
-                if has_discount and abs(target['discount'] - float(item['discount'])) > 0.01:
-                    raise serializers.ValidationError({'delete_items': f"JANコード {jan} の指定値引き額 {item['discount']} が商品の値引き額 {target['discount']} と一致しません。"})
-            
+
+            if not matching_products:
+                raise serializers.ValidationError({'delete_items': f"削除対象の商品に一致する元取引の明細が見つかりません: {item}"})
+
+            # 検証は事前に行われているため、最初の候補を採用する
+            target = matching_products[0]
+
             if delete_quantity > target['quantity']:
                 raise serializers.ValidationError({'delete_items': f"JANコード {jan} の削除数量 {delete_quantity} が元の数量 {target['quantity']} を超えています。"})
-            
+
             target['processed'] = True
             if delete_quantity < target['quantity']:
                 remaining_products.append({
