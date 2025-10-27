@@ -754,6 +754,10 @@ class TransactionSerializer(BaseTransactionSerializer):
                         totals = self._calculate_totals(normalized_sale_products, store_code_instance)
                         data["_totals"] = totals
 
+                        # Make normalized sale_products available to payment validation so POSA flags are visible.
+                        # This ensures POSA amount cash checks use the normalized data (price/discount/quantity).
+                        self.initial_data['sale_products'] = normalized_sale_products
+
                         # _validate_all_payments は errors dict を受け取って埋める仕様なので、
                         # ここでは一旦ローカル dict に入れてから親 errors に反映する（副作用を明確化）
                         payment_check_errors = {}
@@ -793,7 +797,6 @@ class TransactionSerializer(BaseTransactionSerializer):
     def _validate_all_payments(self, payments, totals, status, user, errors):
         total_amount = totals['total_amount']
         posa_products = [p for p in self.initial_data.get("sale_products", []) if p.get("_is_posa", False)]
-        
         payment_totals = {'cash': 0, 'voucher': 0, 'other': 0}
         for p in payments:
             method = p.get('payment_method')
@@ -824,19 +827,19 @@ class TransactionSerializer(BaseTransactionSerializer):
         すべてのエラーを収集してから一括で返す
         """
         errors = {}
-        
+
         # 基本的な支払い総額チェック
         basic_payment_total = payment_totals['cash'] + payment_totals['voucher'] + payment_totals['other']
         if basic_payment_total < total_amount:
             errors["payment_total"] = "支払いの合計金額が不足しています。"
-        
+
         # 支払い処理の優先順位に従った計算
         remaining_amount = total_amount
-        
+
         # 1. POSA商品の現金充当（最優先）
         if posa_products and not self.context.get("skip_posa_check", False):
             posa_total = sum((p.get("price", 0) - p.get("discount", 0)) * p.get("quantity", 1) for p in posa_products)
-            
+
             # POSA商品分の現金不足チェック
             if payment_totals['cash'] < posa_total:
                 shortage = posa_total - payment_totals['cash']
@@ -844,26 +847,26 @@ class TransactionSerializer(BaseTransactionSerializer):
             else:
                 # POSA分を残額から差し引き
                 remaining_amount -= posa_total
-        
+
         # 2. キャッシュレス決済上限チェック（釣り銭が出せないため）
         if payment_totals['other'] > remaining_amount:
             errors["cashless_payment"] = "キャッシュレス決済が必要額を超えています。"
         else:
             # キャッシュレス決済分を残額から差し引き
             remaining_amount -= payment_totals['other']
-        
+
         # 3. 金券利用チェック（キャッシュレス決済後の残額に対して）
         if payment_totals['voucher'] > 0:
             # 金券が実際に利用される額
             actual_voucher_usage = min(payment_totals['voucher'], remaining_amount)
-            
+
             # 金券が登録されているのに全く利用されていない場合
             if actual_voucher_usage == 0:
                 errors["voucher_payment"] = "金券が登録されていますが、利用されていません。"
-            
+
             # 金券利用分を残額から差し引く
             remaining_amount -= actual_voucher_usage
-        
+
         return errors
 
     def _calculate_change(self, payments_data, total_amount, sale_products_data):
@@ -1056,9 +1059,15 @@ class TransactionSerializer(BaseTransactionSerializer):
         }
 
     def _aggregate_same_products(self, sale_products_data):
+        """
+        同一商品の集約処理。
+        - POSA 商品については必ず個別化する（集約しない）。
+          優先順: _posa_instance.code, _extra_code, extra_code, それらが無ければ要素インデックスを用いる。
+        - 部門打ち等は従来通り price 等を含めて集約する。
+        """
         aggregated_products = {}
-        for sale_product in sale_products_data:
-            # 部門打ち商品の場合は価格も統合キーに含める
+        for idx, sale_product in enumerate(sale_products_data):
+            # 部門打ち商品の場合は価格も統合キーに含める（従来挙動）
             if sale_product.get("_is_department", False):
                 key = (
                     sale_product["jan"],
@@ -1067,29 +1076,49 @@ class TransactionSerializer(BaseTransactionSerializer):
                     sale_product.get("original_product", False),
                     sale_product.get("price", 0)
                 )
+                should_aggregate = True
             else:
-                # POSA（プリペイド/ギフトカード）は同価格でも個別の識別子で区別する
+                # POSA（プリペイド/ギフトカード）は同価格でも個別の識別子で区別する（集約不可）
                 if sale_product.get("_is_posa", False):
+                    # 優先順: _posa_instance.code, _extra_code, extra_code, インデックスフォールバック
+                    posa_instance = sale_product.get("_posa_instance")
+                    if posa_instance and getattr(posa_instance, "code", None):
+                        unique_id = posa_instance.code
+                    elif sale_product.get("_extra_code"):
+                        unique_id = sale_product.get("_extra_code")
+                    elif sale_product.get("extra_code"):
+                        unique_id = sale_product.get("extra_code")
+                    else:
+                        unique_id = f"__idx_{idx}"
+                    # key に unique_id を必ず含めることで同額POSAがまとめられないようにする
                     key = (
                         sale_product["jan"],
                         sale_product["tax"],
                         sale_product.get("discount", 0),
                         sale_product.get("original_product", False),
-                        sale_product.get("_extra_code", sale_product.get("extra_code"))
+                        unique_id
                     )
+                    should_aggregate = False  # POSA は同一キーでも集約しない（安全のため）
                 else:
+                    # 通常商品の集約キー（従来通り）
                     key = (
                         sale_product["jan"],
                         sale_product["tax"],
                         sale_product.get("discount", 0),
                         sale_product.get("original_product", False)
                     )
+                    should_aggregate = True
+
             if key not in aggregated_products:
+                # POSA を含む場合でも total_quantity を入力行の数量で初期化する（集約しない振る舞いを保障）
                 aggregated_products[key] = {
                     "data": sale_product.copy(),
-                    "total_quantity": 0
+                    "total_quantity": sale_product.get("quantity", 0) if not should_aggregate else 0
                 }
-            aggregated_products[key]["total_quantity"] += sale_product["quantity"]
+
+            # 集約する場合のみ数量を加算する（POSA は should_aggregate=False のため加算されない）
+            if should_aggregate:
+                aggregated_products[key]["total_quantity"] += sale_product.get("quantity", 0)
         return aggregated_products
 
     @transaction.atomic
