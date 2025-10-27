@@ -7,7 +7,10 @@
 __pycache__/
 migrations/
 static/
+.roo/
 
 #　隠しファイル
 .DS_Store
 .env
+
+copilot-instructions.md
