@@ -260,7 +260,7 @@ class TransactionDetail(BaseModel):
 
     class Meta:
         # unique_together = ("transaction", "jan", "tax", "discount")  # 1取引に同じ商品が存在しないことを保証
-        constraints = [models.UniqueConstraint(fields=["transaction", "price", "jan", "tax", "discount"], name='TransactionDetail_unique_constraint')]
+        constraints = [models.UniqueConstraint(fields=["transaction", "price", "jan", "tax", "discount", "extra_code"], name='TransactionDetail_unique_constraint')]
         verbose_name = "明細"
         verbose_name_plural = "取引詳細一覧"
 
