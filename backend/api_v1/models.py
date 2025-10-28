@@ -38,6 +38,27 @@ class Product(BaseModel):
         SPOT = "spot", "スポット"
         DISCON = "discon", "終売"
 
+    def get_applied_tax(self, specified_tax_rate):
+        """
+        商品インスタンスと指定税率から適用税率を判定する。
+        バリデーションエラーは django.core.exceptions.ValidationError で発生させる。
+        """
+        if specified_tax_rate is None:
+            return self.tax
+        if specified_tax_rate not in [0, 8, 10]:
+            raise ValidationError(f"JAN:{self.jan} 不正な税率。税率は0, 8, 10のいずれかを指定してください。")
+        if int(self.tax) == 10 and specified_tax_rate != 10:
+            raise ValidationError(f"JAN:{self.jan} 税率10%の商品は税率変更できません。")
+        if self.disable_change_tax:
+            if specified_tax_rate != int(self.tax):
+                raise ValidationError(f"JAN:{self.jan} は税率の変更が禁止されています。")
+            return self.tax
+        if int(self.tax) == 8 and specified_tax_rate == 10:
+            return 10
+        if specified_tax_rate != int(self.tax):
+            raise ValidationError(f"JAN:{self.jan} は税率変更できません。")
+        return self.tax
+
     jan = models.CharField(max_length=13, primary_key=True, verbose_name="JANコード")
     name = models.CharField(max_length=255, verbose_name="商品名")
     price = models.IntegerField(validators=[MinValueValidator(0)], verbose_name="商品価格")
@@ -63,10 +84,45 @@ class Product(BaseModel):
     def __str__(self):
         return self.jan
 
+    def validate_discount(self, discount, store_price=None):
+        """
+        商品の割引禁止・価格不正チェック
+        :param discount: 割引額（int）
+        :param store_price: 店舗価格（int, 任意）
+        :raises ValidationError: 不正な割引の場合
+        """
+        price_to_check = store_price if store_price is not None else self.price
+
+        # 割引禁止チェック
+        if self.disable_change_price and discount > 0:
+            raise ValidationError({"discount": "この商品は割引が禁止されています。"})
+
+        # 割増価格の場合、割引額はゼロにセット
+        if store_price is not None and store_price > self.price and discount < 0:
+            discount = 0
+
+        # 割引額が0未満ならエラー
+        if discount < 0:
+            raise ValidationError({"discount": "割引額は0以上で指定してください。"})
+
+        # 割引額が基準価格を超えていないかチェック
+        if discount > price_to_check:
+            raise ValidationError({"discount": "割引額が商品価格を超えています。"})
+
     def clean(self):
         if not is_valid_jan_code(self.jan):
             raise ValidationError({"jan": "チェックディジットエラー！"})
         self.validate_tax_rate(self.tax)
+
+        # 税率変更禁止チェック
+        if hasattr(self, "requested_tax") and self.disable_change_tax:
+            if int(self.tax) != int(self.requested_tax):
+                raise ValidationError({"tax": "この商品は税率変更が禁止されています。"})
+
+        # 割引禁止チェック
+        if hasattr(self, "requested_discount") and self.disable_change_price:
+            if self.requested_discount > 0:
+                raise ValidationError({"discount": "この商品は割引が禁止されています。"})
 
     def validate_tax_rate(self, tax_rate):
         if tax_rate not in [0, 8, 10]:
@@ -727,6 +783,17 @@ class Department(BaseModel):
             if self.accounting_flag == 'inherit':
                 raise ValidationError("大分類の場合、部門会計フラグは『上位部門引継』を選択できません。")
 
+        # 税率変更禁止チェック
+        if hasattr(self, "requested_tax") and self.get_tax_rate_mod_flag() != "allow":
+            dept_standard_tax = int(self.get_tax_rate())
+            if int(self.requested_tax) != dept_standard_tax:
+                raise ValidationError({"tax": "この部門では税率変更が許可されていません。"})
+
+        # 割引禁止チェック
+        if hasattr(self, "requested_discount") and self.get_discount_flag() != "allow":
+            if self.requested_discount > 0:
+                raise ValidationError({"discount": "この部門では割引が許可されていません。"})
+
         super().clean()
 
 
@@ -774,21 +841,78 @@ class POSA(BaseModel):
     def clean(self):
         super().clean()
 
-        # 1) 有効期限は date 同士で比較
+        # 有効期限は過去不可
         today = timezone.localdate()
         if self.expiration_date < today:
             raise ValidationError({"expiration_date": "有効期限は過去の日付に設定できません。"})
 
-        # 2) buyer／relative_transaction の必須チェック
+        # 金額必須（バリアブルカードは金額不要かつ設定不可、非バリアブルは必須）
+        if self.is_variable:
+            if self.card_value is not None:
+                raise ValidationError({"card_value": "バリアブルカードは金額を設定できません。"})
+        else:
+            if self.card_value is None:
+                raise ValidationError({"card_value": "POSAの金額が設定されていません。"})
+
+        # buyer／relative_transaction 必須（ステータスに応じて）
         if self.status in self.REQUIRE_BUYER_AND_TXN:
             if not self.buyer:
                 raise ValidationError({"buyer": "このステータスでは購入者の指定が必須です。"})
             if not self.relative_transaction:
                 raise ValidationError({"relative_transaction": "このステータスでは取引の指定が必須です。"})
 
-        # 3) user の必須チェック
+        # user 必須（ステータスに応じて）
         if self.status in self.REQUIRE_USER and not self.user:
             raise ValidationError({"user": "このステータスでは使用者の指定が必須です。"})
+
+        # 事故カード判定
+        if self.status in ["BF_disabled", "AF_disabled"]:
+            raise ValidationError({"status": "事故POSAカードです。カードを回収の上、報告を行なってください。"})
+
+        # 販売済みカード判定
+        if self.status == "salled":
+            # 状態遷移許可判定（販売済みへの遷移は created のみ許可）
+            if hasattr(self, "_previous_status") and self._previous_status != "created":
+                raise ValidationError({"status": f"POSAコード {self.code} は販売へ遷移できません。現在のステータス: {self._previous_status}"})
+            # 販売済みカードは再度販売不可
+            if hasattr(self, "check_for_sale") and self.check_for_sale:
+                raise ValidationError({"status": "販売済みPOSAカードです。"})
+
+        # 無効なPOSAカード判定（created以外で販売済みへの遷移）
+        if self.status == "salled" and hasattr(self, "_previous_status") and self._previous_status != "created":
+            raise ValidationError({"status": "無効なPOSAカードです。"})
+
+        # 状態遷移許可判定（POSA.validate_state_change相当）
+        if hasattr(self, "_validate_state_change_to"):
+            try:
+                self.validate_state_change(self._validate_state_change_to)
+            except ValidationError as e:
+                raise ValidationError({"status": str(e)})
+
+    def validate_state_change(self, new_state: str):
+        """
+        POSAの状態遷移許可判定メソッド。
+        - new_state: 遷移先ステータス文字列
+        - 許可されない場合は django.core.exceptions.ValidationError を発生
+        """
+        current = self.status
+        # 販売済みへの遷移
+        if new_state == "salled":
+            if current != "created":
+                raise ValidationError({"status": f"POSAコード {self.code} は販売へ遷移できません。現在のステータス: {current}"})
+        # 無効化への遷移
+        if new_state == "AF_disabled":
+            if current != "salled":
+                raise ValidationError({"status": f"POSAコード {self.code} は無効化できません。現在のステータス: {current}"})
+        # 事故カードチェック
+        if current in ["BF_disabled", "AF_disabled"]:
+            raise ValidationError({"status": "事故POSAカードです。カードを回収の上、報告を行なってください。"})
+        # 販売済みチェック
+        if current == "salled" and new_state == "salled":
+            raise ValidationError({"status": "販売済みPOSAカードです。"})
+        # created以外は無効
+        if current != "created" and new_state == "salled":
+            raise ValidationError({"status": "無効なPOSAカードです。"})
 
 
 class BulkGeneratePOSACodes(POSA):

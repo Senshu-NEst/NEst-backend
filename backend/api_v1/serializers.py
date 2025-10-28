@@ -4,6 +4,7 @@ from django.db import transaction
 from rest_framework.fields import empty
 from .views import StockReceiveHistory, StockReceiveHistoryItem
 from .models import Product, Stock, Transaction, TransactionDetail, CustomUser, Customer, StorePrice, Payment, ProductVariation, ProductVariationDetail, Staff, WalletTransaction, Wallet, Approval, Store, ReturnTransaction, ReturnDetail, ReturnPayment, Department, POSA, DiscountedJAN, Terminal
+from django.core.exceptions import ValidationError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from datetime import timedelta
 
@@ -198,15 +199,6 @@ class BaseTransactionSerializer(serializers.ModelSerializer):
 
         return data
 
-    # --- 共通税率適用ロジックを Base に移設 ---
-    def get_applied_tax(self, product, requested_tax):
-        """
-        補助メソッド: 商品とリクエストされた税率から適用される税率を返す。
-        既存と同じ例外型（serializers.ValidationError）とメッセージを投げる。
-        純粋関数部分のみを提供し、副作用（DB更新等）は行わない。
-        """
-        return TaxRateManager.get_applied_tax(product, requested_tax)
-    
     def _validate_posa_lifecycle(self, posa_items):
         """
         POSA ライフサイクル検証ヘルパー。
@@ -237,25 +229,15 @@ class BaseTransactionSerializer(serializers.ModelSerializer):
                 # 解決できなかった場合は項目インデックスでわかるように raise
                 raise serializers.ValidationError({"sale_products": f"POSA 情報の解決に失敗しました (index={idx})。"})
 
-            # 許可ルール（既存ロジックに準拠）
-            if posa.status in ["BF_disabled", "AF_disabled"]:
-                raise serializers.ValidationError({"sale_products": "事故POSAカードです。カードを回収の上、報告を行なってください。"})
-            if posa.status == "salled":
-                raise serializers.ValidationError({"sale_products": "販売済みPOSAカードです。"})
-            if posa.status != "created":
-                raise serializers.ValidationError({"sale_products": "無効なPOSAカードです。"})
-
         return True
 
     def _apply_posa_state_change(self, posa_instance, new_state, *, save=True):
         """
-        単一の POSA インスタンスに対して状態変更を適用するヘルパー。
-        - posa_instance: POSA モデルインスタンス（または POSA コード文字列を渡した場合は内部で解決する）
-        - new_state: 遷移先ステータス文字列
-        - save: True の場合は pose_instance.save() を実行する（副作用を集約）
-        - 事前に簡単な許可チェックを行い、許可されない遷移なら serializers.ValidationError を投げる。
+        POSA インスタンスの状態を変更するヘルパー。
+        モデル側のバリデーション（POSA.clean / validate_state_change）を確実に呼び出すため、
+        保存前にモデル側へ遷移先情報を渡して save() を行います。モデル ValidationError は
+        serializers.ValidationError に変換して伝播します。
         """
-        # 解決: 文字列が渡された場合
         if not isinstance(posa_instance, POSA):
             if isinstance(posa_instance, str):
                 try:
@@ -265,20 +247,23 @@ class BaseTransactionSerializer(serializers.ModelSerializer):
             else:
                 raise serializers.ValidationError({"posa": "POSAインスタンスまたはコードを指定してください。"})
 
-        # 許可される遷移の最小チェック（既存ロジックに準拠）
-        current = posa_instance.status
-        # 発行済(created) -> 販売済(salled)
-        if new_state == "salled":
-            if current != "created":
-                raise serializers.ValidationError({"posa": f"POSAコード {posa_instance.code} は販売へ遷移できません。現在のステータス: {current}"})
-        # 販売済(salled) -> 無効(AF_disabled)
-        if new_state == "AF_disabled":
-            if current != "salled":
-                raise serializers.ValidationError({"posa": f"POSAコード {posa_instance.code} は無効化できません。現在のステータス: {current}"})
-
+        # モデルの clean() 側で validate_state_change が呼ばれる仕組みを利用する:
+        # 保存前に遷移先を渡しておくことで、モデル側で一元的に許可判定を行わせる
+        posa_instance._validate_state_change_to = new_state
+        # モデル内の追加チェック（存在する場合）を有効化するためのフラグを渡す
+        posa_instance.check_for_sale = True
         posa_instance.status = new_state
         if save:
-            posa_instance.save()
+            try:
+                posa_instance.save()
+            except ValidationError as e:
+                # django.core.exceptions.ValidationError -> rest_framework の ValidationError に変換
+                if hasattr(e, "message_dict"):
+                    raise serializers.ValidationError(e.message_dict)
+                elif hasattr(e, "messages"):
+                    raise serializers.ValidationError(e.messages)
+                else:
+                    raise serializers.ValidationError(str(e))
         return posa_instance
 
     def _fetch_stock(self, store_code, jan_or_product):
@@ -330,74 +315,29 @@ class BaseTransactionSerializer(serializers.ModelSerializer):
         quantity = data.get("quantity")
         discount = data.get("discount", 0) or 0
 
-        # 共通バリデーション: 数量と割引
+        # 共通バリデーション: 数量
         if quantity is None:
             raise serializers.ValidationError({"quantity": "数量は必須項目です。"})
-        if price is not None and discount > price:
-            raise serializers.ValidationError({"discount": "不正な割引額が入力されました。"})
 
         # 値引きJAN処理
         if isinstance(jan, str) and len(jan) == 13 and jan.startswith("999"):
-            # DiscountedJAN テーブルを参照して割引情報を取得する想定（読み取りのみ）
             try:
                 dj = DiscountedJAN.objects.select_related('stock', 'stock__jan').get(instore_jan=jan)
             except DiscountedJAN.DoesNotExist:
                 raise serializers.ValidationError({"jan": f"値引きJAN {jan} は登録されていません。"})
-            # 値引きJANは数量1で固定
             if quantity != 1:
                 raise serializers.ValidationError({"quantity": "値引きJANの場合、数量は1でなければなりません。"})
-            
+
             product = dj.stock.jan
             discounted_price = dj.discounted_price
 
             data["_is_discounted"] = True
             data["name"] = product.name
             data["price"] = discounted_price
-            input_tax = data.get("tax")
-            if input_tax in (None, ""):
-                tax_to_apply = int(product.tax)
-            else:
-                try:
-                    tax_to_apply = int(input_tax)
-                except (ValueError, TypeError):
-                    raise serializers.ValidationError({"tax": "税率は整数値で指定してください。"})
-
-            # 税率変更の許可チェック
-            if tax_to_apply != int(product.tax) and product.tax_rate_mod_flag != "allow":
-                raise serializers.ValidationError({"tax": "この商品では税率変更が許可されていません。"})
-
-            data["tax"] = tax_to_apply
-            
-            try:
-                store_price_obj = StorePrice.objects.get(store_code=store_code, jan=product)
-                store_price = store_price_obj.price
-                # 割引額 = 店舗価格 - 値引き後価格
-                discount = store_price - discounted_price
-            except StorePrice.DoesNotExist:
-                # 店舗価格が設定されていない場合は、標準価格をもとに割引額を計算
-                discount = product.price - discounted_price
-            
-            # 割引額がマイナスになる場合は0に丸める→割り増し価格を考慮する
-            discount = max(0, discount)
-
-            # リクエストで指定された割引額を取得
-            requested_discount = data.get("discount", 0) or 0
-            
-            # 最終的な割引額 = 値引きJANによる割引額 + リクエストによる割引額
-            final_discount = discount + requested_discount
-            
-            # 割引額が商品価格を超えていないかチェック
-            # ここでの価格は「値引きJAN適用前の価格」である store_price または product.price
-            original_price = store_price if 'store_price' in locals() else product.price
-            if final_discount > original_price:
-                raise serializers.ValidationError({"discount": "割引額が商品価格を超えています。"})
-
-            data["discount"] = final_discount
             return data
 
         # POSA販売処理（20桁、先頭999020）
         if isinstance(jan, str) and len(jan) == 20 and jan.startswith("999020"):
-            # POSAコードの検証（読み取りのみ）
             try:
                 posa = POSA.objects.get(code=jan)
             except POSA.DoesNotExist:
@@ -426,17 +366,11 @@ class BaseTransactionSerializer(serializers.ModelSerializer):
                 )
             except Department.DoesNotExist:
                 raise serializers.ValidationError({"jan": f"指定された部門コード {dept_code} に一致する部門が存在しません。"})
-            # 会計フラグチェック
             if dept.get_accounting_flag() != "allow":
                 raise serializers.ValidationError({"jan": "指定された部門では販売が許可されていません。"})
-            # POSAカードのステータスチェック（読み取りのみ）
-            if posa.status in ["BF_disabled", "AF_disabled"]:
-                raise serializers.ValidationError({"jan": "事故POSAカードです。カードを回収の上、報告を行なってください。"})
-            elif posa.status == "salled":
-                raise serializers.ValidationError({"jan": "販売済みPOSAカードです。"})
-            elif posa.status != "created":
-                raise serializers.ValidationError({"jan": "無効なPOSAカードです。"})
-            # 金額の処理
+
+            # 金額の処理（モデル側で必須/妥当性は担保しているため、ここでは変数割当と
+            # リクエスト固有のチェック（バリアブルカードで price 必須／固定額で price 禁止）のみ行う）
             if posa.is_variable:
                 if price is None:
                     raise serializers.ValidationError({"price": "バリアブルカードの場合、金額の入力が必須です。"})
@@ -444,29 +378,11 @@ class BaseTransactionSerializer(serializers.ModelSerializer):
             else:
                 if price is not None:
                     raise serializers.ValidationError({"price": "固定額カードの場合、金額を指定することはできません。"})
-                if posa.card_value is None:
-                    raise serializers.ValidationError({"jan": "POSAの金額が設定されていません。"})
                 card_value = posa.card_value
-            # 部門税率の適用とフラグチェック
-            dept_standard_tax = int(dept.get_tax_rate())
-            input_tax = data.get("tax")
-            if input_tax in (None, ""):
-                tax_to_apply = dept_standard_tax
-            else:
-                try:
-                    input_tax = int(input_tax)
-                except (ValueError, TypeError):
-                    raise serializers.ValidationError({"tax": "税率は整数値で指定してください。"})
-                tax_to_apply = input_tax
-            if tax_to_apply != dept_standard_tax and dept.get_tax_rate_mod_flag() != "allow":
-                raise serializers.ValidationError({"tax": "この部門では税率変更が許可されていません。"})
-            if discount > 0 and dept.get_discount_flag() != "allow":
-                raise serializers.ValidationError({"discount": "この部門では割引が許可されていません。"})
+
             data["_is_posa"] = True
             data["_posa_instance"] = posa
             data["price"] = card_value
-            data["tax"] = tax_to_apply
-            data["discount"] = discount
             posa_unique_code = jan[8:]
             data["name"] = f'{dept_code}{dept.name}({posa_unique_code})'
             data["_department_name"] = dept.name
@@ -498,21 +414,6 @@ class BaseTransactionSerializer(serializers.ModelSerializer):
                 })
             if dept.get_accounting_flag() != "allow":
                 raise serializers.ValidationError({"jan": "指定された部門では部門打ちが許可されていません。"})
-            dept_standard_tax = int(dept.get_tax_rate())
-            input_tax = data.get("tax")
-            if input_tax in (None, ""):
-                tax_to_apply = dept_standard_tax
-            else:
-                try:
-                    input_tax = int(input_tax)
-                except (ValueError, TypeError):
-                    raise serializers.ValidationError({"tax": "税率は整数値で指定してください。"})
-                tax_to_apply = input_tax
-            if tax_to_apply != dept_standard_tax and dept.get_tax_rate_mod_flag() != "allow":
-                raise serializers.ValidationError({"tax": "この部門では税率変更が許可されていません。"})
-            data["tax"] = tax_to_apply
-            if discount > 0 and dept.get_discount_flag() != "allow":
-                raise serializers.ValidationError({"discount": "この部門では割引が許可されていません。"})
             data["name"] = f'{dept_code}{dept.name}'
             data["_department_name"] = dept.name
             data["jan"] = "999" + dept.department_code
@@ -523,29 +424,10 @@ class BaseTransactionSerializer(serializers.ModelSerializer):
             product = Product.objects.get(jan=jan)
         except Product.DoesNotExist:
             raise serializers.ValidationError({"jan": f"JANコード {jan} は登録されていません。"})
-
-        # 継承商品
         if data.get("original_product", False):
             if price is None:
-                # original_product フラグが立っている場合、価格は必須（返品などで使用）
                 raise serializers.ValidationError({"price": "original_product の場合、価格の指定が必須です。"})
-        # 税率適用は Base の get_applied_tax を使用（既存の例外メッセージを維持）
-        input_tax = data.get("tax")
-        if input_tax in (None, ""):
-            applied_tax = product.tax
-        else:
-            try:
-                input_tax = int(input_tax)
-            except (ValueError, TypeError):
-                raise serializers.ValidationError({"tax": "税率は整数値で指定してください。"})
-            applied_tax = self.get_applied_tax(product, input_tax)
-        data["tax"] = applied_tax
-        # 価格が未指定の場合、商品マスタの売価を使用
-        if price is None:
-            # StorePrice 等のストア別価格ロジックは副作用を伴う可能性があるため
-            # サブクラス側で必要なら参照して設定することを想定する。
-            data["price"] = product.price
-        # name を設定
+        data["price"] = price if price is not None else product.price
         data["name"] = product.name
         return data
 
@@ -564,30 +446,7 @@ class BaseTransactionSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"sale_products": f"商品取得エラー: {str(e)}"})
 
 
-class TaxRateManager:
-    @staticmethod
-    def get_applied_tax(product, specified_tax_rate):
-        # 指定がなければ、商品の元の税率を返す
-        if specified_tax_rate is None:
-            return product.tax
-        # 指定税率は 0, 8, 10 のいずれかでなければならない
-        if specified_tax_rate not in [0, 8, 10]:
-            raise serializers.ValidationError(f"JAN:{product.jan} 不正な税率。税率は0, 8, 10のいずれかを指定してください。")
-        # 税率10%の商品は変更不可
-        if product.tax == 10 and specified_tax_rate != 10:
-            raise serializers.ValidationError(f"JAN:{product.jan} 税率10%の商品は税率変更できません。")
-        # 税率変更が禁止されている場合は、指定税率と元の税率が一致しなければならない
-        if product.disable_change_tax:
-            if specified_tax_rate != product.tax:
-                raise serializers.ValidationError(f"JAN:{product.jan} は税率の変更が禁止されています。")
-            return product.tax
-        # 8%の商品について、指定が10%であれば変更を許可
-        if product.tax == 8 and specified_tax_rate == 10:
-            return 10
-        # それ以外で、指定税率が元と異なる場合はエラー
-        if specified_tax_rate != product.tax:
-            raise serializers.ValidationError(f"JAN:{product.jan} は税率変更できません。")
-        return product.tax
+# TaxRateManager は廃止。直接 Product.get_applied_tax を呼び出してください。
 
 
 class NonStopListSerializer(serializers.ListSerializer):
@@ -934,21 +793,27 @@ class TransactionSerializer(BaseTransactionSerializer):
         return discount_error_list
 
     def _discount_check(self, sale_product, store_code, permissions):
-        errors = []
+        """
+        割引チェックをモデル側に委譲した簡潔なラッパー。
+        - 権限チェック（change_price）はシリアライザ側で行う。
+        - Product の存在チェックは _get_product に委譲し、その ValidationError は整形して返す。
+        - 割引妥当性は product.validate_discount を呼び出し、モデルの ValidationError を
+          rest_framework の ValidationError に変換して伝播する。
+        """
         jan = sale_product.get("jan", "不明")
         discount = sale_product.get("discount", 0)
         status = self.initial_data.get("status")
-        
-        # スタッフに売価変更権限がない場合のチェック（resale以外）
+    
+        # 権限チェック（resale 以外）
         if discount != 0 and status != "resale":
             if permissions is None or "change_price" not in permissions:
-                errors.append(f"JAN:{jan} このスタッフは売価変更を行う権限がありません。")
-        
-        # 商品を取得
+                raise serializers.ValidationError([f"JAN:{jan} このスタッフは売価変更を行う権限がありません。"])
+    
+        # 商品取得（存在しなければ _get_product の ValidationError をそのまま伝播）
         try:
             product = self._get_product(jan)
         except serializers.ValidationError as e:
-            # e.detail は dict の場合があるため最初の値を取得してメッセージ化
+            # 既存のフォーマットに合わせて文字列化して返す
             detail = e.detail
             if isinstance(detail, dict):
                 try:
@@ -957,24 +822,22 @@ class TransactionSerializer(BaseTransactionSerializer):
                     message = detail
             else:
                 message = detail
-            errors.append(f"JAN:{jan} {message}")
-        else:
-            # 割引禁止商品のチェック
-            if discount > 0 and product.disable_change_price:
-                errors.append(f"JAN:{jan} の値引きは許可されていません。")
-            
-            # 有効価格の取得と割引額のチェック
-            store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
-            effective_price = store_price.get_price() if store_price else product.price
-            
-            if discount > effective_price:
-                errors.append(f"JAN:{jan} 不正な割引額が入力されました。")
-            
-            if discount < 0:
-                errors.append(f"JAN:{jan} 割引額は0以上である必要があります。")
-        
-        if errors:
-            raise serializers.ValidationError(errors)
+            raise serializers.ValidationError([f"JAN:{jan} {message}"])
+    
+        # 店舗価格取得
+        store_price = StorePrice.objects.filter(store_code=store_code, jan=product).first()
+        store_price_value = store_price.get_price() if store_price else None
+    
+        # モデル側の検証を呼び出す（django.core.exceptions.ValidationError -> rest_framework の ValidationError に変換）
+        try:
+            product.validate_discount(discount or 0, store_price_value)
+        except ValidationError as e:
+            if hasattr(e, "message_dict"):
+                raise serializers.ValidationError({f"JAN:{jan}": e.message_dict})
+            elif hasattr(e, "messages"):
+                raise serializers.ValidationError({f"JAN:{jan}": e.messages})
+            else:
+                raise serializers.ValidationError({f"JAN:{jan}": str(e)})
 
     def _calculate_totals(self, sale_products_data, store_code):
         """
